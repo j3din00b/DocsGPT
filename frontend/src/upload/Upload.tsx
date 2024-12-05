@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
 
 import userService from '../api/services/userService';
-import Exit from '../assets/exit.svg';
 import ArrowLeft from '../assets/arrow-left.svg';
 import FileUpload from '../assets/file_upload.svg';
 import WebsiteCollect from '../assets/website_collect.svg';
@@ -17,17 +16,22 @@ import {
   setSourceDocs,
   selectSourceDocs,
 } from '../preferences/preferenceSlice';
+import WrapperModal from '../modals/WrapperModal';
 
 function Upload({
-  modalState,
+  receivedFile = [],
   setModalState,
   isOnboarding,
+  renderTab = null,
+  close,
 }: {
-  modalState: ActiveState;
+  receivedFile: File[];
   setModalState: (state: ActiveState) => void;
   isOnboarding: boolean;
+  renderTab: string | null;
+  close: () => void;
 }) {
-  const [docName, setDocName] = useState('');
+  const [docName, setDocName] = useState(receivedFile[0]?.name);
   const [urlName, setUrlName] = useState('');
   const [url, setUrl] = useState('');
   const [repoUrl, setRepoUrl] = useState(''); // P3f93
@@ -38,8 +42,8 @@ function Upload({
     search_queries: [''],
     number_posts: 10,
   });
-  const [activeTab, setActiveTab] = useState<string | null>(null);
-  const [files, setfiles] = useState<File[]>([]);
+  const [activeTab, setActiveTab] = useState<string | null>(renderTab);
+  const [files, setfiles] = useState<File[]>(receivedFile);
   const [progress, setProgress] = useState<{
     type: 'UPLOAD' | 'TRAINING';
     percentage: number;
@@ -76,7 +80,7 @@ function Upload({
         <div className="relative w-32 h-32 rounded-full">
           <div className="absolute inset-0 rounded-full shadow-[0_0_10px_2px_rgba(0,0,0,0.3)_inset] dark:shadow-[0_0_10px_2px_rgba(0,0,0,0.3)_inset]"></div>
           <div
-            className={`absolute inset-0 rounded-full ${progressPercent === 100 ? 'shadow-xl shadow-lime-300/50 dark:shadow-lime-300/50 bg-gradient-to-r from-white to-gray-400 dark:bg-gradient-to-br dark:from-gray-500 dark:to-gray-300' : 'shadow-[0_2px_0_#FF3D00_inset] dark:shadow-[0_2px_0_#FF3D00_inset]'}`}
+            className={`absolute inset-0 rounded-full ${progressPercent === 100 ? 'shadow-xl shadow-lime-300/50 dark:shadow-lime-300/50 bg-gradient-to-r from-white to-gray-400 dark:bg-gradient-to-br dark:from-gray-500 dark:to-gray-300' : 'shadow-[0_4px_0_#7D54D1] dark:shadow-[0_4px_0_#7D54D1]'}`}
             style={{
               animation: `${progressPercent === 100 ? 'none' : 'rotate 2s linear infinite'}`,
             }}
@@ -166,7 +170,10 @@ function Upload({
                     dispatch(setSourceDocs(data));
                     dispatch(
                       setSelectedDocs(
-                        data?.find((d) => d.type?.toLowerCase() === 'local'),
+                        Array.isArray(data) &&
+                          data?.find(
+                            (d: Doc) => d.type?.toLowerCase() === 'local',
+                          ),
                       ),
                     );
                   });
@@ -182,15 +189,21 @@ function Upload({
                   getDocs().then((data) => {
                     dispatch(setSourceDocs(data));
                     const docIds = new Set(
-                      sourceDocs?.map((doc: Doc) => (doc.id ? doc.id : null)),
+                      (Array.isArray(sourceDocs) &&
+                        sourceDocs?.map((doc: Doc) =>
+                          doc.id ? doc.id : null,
+                        )) ||
+                        [],
                     );
-                    data?.map((updatedDoc: Doc) => {
-                      if (updatedDoc.id && !docIds.has(updatedDoc.id)) {
-                        //select the doc not present in the intersection of current Docs and fetched data
-                        dispatch(setSelectedDocs(updatedDoc));
-                        return;
-                      }
-                    });
+                    if (data && Array.isArray(data)) {
+                      data.map((updatedDoc: Doc) => {
+                        if (updatedDoc.id && !docIds.has(updatedDoc.id)) {
+                          // Select the doc not present in the intersection of current Docs and fetched data
+                          dispatch(setSelectedDocs(updatedDoc));
+                          return;
+                        }
+                      });
+                    }
                   });
                   setProgress(
                     (progress) =>
@@ -323,6 +336,9 @@ function Upload({
       ],
       'application/vnd.openxmlformats-officedocument.presentationml.presentation':
         ['.pptx'],
+      'image/png': ['.png'],
+      'image/jpeg': ['.jpeg'],
+      'image/jpg': ['.jpg'],
     },
   });
 
@@ -351,32 +367,32 @@ function Upload({
   } else {
     view = (
       <div className="flex flex-col gap-4 w-full">
-        <p className="text-xl text-jet dark:text-bright-gray text-center font-semibold">
+        <p className="text-2xl text-jet dark:text-bright-gray text-center font-semibold">
           {t('modals.uploadDoc.label')}
         </p>
         {!activeTab && (
           <div>
-            <p className="text-gray-6000 dark:text-light-gray text-sm text-center">
+            <p className="text-gray-6000 dark:text-bright-gray text-sm text-center font-medium">
               {t('modals.uploadDoc.select')}
             </p>
             <div className="w-full gap-4 h-full p-4 flex flex-col md:flex-row md:gap-4 justify-center items-center">
               <button
                 onClick={() => setActiveTab('file')}
-                className="rounded-3xl text-md font-medium border flex flex-col items-center justify-center hover:shadow-lg dark:hover:shadow-lg p-8 dark:active:shadow-lg gap-4 bg-white dark:bg-outer-space dark:text-light-gray hover:bg-gray-100 dark:hover:bg-[#767183]/50 hover:text-purple-30 dark:hover:text-gray-30 border-purple-30 dark:border-gray-700 h-40 w-40 md:w-52 md:h-52"
+                className="opacity-85 hover:opacity-100 rounded-3xl text-sm font-medium border flex flex-col items-center justify-center hover:shadow-purple-30/30 hover:shadow-lg p-8 gap-4 bg-white text-[#777777] dark:bg-outer-space dark:text-[#c3c3c3] hover:border-purple-30 border-[#D7D7D7] h-40 w-40 md:w-52 md:h-52"
               >
                 <img
                   src={FileUpload}
-                  className="w-8 h-8 mr-2 dark:filter dark:invert"
+                  className="w-12 h-12 mr-2 dark:filter dark:invert dark:brightness-50"
                 />
                 {t('modals.uploadDoc.file')}
               </button>
               <button
                 onClick={() => setActiveTab('remote')}
-                className="rounded-3xl text-md font-medium border flex flex-col items-center justify-center hover:shadow-lg dark:hover:shadow-lg p-8 dark:active:shadow-lg gap-4 bg-white dark:bg-outer-space dark:text-light-gray hover:bg-gray-100 dark:hover:bg-[#767183]/50 hover:text-purple-30 dark:hover:text-gray-30 border-purple-30 dark:border-gray-700 h-40 w-40 md:w-52 md:h-52"
+                className="opacity-85 hover:opacity-100 rounded-3xl text-sm font-medium border flex flex-col items-center justify-center hover:shadow-purple-30/30 hover:shadow-lg p-8 gap-4 bg-white text-[#777777] dark:bg-outer-space dark:text-[#c3c3c3] hover:border-purple-30 border-[#D7D7D7] h-40 w-40 md:w-52 md:h-52"
               >
                 <img
                   src={WebsiteCollect}
-                  className="w-8 h-8 mr-2 dark:filter dark:invert"
+                  className="w-14 h-14 mr-2 dark:filter dark:invert dark:brightness-50"
                 />
                 {t('modals.uploadDoc.remote')}
               </button>
@@ -591,7 +607,30 @@ function Upload({
             ) : (
               <button
                 onClick={uploadRemote}
-                className={`ml-2 cursor-pointer rounded-3xl bg-purple-30 py-2 px-6 text-sm text-white hover:bg-[#6F3FD1]`}
+                className={`ml-2 cursor-pointer rounded-3xl bg-purple-30 py-2 px-6 text-sm text-white hover:bg-[#6F3FD1] ${
+                  urlName.trim().length === 0 ||
+                  url.trim().length === 0 ||
+                  (urlType.label === 'Reddit' &&
+                    (redditData.client_id.length === 0 ||
+                      redditData.client_secret.length === 0 ||
+                      redditData.user_agent.length === 0 ||
+                      redditData.search_queries.length === 0 ||
+                      redditData.number_posts === 0)) ||
+                  (urlType.label === 'GitHub' && repoUrl.trim().length === 0)
+                    ? 'bg-opacity-80 text-opacity-80'
+                    : ''
+                }`}
+                disabled={
+                  urlName.trim().length === 0 ||
+                  url.trim().length === 0 ||
+                  (urlType.label === 'Reddit' &&
+                    (redditData.client_id.length === 0 ||
+                      redditData.client_secret.length === 0 ||
+                      redditData.user_agent.length === 0 ||
+                      redditData.search_queries.length === 0 ||
+                      redditData.number_posts === 0)) ||
+                  (urlType.label === 'GitHub' && repoUrl.trim().length === 0)
+                }
               >
                 {t('modals.uploadDoc.train')}
               </button>
@@ -617,28 +656,18 @@ function Upload({
   }
 
   return (
-    <article
-      className={`${
-        modalState === 'ACTIVE' ? 'visible' : 'hidden'
-      } absolute z-30 bg-gray-alpha flex items-center justify-center h-[calc(100vh-4rem)] md:h-screen w-full`}
+    <WrapperModal
+      isPerformingTask={progress !== undefined && progress.percentage < 100}
+      close={() => {
+        close();
+        setDocName('');
+        setfiles([]);
+        setModalState('INACTIVE');
+        setActiveTab(null);
+      }}
     >
-      <article className="relative mx-auto flex w-[90vw] max-w-lg  flex-col gap-4 rounded-lg bg-white p-6 shadow-lg dark:bg-outer-space h-fit-content">
-        {!isOnboarding && !progress && (
-          <button
-            className="absolute top-4 right-4 m-1 w-3"
-            onClick={() => {
-              setDocName('');
-              setfiles([]);
-              setModalState('INACTIVE');
-              setActiveTab(null);
-            }}
-          >
-            <img className="filter dark:invert" src={Exit} />
-          </button>
-        )}
-        {view}
-      </article>
-    </article>
+      {view}
+    </WrapperModal>
   );
 }
 

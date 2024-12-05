@@ -77,7 +77,7 @@
   },
   "modals": {
     "uploadDoc": {
-      "label": "Subir Nueva Documentación",
+      "label": "Subir nuevo documento",
       "select": "Elija cómo cargar su documento en DocsGPT",
       "file": "Subir desde el dispositivo",
       "back": "Atrás",
@@ -99,6 +99,10 @@
         "agent": "Agente de Usuario",
         "searchQueries": "Consultas de Búsqueda",
         "numberOfPosts": "Número de publicaciones"
+      },
+      "drag": {
+        "title": "Cargar un archivo fuente",
+        "description": "Suelta tu archivo aquí para agregarlo como fuente."
       }
     },
     "createAPIKey": {
