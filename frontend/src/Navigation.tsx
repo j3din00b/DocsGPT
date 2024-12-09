@@ -18,6 +18,7 @@ import SourceDropdown from './components/SourceDropdown';
 import {
   setConversation,
   updateConversationId,
+  handleAbort,
 } from './conversation/conversationSlice';
 import ConversationTile from './conversation/ConversationTile';
 import { useDarkTheme, useMediaQuery, useOutsideAlerter } from './hooks';
@@ -32,12 +33,13 @@ import {
   selectConversations,
   selectModalStateDeleteConv,
   selectSelectedDocs,
-  selectSelectedDocsStatus,
   selectSourceDocs,
+  selectPaginatedDocuments,
   setConversations,
   setModalStateDeleteConv,
   setSelectedDocs,
   setSourceDocs,
+  setPaginatedDocuments,
 } from './preferences/preferenceSlice';
 import Spinner from './assets/spinner.svg';
 import SpinnerDark from './assets/spinner-dark.svg';
@@ -49,21 +51,7 @@ interface NavigationProps {
   navOpen: boolean;
   setNavOpen: React.Dispatch<React.SetStateAction<boolean>>;
 }
-/* const NavImage: React.FC<{
-  Light: string | undefined;
-  Dark: string | undefined;
-}> = ({ Light, Dark }) => {
-  return (
-    <>
-      <img src={Dark} alt="icon" className="ml-2 hidden w-5 dark:block " />
-      <img src={Light} alt="icon" className="ml-2 w-5 dark:hidden filter dark:invert" />
-    </>
-  );
-};
-NavImage.propTypes = {
-  Light: PropTypes.string,
-  Dark: PropTypes.string,
-}; */
+
 export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
   const dispatch = useDispatch();
   const queries = useSelector(selectQueries);
@@ -72,6 +60,7 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
   const conversations = useSelector(selectConversations);
   const modalStateDeleteConv = useSelector(selectModalStateDeleteConv);
   const conversationId = useSelector(selectConversationId);
+  const paginatedDocuments = useSelector(selectPaginatedDocuments);
   const [isDeletingConversation, setIsDeletingConversation] = useState(false);
 
   const { isMobile } = useMediaQuery();
@@ -81,10 +70,6 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
   const isApiKeySet = useSelector(selectApiKeyStatus);
   const [apiKeyModalState, setApiKeyModalState] =
     useState<ActiveState>('INACTIVE');
-
-  const isSelectedDocsSet = useSelector(selectSelectedDocsStatus);
-  const [selectedDocsModalState, setSelectedDocsModalState] =
-    useState<ActiveState>(isSelectedDocsSet ? 'INACTIVE' : 'ACTIVE');
 
   const [uploadModalState, setUploadModalState] =
     useState<ActiveState>('INACTIVE');
@@ -143,9 +128,18 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
       })
       .then((updatedDocs) => {
         dispatch(setSourceDocs(updatedDocs));
+        const updatedPaginatedDocs = paginatedDocuments?.filter(
+          (document) => document.id !== doc.id,
+        );
+        dispatch(
+          setPaginatedDocuments(updatedPaginatedDocs || paginatedDocuments),
+        );
         dispatch(
           setSelectedDocs(
-            updatedDocs?.find((doc) => doc.name.toLowerCase() === 'default'),
+            Array.isArray(updatedDocs) &&
+              updatedDocs?.find(
+                (doc: Doc) => doc.name.toLowerCase() === 'default',
+              ),
           ),
         );
       })
@@ -168,6 +162,7 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
   };
 
   const resetConversation = () => {
+    handleAbort();
     dispatch(setConversation([]));
     dispatch(
       updateConversationId({
@@ -254,7 +249,7 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
         ref={navRef}
         className={`${
           !navOpen && '-ml-96 md:-ml-[18rem]'
-        } duration-20 fixed top-0 z-40 flex h-full w-72 flex-col border-r-[1px] border-b-0 bg-white transition-all dark:border-r-purple-taupe dark:bg-chinese-black dark:text-white`}
+        } duration-20 fixed top-0 z-20 flex h-full w-72 flex-col border-r-[1px] border-b-0 bg-white transition-all dark:border-r-purple-taupe dark:bg-chinese-black dark:text-white`}
       >
         <div
           className={'visible mt-2 flex h-[6vh] w-full justify-between md:h-12'}
@@ -479,11 +474,15 @@ export default function Navigation({ navOpen, setNavOpen }: NavigationProps) {
         setModalState={setModalStateDeleteConv}
         handleDeleteAllConv={handleDeleteAllConversations}
       />
-      <Upload
-        modalState={uploadModalState}
-        setModalState={setUploadModalState}
-        isOnboarding={false}
-      ></Upload>
+      {uploadModalState === 'ACTIVE' && (
+        <Upload
+          receivedFile={[]}
+          setModalState={setUploadModalState}
+          isOnboarding={false}
+          renderTab={null}
+          close={() => setUploadModalState('INACTIVE')}
+        ></Upload>
+      )}
     </>
   );
 }

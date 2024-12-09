@@ -1,31 +1,37 @@
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDispatch, useSelector } from 'react-redux';
-import newChatIcon from '../assets/openNewChat.svg';
+import { useNavigate } from 'react-router-dom';
+import Hero from '../Hero';
+import { useDropzone } from 'react-dropzone';
+import DragFileUpload from '../assets/DragFileUpload.svg';
 import ArrowDown from '../assets/arrow-down.svg';
+import newChatIcon from '../assets/openNewChat.svg';
 import Send from '../assets/send.svg';
 import SendDark from '../assets/send_dark.svg';
+import ShareIcon from '../assets/share.svg';
 import SpinnerDark from '../assets/spinner-dark.svg';
 import Spinner from '../assets/spinner.svg';
 import RetryIcon from '../components/RetryIcon';
-import { useNavigate } from 'react-router-dom';
-import Hero from '../Hero';
 import { useDarkTheme, useMediaQuery } from '../hooks';
 import { ShareConversationModal } from '../modals/ShareConversationModal';
-import { setConversation, updateConversationId } from './conversationSlice';
 import { selectConversationId } from '../preferences/preferenceSlice';
 import { AppDispatch } from '../store';
 import ConversationBubble from './ConversationBubble';
 import { handleSendFeedback } from './conversationHandlers';
 import { FEEDBACK, Query } from './conversationModels';
-import ShareIcon from '../assets/share.svg';
 import {
   addQuery,
   fetchAnswer,
+  resendQuery,
   selectQueries,
   selectStatus,
+  setConversation,
+  updateConversationId,
   updateQuery,
 } from './conversationSlice';
+import Upload from '../upload/Upload';
+import { ActiveState } from '../models/misc';
 
 export default function Conversation() {
   const queries = useSelector(selectQueries);
@@ -43,6 +49,47 @@ export default function Conversation() {
   const [isShareModalOpen, setShareModalState] = useState<boolean>(false);
   const { t } = useTranslation();
   const { isMobile } = useMediaQuery();
+  const [uploadModalState, setUploadModalState] =
+    useState<ActiveState>('INACTIVE');
+  const [files, setFiles] = useState<File[]>([]);
+  const [handleDragActive, setHandleDragActive] = useState<boolean>(false);
+
+  const onDrop = useCallback((acceptedFiles: File[]) => {
+    setUploadModalState('ACTIVE');
+    setFiles(acceptedFiles);
+    setHandleDragActive(false);
+  }, []);
+
+  const { getRootProps, getInputProps } = useDropzone({
+    onDrop,
+    noClick: true,
+    multiple: true,
+    onDragEnter: () => {
+      setHandleDragActive(true);
+    },
+    onDragLeave: () => {
+      setHandleDragActive(false);
+    },
+    maxSize: 25000000,
+    accept: {
+      'application/pdf': ['.pdf'],
+      'text/plain': ['.txt'],
+      'text/x-rst': ['.rst'],
+      'text/x-markdown': ['.md'],
+      'application/zip': ['.zip'],
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        ['.docx'],
+      'application/json': ['.json'],
+      'text/csv': ['.csv'],
+      'text/html': ['.html'],
+      'application/epub+zip': ['.epub'],
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': [
+        '.xlsx',
+      ],
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+        ['.pptx'],
+    },
+  });
 
   const handleUserInterruption = () => {
     if (!eventInterrupt && status === 'loading') setEventInterrupt(true);
@@ -84,15 +131,25 @@ export default function Conversation() {
   const handleQuestion = ({
     question,
     isRetry = false,
+    updated = null,
+    indx = undefined,
   }: {
     question: string;
     isRetry?: boolean;
+    updated?: boolean | null;
+    indx?: number;
   }) => {
-    question = question.trim();
-    if (question === '') return;
-    setEventInterrupt(false);
-    !isRetry && dispatch(addQuery({ prompt: question })); //dispatch only new queries
-    fetchStream.current = dispatch(fetchAnswer({ question }));
+    if (updated === true) {
+      !isRetry &&
+        dispatch(resendQuery({ index: indx as number, prompt: question })); //dispatch only new queries
+      fetchStream.current = dispatch(fetchAnswer({ question, indx }));
+    } else {
+      question = question.trim();
+      if (question === '') return;
+      setEventInterrupt(false);
+      !isRetry && dispatch(addQuery({ prompt: question })); //dispatch only new queries
+      fetchStream.current = dispatch(fetchAnswer({ question }));
+    }
   };
 
   const handleFeedback = (query: Query, feedback: FEEDBACK, index: number) => {
@@ -103,8 +160,14 @@ export default function Conversation() {
     );
   };
 
-  const handleQuestionSubmission = () => {
-    if (inputRef.current?.value && status !== 'loading') {
+  const handleQuestionSubmission = (
+    updatedQuestion?: string,
+    updated?: boolean,
+    indx?: number,
+  ) => {
+    if (updated === true) {
+      handleQuestion({ question: updatedQuestion as string, updated, indx });
+    } else if (inputRef.current?.value && status !== 'loading') {
       if (lastQueryReturnedErr) {
         // update last failed query with new prompt
         dispatch(
@@ -216,9 +279,9 @@ export default function Conversation() {
   return (
     <div className="flex flex-col gap-1 h-full justify-end ">
       {conversationId && queries.length > 0 && (
-        <div className="absolute top-4 right-20 z-20 ">
+        <div className="absolute top-4 right-20 z-10 ">
           {' '}
-          <div className="flex items-center gap-4 ">
+          <div className="flex mt-2 items-center gap-4 ">
             {isMobile && queries.length > 0 && (
               <button
                 title="Open New Chat"
@@ -289,6 +352,8 @@ export default function Conversation() {
                     key={`${index}QUESTION`}
                     message={query.prompt}
                     type="QUESTION"
+                    handleUpdatedQuestionSubmission={handleQuestionSubmission}
+                    questionNumber={index}
                     sources={query.sources}
                   ></ConversationBubble>
 
@@ -302,14 +367,18 @@ export default function Conversation() {
         )}
       </div>
 
-      <div className="flex w-11/12 flex-col items-end self-center rounded-2xl bg-opacity-0 pb-1 sm:w-[62%] h-auto">
-        <div className="flex w-full items-center rounded-[40px] border border-silver bg-white py-1 dark:bg-raisin-black">
+      <div className="flex w-11/12 flex-col items-end self-center rounded-2xl bg-opacity-0 z-3 sm:w-[62%] h-auto py-1">
+        <div
+          {...getRootProps()}
+          className="flex w-full items-center rounded-[40px] border border-silver bg-white dark:bg-raisin-black"
+        >
+          <input {...getInputProps()}></input>
           <textarea
             id="inputbox"
             ref={inputRef}
             tabIndex={1}
             placeholder={t('inputPlaceholder')}
-            className={`inputbox-style h-16 w-full overflow-y-auto overflow-x-hidden whitespace-pre-wrap rounded-full bg-white pt-5 pb-[22px] text-base leading-tight opacity-100 focus:outline-none dark:bg-raisin-black dark:text-bright-gray`}
+            className={`inputbox-style w-full overflow-y-auto overflow-x-hidden whitespace-pre-wrap rounded-full bg-transparent py-5 text-base leading-tight opacity-100 focus:outline-none dark:bg-transparent dark:text-bright-gray`}
             onInput={handleInput}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -327,7 +396,7 @@ export default function Conversation() {
             <div className="mx-1 cursor-pointer rounded-full p-3 text-center hover:bg-gray-3000 dark:hover:bg-dark-charcoal">
               <img
                 className="ml-[4px] h-6 w-6 text-white "
-                onClick={handleQuestionSubmission}
+                onClick={() => handleQuestionSubmission()}
                 src={isDarkTheme ? SendDark : Send}
               ></img>
             </div>
@@ -338,6 +407,26 @@ export default function Conversation() {
           {t('tagline')}
         </p>
       </div>
+      {handleDragActive && (
+        <div className="pointer-events-none fixed top-0 left-0 z-30 flex flex-col size-full items-center justify-center bg-opacity-50 bg-white dark:bg-gray-alpha">
+          <img className="filter dark:invert" src={DragFileUpload} />
+          <span className="px-2 text-2xl font-bold text-outer-space dark:text-silver">
+            {t('modals.uploadDoc.drag.title')}
+          </span>
+          <span className="p-2 text-s w-48 text-center text-outer-space dark:text-silver">
+            {t('modals.uploadDoc.drag.description')}
+          </span>
+        </div>
+      )}
+      {uploadModalState === 'ACTIVE' && (
+        <Upload
+          receivedFile={files}
+          setModalState={setUploadModalState}
+          isOnboarding={false}
+          renderTab={'file'}
+          close={() => setUploadModalState('INACTIVE')}
+        ></Upload>
+      )}
     </div>
   );
 }
