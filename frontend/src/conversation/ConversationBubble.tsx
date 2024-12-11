@@ -1,28 +1,33 @@
-import { forwardRef, useState } from 'react';
+import 'katex/dist/katex.min.css';
+
+import { forwardRef, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { useSelector } from 'react-redux';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/cjs/styles/prism';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
-import 'katex/dist/katex.min.css';
+
 import DocsGPT3 from '../assets/cute_docsgpt3.svg';
 import Dislike from '../assets/dislike.svg?react';
 import Document from '../assets/document.svg';
 import Like from '../assets/like.svg?react';
 import Link from '../assets/link.svg';
 import Sources from '../assets/sources.svg';
+import Edit from '../assets/edit.svg';
+import UserIcon from '../assets/user.png';
 import Avatar from '../components/Avatar';
 import CopyButton from '../components/CopyButton';
 import Sidebar from '../components/Sidebar';
+import SpeakButton from '../components/TextToSpeechButton';
 import {
   selectChunks,
   selectSelectedDocs,
 } from '../preferences/preferenceSlice';
 import classes from './ConversationBubble.module.css';
 import { FEEDBACK, MESSAGE_TYPE } from './conversationModels';
-import SpeakButton from '../components/TextToSpeechButton';
+import { useOutsideAlerter } from '../hooks';
 
 const DisableSourceFE = import.meta.env.VITE_DISABLE_SOURCE_FE || false;
 
@@ -36,35 +41,113 @@ const ConversationBubble = forwardRef<
     handleFeedback?: (feedback: FEEDBACK) => void;
     sources?: { title: string; text: string; source: string }[];
     retryBtn?: React.ReactElement;
+    questionNumber?: number;
+    handleUpdatedQuestionSubmission?: (
+      updatedquestion?: string,
+      updated?: boolean,
+      index?: number,
+    ) => void;
   }
 >(function ConversationBubble(
-  { message, type, className, feedback, handleFeedback, sources, retryBtn },
+  {
+    message,
+    type,
+    className,
+    feedback,
+    handleFeedback,
+    sources,
+    retryBtn,
+    questionNumber,
+    handleUpdatedQuestionSubmission,
+  },
   ref,
 ) {
+  // const bubbleRef = useRef<HTMLDivElement | null>(null);
   const chunks = useSelector(selectChunks);
   const selectedDocs = useSelector(selectSelectedDocs);
   const [isLikeHovered, setIsLikeHovered] = useState(false);
+  const [isEditClicked, setIsEditClicked] = useState(false);
   const [isDislikeHovered, setIsDislikeHovered] = useState(false);
+  const [isQuestionHovered, setIsQuestionHovered] = useState(false);
+  const [editInputBox, setEditInputBox] = useState<string>('');
+
   const [isLikeClicked, setIsLikeClicked] = useState(false);
   const [isDislikeClicked, setIsDislikeClicked] = useState(false);
   const [activeTooltip, setActiveTooltip] = useState<number | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
+  const editableQueryRef = useRef<HTMLDivElement | null>(null);
 
+  useOutsideAlerter(editableQueryRef, () => setIsEditClicked(false), [], true);
+  const handleEditClick = () => {
+    setIsEditClicked(false);
+    handleUpdatedQuestionSubmission?.(editInputBox, true, questionNumber);
+  };
   let bubble;
   if (type === 'QUESTION') {
     bubble = (
       <div
-        ref={ref}
-        className={`flex flex-row-reverse self-end flex-wrap ${className}`}
+        onMouseEnter={() => setIsQuestionHovered(true)}
+        onMouseLeave={() => setIsQuestionHovered(false)}
       >
-        <Avatar className="mt-2 text-2xl" avatar="🧑‍💻"></Avatar>
         <div
-          style={{
-            wordBreak: 'break-word',
-          }}
-          className="ml-10 mr-2 flex items-center rounded-[28px] bg-purple-30 py-[14px] px-[19px] text-white max-w-full whitespace-pre-wrap leading-normal"
+          ref={ref}
+          className={`flex flex-row-reverse self-end flex-wrap ${className}`}
         >
-          {message}
+          <Avatar
+            size="SMALL"
+            className="mt-2 text-2xl"
+            avatar={
+              <img className="rounded-full mr-1" width={30} src={UserIcon} />
+            }
+          />
+          {!isEditClicked && (
+            <div
+              style={{
+                wordBreak: 'break-word',
+              }}
+              className="text-sm sm:text-base ml-2 mr-2 flex items-center rounded-[28px] bg-purple-30 py-[14px] px-[19px] text-white max-w-full whitespace-pre-wrap leading-normal"
+            >
+              {message}
+            </div>
+          )}
+          {isEditClicked && (
+            <div ref={editableQueryRef} className="w-[75%] flex flex-col">
+              <textarea
+                placeholder="Type the updated query..."
+                onChange={(e) => {
+                  setEditInputBox(e.target.value);
+                }}
+                rows={1}
+                value={editInputBox}
+                className="ml-2 mr-12 text-[15px] resize-y h-12 min-h-max rounded-3xl p-3  no-scrollbar leading-relaxed dark:border-[0.5px] dark:border-white dark:bg-raisin-black dark:text-white px-[18px] border-[1.5px] border-black"
+              />
+              <div
+                className={`flex flex-row-reverse justify-end gap-1 mt-3 text-sm font-medium`}
+              >
+                <button
+                  className="rounded-full bg-[#CDB5FF] hover:bg-[#E1D3FF] py-[10px] px-[15px] text-purple-30 max-w-full whitespace-pre-wrap leading-none"
+                  onClick={() => handleEditClick()}
+                >
+                  Update
+                </button>
+                <button
+                  className="py-[10px] px-[15px]  no-underline hover:underline  text-purple-30 max-w-full whitespace-pre-wrap leading-normal"
+                  onClick={() => setIsEditClicked(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+          <button
+            onClick={() => {
+              setIsEditClicked(true);
+              setEditInputBox(message);
+            }}
+            className={`h-fit mt-3 p-2 cursor-pointer rounded-full hover:bg-[#35363B] flex items-center ${isQuestionHovered || isEditClicked ? 'visible' : 'invisible'}`}
+          >
+            <img src={Edit} alt="Edit" className="cursor-pointer" />
+          </button>
         </div>
       </div>
     );
@@ -141,7 +224,7 @@ const ConversationBubble = forwardRef<
                 />
                 <p className="text-base font-semibold">Sources</p>
               </div>
-              <div className="ml-3 mr-5 max-w-[90vw] md:max-w-[70vw] lg:max-w-[50vw]">
+              <div className="fade-in ml-3 mr-5 max-w-[90vw] md:max-w-[70vw] lg:max-w-[50vw]">
                 <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
                   {sources?.slice(0, 3)?.map((source, index) => (
                     <div key={index} className="relative">
@@ -190,7 +273,7 @@ const ConversationBubble = forwardRef<
                       </div>
                       {activeTooltip === index && (
                         <div
-                          className={`absolute left-1/2 z-30 max-h-48 w-40 translate-x-[-50%] translate-y-[3px] rounded-xl bg-[#FBFBFB] p-4 text-black shadow-xl dark:bg-chinese-black dark:text-chinese-silver sm:w-56`}
+                          className={`absolute left-1/2 z-50 max-h-48 w-40 translate-x-[-50%] translate-y-[3px] rounded-xl bg-[#FBFBFB] p-4 text-black shadow-xl dark:bg-chinese-black dark:text-chinese-silver sm:w-56`}
                           onMouseOver={() => setActiveTooltip(index)}
                           onMouseOut={() => setActiveTooltip(null)}
                         >
@@ -231,14 +314,14 @@ const ConversationBubble = forwardRef<
             <p className="text-base font-semibold">Answer</p>
           </div>
           <div
-            className={`ml-2 mr-5 flex max-w-[90vw] rounded-[28px] bg-gray-1000 py-[14px] px-7 dark:bg-gun-metal md:max-w-[70vw] lg:max-w-[50vw] ${
+            className={`fade-in-bubble ml-2 mr-5 flex max-w-[90vw] rounded-[28px] bg-gray-1000 py-[14px] px-7 dark:bg-gun-metal md:max-w-[70vw] lg:max-w-[50vw] ${
               type === 'ERROR'
                 ? 'relative flex-row items-center rounded-full border border-transparent bg-[#FFE7E7] p-2 py-5 text-sm font-normal text-red-3000  dark:border-red-2000 dark:text-white'
                 : 'flex-col rounded-3xl'
             }`}
           >
             <ReactMarkdown
-              className="whitespace-pre-wrap break-normal leading-normal"
+              className="fade-in whitespace-pre-wrap break-words leading-normal"
               remarkPlugins={[remarkGfm, remarkMath]}
               rehypePlugins={[rehypeKatex]}
               components={{
@@ -266,12 +349,7 @@ const ConversationBubble = forwardRef<
                       </div>
                     </div>
                   ) : (
-                    <code
-                      className={className ? className : 'whitespace-pre-line'}
-                      {...props}
-                    >
-                      {children}
-                    </code>
+                    <code className="whitespace-pre-line">{children}</code>
                   );
                 },
                 ul({ children }) {
@@ -474,7 +552,7 @@ function AllSources(sources: AllSourcesProps) {
                 ></img>
               ) : null}
             </span>
-            <p className="mt-3 max-h-24 overflow-y-auto break-words rounded-md text-left text-xs text-black dark:text-chinese-silver">
+            <p className="mt-3 max-h-16 overflow-y-auto break-words rounded-md text-left text-xs text-black dark:text-chinese-silver">
               {source.text}
             </p>
           </div>
