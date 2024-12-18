@@ -77,7 +77,7 @@
   },
   "modals": {
     "uploadDoc": {
-      "label": "上传新文档资料",
+      "label": "上传新文档",
       "select": "选择如何将文档上传到 DocsGPT",
       "file": "从设备上传",
       "back": "后退",
@@ -99,6 +99,10 @@
         "agent": "用户代理",
         "searchQueries": "搜索查询",
         "numberOfPosts": "帖子数量"
+      },
+      "drag": {
+        "title": "上传源文件",
+        "description": "将您的文件拖放到此处以将其添加为源"
       }
     },
     "createAPIKey": {
