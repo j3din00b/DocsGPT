@@ -1,14 +1,15 @@
 "use client";
 import React, { useRef } from 'react'
 import DOMPurify from 'dompurify';
-import styled, { keyframes, createGlobalStyle } from 'styled-components';
+import styled, { keyframes, css } from 'styled-components';
 import { PaperPlaneIcon, RocketIcon, ExclamationTriangleIcon, Cross2Icon } from '@radix-ui/react-icons';
-import { FEEDBACK, MESSAGE_TYPE, Query, Status, WidgetProps } from '../types/index';
+import { FEEDBACK, MESSAGE_TYPE, Query, Status, WidgetCoreProps, WidgetProps } from '../types/index';
 import { fetchAnswerStreaming, sendFeedback } from '../requests/streamingApi';
 import { ThemeProvider } from 'styled-components';
 import Like from "../assets/like.svg"
 import Dislike from "../assets/dislike.svg"
 import MarkdownIt from 'markdown-it';
+
 const themes = {
   dark: {
     bg: '#222327',
@@ -35,41 +36,99 @@ const themes = {
     }
   }
 }
-const GlobalStyles = createGlobalStyle`
-.response pre {
-    padding: 8px;
-    width: 90%;
-    font-size: 12px;
-    border-radius: 6px;
-    overflow-x: auto;
-    background-color: #1B1C1F;
-    color: #fff !important;
-}
-.response h1{
-  font-size: 20px;
-}
-.response h2{
-  font-size: 18px;
-}
-.response h3{
-  font-size: 16px;
-}
-.response p{
-  margin:0px;
-}
-.response code:not(pre code){
-  border-radius: 6px;
-  padding: 1px 3px 1px 3px;
-  font-size: 12px;
-  display: inline-block;
-  background-color: #646464;
-  color: #fff !important;
-}
-.response code {
-  white-space: pre-wrap !important;
-  line-break: loose !important;
-}
-`;
+
+const sizesConfig = {
+  small: { size: 'small', width: '320px', height: '400px' },
+  medium: { size: 'medium', width: '400px', height: '80vh' },
+  large: { size: 'large', width: '666px', height: '75vh' },
+  getCustom: (custom: { width: string; height: string; maxWidth?: string; maxHeight?: string }) => ({
+    size: 'custom',
+    width: custom.width,
+    height: custom.height,
+    maxWidth: custom.maxWidth || '968px',
+    maxHeight: custom.maxHeight || '70vh',
+  }),
+};
+const createBox = keyframes`
+   0% {
+        transform: scale(0.6);
+      }
+      90% {
+        transform: scale(1.02);
+      }
+      100% {
+        transform: scale(1);
+      }
+`
+const closeBox = keyframes`
+  0% {
+        transform: scale(1); 
+      }
+      10% {
+        transform: scale(1.02); 
+      }
+      100% {
+        transform: scale(0.6);
+      }
+`
+
+const openContainer = keyframes`
+      0% {
+        width: 200px;
+        height: 100px;
+      }
+      100% {
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+        border-radius: 12px;
+      }`
+const closeContainer = keyframes`
+  0% {
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+        border-radius: 12px;
+      }
+      100% {
+        width: 200px;
+        height: 100px;
+      }
+`
+const fadeIn = keyframes`
+  from {
+        opacity: 0;
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+        transform: scale(0.9);
+      }
+      to {
+        opacity: 1;
+        transform: scale(1);
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+      }
+`
+
+const fadeOut = keyframes`
+  from {
+        opacity: 1;
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+      }
+      to {
+        opacity: 0;
+        transform: scale(0.9);
+        width: ${(props) => props.theme.dimensions.width};
+        height: ${(props) => props.theme.dimensions.height};
+      }
+`
+const scaleAnimation = keyframes`
+  from {
+      transform: scale(1.2);
+      }
+      to {
+      transform: scale(1);
+      }
+`
 const Overlay = styled.div`
   position: fixed;
   top: 0;
@@ -80,54 +139,85 @@ const Overlay = styled.div`
   z-index: 999;
   transition: opacity 0.5s;
 `
-const WidgetContainer = styled.div<{ modal: boolean }>`
-    display: block;
+
+
+const WidgetContainer = styled.div<{ modal?: boolean, isOpen?: boolean }>`
+    all: initial;
     position: fixed;
     right: ${props => props.modal ? '50%' : '10px'};
     bottom: ${props => props.modal ? '50%' : '10px'};
-    z-index: 1000;
-    display: flex;
-    ${props => props.modal &&
-    "transform : translate(50%,50%);"
-  }
-    flex-direction: column;
+    z-index: 1001;
+    transform-origin:100% 100%;
+    display: block;
+    &.modal{
+      transform : translate(50%,50%);
+    }
+    &.open {
+        animation: css ${createBox} 250ms cubic-bezier(0.25, 0.1, 0.25, 1) forwards;
+    }
+    &.close {
+      animation: css ${closeBox} 250ms cubic-bezier(0.25, 0.1, 0.25, 1) forwards;
+    }
     align-items: center;
     text-align: left;
-    @media only screen and (max-width: 768px) {
-    max-height: 100vh !important;
-    overflow: auto;
-    }
 `;
-const StyledContainer = styled.div`
-    display: flex;
+
+const StyledContainer = styled.div<{ isOpen: boolean }>`
+    all: initial;
+    max-height: ${(props) => props.theme.dimensions.maxHeight};
+    max-width: ${(props) => props.theme.dimensions.maxWidth};
+    width: ${(props) => props.theme.dimensions.width};
+    height: ${(props) => props.theme.dimensions.height} ;
     position: relative;
     flex-direction: column;
-    justify-content: center;
+    justify-content: space-between;
     bottom: 0;
     left: 0;
-    border-radius: 0.75rem;
-    background-color: ${props => props.theme.primary.bg};
+    background-color: ${(props) => props.theme.primary.bg};
     font-family: sans-serif;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 2px 4px rgba(0, 0, 0, 0.1);
-    transition: visibility 0.3s, opacity 0.3s;
-`;
-const FloatingButton = styled.div<{ bgcolor: string }>`
-    position: fixed;
     display: flex;
+    border-radius: 12px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 2px 4px rgba(0, 0, 0, 0.1);
+    padding: 26px 26px 0px 26px;
+    animation: ${({ isOpen, theme }) =>
+    theme.dimensions.size === 'large'
+      ? isOpen
+        ? css`${fadeIn} 150ms ease-in forwards`
+        : css` ${fadeOut} 150ms ease-in forwards`
+      : isOpen
+        ? css`${openContainer} 150ms ease-in forwards`
+        : css`${closeContainer} 250ms ease-in forwards`};
+    @media only screen and (max-width: 768px) {
+      max-height: 100vh;
+      max-width: 80vw;
+      overflow: auto;
+    }
+`;
+
+const FloatingButton = styled.div<{ bgcolor: string, hidden: boolean, isAnimatingButton: boolean }>`
+    position: fixed;
+    display: ${props => props.hidden ? "none" : "flex"};
     z-index: 500;
     justify-content: center;
+    gap: 8px;
+    padding: 14px;
     align-items: center;
-    bottom: 1rem;
-    right: 1rem;
-    width: 5rem;
-    height: 5rem;
+    bottom: 16px;
+    color: white;
+    font-family: sans-serif;
+    right: 16px;
+    font-weight: 500;
     border-radius: 9999px;
     background: ${props => props.bgcolor};
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     cursor: pointer;
+    animation: ${props => props.isAnimatingButton ? css`${scaleAnimation} 200ms forwards` : 'none'};
     &:hover {
-        transform: scale(1.1);
-        transition: transform 0.2s ease-in-out;
+      transform: scale(1.1);
+      transition: transform 0.2s ease-in-out;
+    }
+    &:not(:hover) {
+      transition: transform 0.2s ease-in-out;
     }
 `;
 const CancelButton = styled.button`
@@ -135,7 +225,7 @@ const CancelButton = styled.button`
     position: absolute;
     top: 0;
     right: 0;
-    margin: 0.5rem;
+    margin: 8px;
     width: 30px;
     padding: 0;
     background-color: transparent;
@@ -154,52 +244,37 @@ const CancelButton = styled.button`
 
 const Header = styled.div`
     display: flex;
-    align-items: center;
-    padding-inline: 0.75rem;
-    padding-top: 1rem;
-    padding-bottom: 0.5rem;
-`;
-
-const IconWrapper = styled.div`
-    padding: 0.5rem;
+    align-items: flex-start;
 `;
 
 const ContentWrapper = styled.div`
-    flex: 1;
-    margin-left: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap:2px; 
+    margin-left: 8px;
 `;
 
 const Title = styled.h3`
-    font-size: 1rem;
+    font-size: 14px;
     font-weight: normal;
     color: ${props => props.theme.primary.text};
-    margin-top: 0;
-    margin-bottom: 0.25rem;
+    margin: 0;
 `;
 
 const Description = styled.p`
-    font-size: 0.85rem;
+    font-size: 13.75px;
     color: ${props => props.theme.secondary.text};
-    margin-top: 0;
+    margin: 0 ;
+    padding: 0 ;
 `;
 
-const Conversation = styled.div<{ size: string }>`
-    min-height: 250px;
-    max-width: 968px;
-    height: ${props => props.size === 'large' ? '75vh' : props.size === 'medium' ? '70vh' : '320px'};
-    width: ${props => props.size === 'large' ? '60vw' : props.size === 'medium' ? '28vw' : '400px'};
-    padding-inline: 0.5rem;
-    border-radius: 0.375rem;
-    text-align: left;
-    overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: #4a4a4a transparent; /* thumb color track color */
-    @media only screen and (max-width: 768px) {
-    width: 90vw !important;
-    }
-    @media only screen and (min-width:768px ) and (max-width: 1280px) {
-    width:${props => props.size === 'large' ? '90vw' : props.size === 'medium' ? '60vw' : '400px'} !important;
-    }
+const Conversation = styled.div`
+  height: 70%;
+  border-radius: 6px;
+  text-align: left;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #4a4a4a transparent; /* thumb color track color */
 `;
 const Feedback = styled.div`
   background-color: transparent;
@@ -215,9 +290,9 @@ const MessageBubble = styled.div<{ type: MESSAGE_TYPE }>`
     position: relative;
     width: 100%;;
     float: right;
-    margin: 0rem;
+    margin: 0px;
     &:hover ${Feedback} * {
-    visibility: visible !important;
+    visibility: visible ;
   }
 `;
 const Message = styled.div<{ type: MESSAGE_TYPE }>`
@@ -232,19 +307,66 @@ const Message = styled.div<{ type: MESSAGE_TYPE }>`
     margin: 4px;
     display: block;
     line-height: 1.5;
-    padding: 0.75rem;
-    border-radius: 0.375rem;
+    padding: 12px;
+    border-radius: 6px;
 `;
+const Markdown = styled.div`
+ pre {
+      padding: 8px;
+      width: 90%;
+      font-size: 12px;
+      border-radius: 6px;
+      overflow-x: auto;
+      background-color: #1B1C1F;
+      color: #fff ;
+    }
+
+    h1 {
+      font-size: 16px;
+    }
+
+    h2 {
+      font-size: 14px;
+    }
+
+    h3 {
+      font-size: 14px;
+    }
+
+    p {
+      margin: 0px;
+    }
+
+    code:not(pre code) {
+      border-radius: 6px;
+      padding: 1px 3px;
+      font-size: 12px;
+      display: inline-block;
+      background-color: #646464;
+      color: #fff ;
+    }
+
+    code {
+      white-space: pre-wrap ;
+      overflow-wrap: break-word;
+      word-break: break-all;
+    }
+
+    ul{
+      padding:0px;
+      list-style-position: inside;
+    }
+`
 const ErrorAlert = styled.div`
   color: #b91c1c;
   border:0.1px solid #b91c1c;
   display: flex;
   padding:4px;
-  margin:0.7rem;
+  margin:11.2px;
   opacity: 90%;
   max-width: 70%;
   font-weight: 400;
-  border-radius: 0.375rem;
+  border-radius: 6px;
   justify-content: space-evenly;
 `
 //dot loading animation
@@ -265,10 +387,9 @@ const DotAnimation = styled.div`
 const Delay = styled(DotAnimation) <{ delay: number }>`
   animation-delay: ${props => props.delay + 'ms'};
 `;
-const PromptContainer = styled.form<{ size: string }>`
+const PromptContainer = styled.form`
   background-color: transparent;
-  height: ${props => props.size == 'large' ? '60px' : '40px'};
-  margin: 16px;
+  height: ${props => props.theme.dimensions.size == 'large' ? '60px' : '40px'};
   display: flex;
   justify-content: space-evenly;
 `;
@@ -282,16 +403,18 @@ const StyledInput = styled.input`
   color: ${props => props.theme.text};
   outline: none;
 `;
-const StyledButton = styled.button<{ size: string }>`
+const StyledButton = styled.button`
   display: flex;
   justify-content: center;
   align-items: center;
   background-image: linear-gradient(to bottom right, #5AF0EC, #E80D9D);
+  background-color: rgba(0, 0, 0, 0.3);
   border-radius: 6px;
-  min-width: ${props => props.size === 'large' ? '60px' : '36px'};
-  height: ${props => props.size === 'large' ? '60px' : '36px'};
+  min-width: ${props => props.theme.dimensions.size === 'large' ? '60px' : '40px'};
+  height: ${props => props.theme.dimensions.size === 'large' ? '60px' : '40px'};
   margin-left:8px;
   padding: 0px;
+  
   border: none;
   cursor: pointer;
   outline: none;
@@ -299,62 +422,107 @@ const StyledButton = styled.button<{ size: string }>`
     opacity: 90%;
   }
   &:disabled {
-    opacity: 60%;
+    background-image: linear-gradient(to bottom right, #2d938f, #b31877);
   }`;
 const HeroContainer = styled.div`
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  display: flex;
-  justify-content: center;
-  align-items: middle;
-  transform: translate(-50%, -50%);
-  width: 80%;
+  position: relative;
+  width: 90%;
   max-width: 500px;
   background-image: linear-gradient(to bottom right, #5AF0EC, #ff1bf4);
   border-radius: 10px;
-  margin: 0 auto;
+  margin: 16px auto;
   padding: 2px;
 `;
 const HeroWrapper = styled.div`
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 8px;
+  align-items: middle;
   background-color: ${props => props.theme.primary.bg};
   border-radius: 10px; 
   font-weight: normal;
-  padding: 6px;
-  display: flex;
-  justify-content: space-between;
+  padding: 12px;
 `
 const HeroTitle = styled.h3`
   color: ${props => props.theme.text};
-  margin-bottom: 5px;
-  padding: 2px;
+  font-size: 16px;
+  margin:0px ;
+  padding: 0px;
 `;
 const HeroDescription = styled.p`
   color: ${props => props.theme.text};
-  font-size: 14px;
+  font-size: 12px;
   line-height: 1.5;
+  margin: 0px;
+  padding: 0px;
 `;
+const Hyperlink = styled.a`
+  color: #9971EC;
+  text-decoration: none;
+`;
+const Tagline = styled.div`
+  text-align: center;
+  display: block;
+  color: ${props => props.theme.secondary.text};
+  padding: 12px ;
+  font-size: 12px;
+`;
+
+
 
 const Hero = ({ title, description, theme }: { title: string, description: string, theme: string }) => {
   return (
-    <>
-      <HeroContainer>
-        <HeroWrapper>
-          <IconWrapper style={{ marginTop: '12px' }}>
-            <RocketIcon color={theme === 'light' ? 'black' : 'white'} width={20} height={20} />
-          </IconWrapper>
-          <div>
-            <HeroTitle>{title}</HeroTitle>
-            <HeroDescription>
-              {description}
-            </HeroDescription>
-          </div>
-        </HeroWrapper>
-      </HeroContainer>
-    </>
+    <HeroContainer>
+      <HeroWrapper>
+        <RocketIcon color={theme === 'light' ? 'black' : 'white'} width={24} height={24} />
+        <HeroTitle>{title}</HeroTitle>
+        <HeroDescription>{description}</HeroDescription>
+      </HeroWrapper>
+    </HeroContainer>
   );
 };
-export const DocsGPTWidget = ({
+export const DocsGPTWidget = (props: WidgetProps) => {
+
+  const {
+    buttonIcon = 'https://d3dg1063dc54p9.cloudfront.net/widget/chat.svg',
+    buttonText = 'Ask a question',
+    buttonBg = 'linear-gradient(to bottom right, #5AF0EC, #E80D9D)',
+    defaultOpen = false,
+    ...coreProps
+  } = props
+
+  const [open, setOpen] = React.useState<boolean>(defaultOpen);
+  const [isAnimatingButton, setIsAnimatingButton] = React.useState(false);
+  const [isFloatingButtonVisible, setIsFloatingButtonVisible] = React.useState(true);
+
+  React.useEffect(() => {
+    if (isFloatingButtonVisible)
+      setTimeout(() => setIsAnimatingButton(true), 250);
+    return () => {
+      setIsAnimatingButton(false)
+    }
+  }, [isFloatingButtonVisible])
+
+  const handleClose = () => {
+    setIsFloatingButtonVisible(true);
+    setOpen(false);
+  };
+  const handleOpen = () => {
+    setOpen(true);
+    setIsFloatingButtonVisible(false);
+  }
+  return (
+    <>
+      <FloatingButton bgcolor={buttonBg} onClick={handleOpen} hidden={!isFloatingButtonVisible} isAnimatingButton={isAnimatingButton}>
+        <img width={24} src={buttonIcon} />
+        <span>{buttonText}</span>
+      </FloatingButton>
+      <WidgetCore isOpen={open} handleClose={handleClose} {...coreProps} />
+    </>
+  )
+}
+export const WidgetCore = ({
   apiHost = 'https://gptcloud.arc53.com',
   apiKey = '82962c9a-aa77-4152-94e5-a4f84fd44c6a',
   avatar = 'https://d3dg1063dc54p9.cloudfront.net/cute-docsgpt.png',
@@ -364,19 +532,36 @@ export const DocsGPTWidget = ({
   heroDescription = 'This chatbot is built with DocsGPT and utilises GenAI, please review important information using sources.',
   size = 'small',
   theme = 'dark',
-  buttonIcon = 'https://d3dg1063dc54p9.cloudfront.net/widget/message.svg',
-  buttonBg = 'linear-gradient(to bottom right, #5AF0EC, #E80D9D)',
-  collectFeedback = true
-}: WidgetProps) => {
-  const [prompt, setPrompt] = React.useState('');
+  collectFeedback = true,
+  isOpen = false,
+  prefilledQuery = "",
+  handleClose
+}: WidgetCoreProps) => {
+  const [prompt, setPrompt] = React.useState<string>("");
+  const [mounted, setMounted] = React.useState(false);
   const [status, setStatus] = React.useState<Status>('idle');
-  const [queries, setQueries] = React.useState<Query[]>([])
-  const [conversationId, setConversationId] = React.useState<string | null>(null)
-  const [open, setOpen] = React.useState<boolean>(false)
+  const [queries, setQueries] = React.useState<Query[]>([]);
+  const [conversationId, setConversationId] = React.useState<string | null>(null);
   const [eventInterrupt, setEventInterrupt] = React.useState<boolean>(false); //click or scroll by user while autoScrolling
-  const isBubbleHovered = useRef<boolean>(false)
+
+  const isBubbleHovered = useRef<boolean>(false);
   const endMessageRef = React.useRef<HTMLDivElement | null>(null);
   const md = new MarkdownIt();
+
+  React.useEffect(() => {
+    if (isOpen) {
+      setMounted(true); // Mount the component
+      appendQuery(prefilledQuery)
+    } else {
+      // Wait for animations before unmounting
+      const timeout = setTimeout(() => {
+        setMounted(false)
+      }, 250);
+      return () => clearTimeout(timeout);
+    }
+  }, [isOpen]);
+
+
 
   const handleUserInterrupt = () => {
     (status === 'loading') && setEventInterrupt(true);
@@ -417,7 +602,7 @@ export const DocsGPTWidget = ({
             });
           }
         })
-        .catch(err => console.log("Connection failed",err))
+        .catch(err => console.log("Connection failed", err))
     }
     else {
       delete query.feedback;
@@ -477,126 +662,138 @@ export const DocsGPTWidget = ({
   }
   // submit handler
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
+    e.preventDefault();
+    await appendQuery(prompt)
+  }
+
+  const appendQuery = async (userQuery:string) => {
+    console.log(userQuery)
+    if(!userQuery)
+      return;
+
     setEventInterrupt(false);
-    queries.push({ prompt })
-    setPrompt('')
-    await stream(prompt)
+    queries.push({ prompt:userQuery});
+    setPrompt('');
+    await stream(userQuery);
   }
   const handleImageError = (event: React.SyntheticEvent<HTMLImageElement, Event>) => {
     event.currentTarget.src = "https://d3dg1063dc54p9.cloudfront.net/cute-docsgpt.png";
   };
-  return (
-    <ThemeProvider theme={themes[theme]}>
-      {open && size === 'large' &&
-        <Overlay onClick={() => {
-          setOpen(false)
-        }} />
-      }
-      <FloatingButton bgcolor={buttonBg} onClick={() => setOpen(!open)} hidden={open}>
-        <img style={{ maxHeight: '4rem', maxWidth: '4rem' }} src={buttonIcon} />
-      </FloatingButton>
-      <WidgetContainer modal={size == 'large'}>
-        <GlobalStyles />
-        {open && <StyledContainer>
-          <div>
-            <CancelButton onClick={() => setOpen(false)}>
-              <Cross2Icon width={24} height={24} color={theme === 'light' ? 'black' : 'white'} />
-            </CancelButton>
-            <Header>
-              <IconWrapper>
-                <img style={{ maxWidth: "42px", maxHeight: "42px" }} onError={handleImageError} src={avatar} alt='docs-gpt' />
-              </IconWrapper>
-              <ContentWrapper>
-                <Title>{title}</Title>
-                <Description>{description}</Description>
-              </ContentWrapper>
-            </Header>
-          </div>
-          <Conversation size={size} onWheel={handleUserInterrupt} onTouchMove={handleUserInterrupt}>
-            {
-              queries.length > 0 ? queries?.map((query, index) => {
-                return (
-                  <React.Fragment key={index}>
-                    {
-                      query.prompt && <MessageBubble type='QUESTION'>
-                        <Message
-                          type='QUESTION'
-                          ref={(!(query.response || query.error) && index === queries.length - 1) ? endMessageRef : null}>
-                          {query.prompt}
-                        </Message>
-                      </MessageBubble>
-                    }
-                    {
-                      query.response ? <MessageBubble onMouseOver={() => { isBubbleHovered.current = true }} type='ANSWER'>
-                        <Message
-                          type='ANSWER'
-                          ref={(index === queries.length - 1) ? endMessageRef : null}
-                        >
-                          <div
-                            className="response"
-                            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(md.render(query.response)) }}
-                          />
-                        </Message>
 
-                        {collectFeedback &&
-                          <Feedback>
-                            <Like
-                              style={{
-                                stroke: query.feedback == 'LIKE' ? '#8860DB' : '#c0c0c0',
-                                visibility: query.feedback == 'LIKE' ? 'visible' : 'hidden'
-                              }}
-                              fill='none'
-                              onClick={() => handleFeedback("LIKE", index)} />
-                            <Dislike
-                              style={{
-                                stroke: query.feedback == 'DISLIKE' ? '#ed8085' : '#c0c0c0',
-                                visibility: query.feedback == 'DISLIKE' ? 'visible' : 'hidden'
-                              }}
-                              fill='none'
-                              onClick={() => handleFeedback("DISLIKE", index)} />
-                          </Feedback>}
-                      </MessageBubble>
-                        : <div>
-                          {
-                            query.error ? <ErrorAlert>
-                              <IconWrapper>
-                                <ExclamationTriangleIcon style={{ marginTop: '4px' }} width={22} height={22} color='#b91c1c' />
-                              </IconWrapper>
-                              <div>
-                                <h5 style={{ margin: 2 }}>Network Error</h5>
-                                <span style={{ margin: 2, fontSize: '13px' }}>{query.error}</span>
-                              </div>
-                            </ErrorAlert>
-                              : <MessageBubble type='ANSWER'>
-                                <Message type='ANSWER' style={{ fontWeight: 600 }}>
-                                  <DotAnimation>.</DotAnimation>
-                                  <Delay delay={200}>.</Delay>
-                                  <Delay delay={400}>.</Delay>
-                                </Message>
-                              </MessageBubble>
-                          }
-                        </div>
-                    }
-                  </React.Fragment>)
-              })
-                : <Hero title={heroTitle} description={heroDescription} theme={theme} />
-            }
-          </Conversation>
-          <PromptContainer
-            size={size}
-            onSubmit={handleSubmit}>
-            <StyledInput
-              value={prompt} onChange={(event) => setPrompt(event.target.value)}
-              type='text' placeholder="What do you want to do?" />
-            <StyledButton
-              size={size}
-              disabled={prompt.trim().length == 0 || status !== 'idle'}>
-              <PaperPlaneIcon width={15} height={15} color='white' />
-            </StyledButton>
-          </PromptContainer>
-        </StyledContainer>}
-      </WidgetContainer>
+  const dimensions =
+    typeof size === 'object' && 'custom' in size
+      ? sizesConfig.getCustom(size.custom)
+      : sizesConfig[size];
+  if (!mounted) return null;
+  return (
+    <ThemeProvider theme={{ ...themes[theme], dimensions }}>
+      {isOpen && size === 'large' &&
+        <Overlay onClick={handleClose} />
+      }
+      {(
+        <WidgetContainer className={`${size !== 'large' ? (isOpen ? "open" : "close") : "modal"}`} modal={size === 'large'}>
+          <StyledContainer isOpen={isOpen}>
+            <div>
+              <CancelButton onClick={handleClose}>
+                <Cross2Icon width={24} height={24} color={theme === 'light' ? 'black' : 'white'} />
+              </CancelButton>
+              <Header>
+                <img style={{ transform: 'translateY(-5px)', maxWidth: "42px", maxHeight: "42px" }} onError={handleImageError} src={avatar} alt='docs-gpt' />
+                <ContentWrapper>
+                  <Title>{title}</Title>
+                  <Description>{description}</Description>
+                </ContentWrapper>
+              </Header>
+            </div>
+            <Conversation onWheel={handleUserInterrupt} onTouchMove={handleUserInterrupt}>
+              {
+                queries.length > 0 ? queries?.map((query, index) => {
+                  return (
+                    <React.Fragment key={index}>
+                      {
+                        query.prompt && <MessageBubble type='QUESTION'>
+                          <Message
+                            type='QUESTION'
+                            ref={(!(query.response || query.error) && index === queries.length - 1) ? endMessageRef : null}>
+                            {query.prompt}
+                          </Message>
+                        </MessageBubble>
+                      }
+                      {
+                        query.response ? <MessageBubble onMouseOver={() => { isBubbleHovered.current = true }} type='ANSWER'>
+                          <Message
+                            type='ANSWER'
+                            ref={(index === queries.length - 1) ? endMessageRef : null}
+                          >
+                            <Markdown
+                              dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(md.render(query.response)) }}
+                            />
+                          </Message>
+
+                          {collectFeedback &&
+                            <Feedback>
+                              <Like
+                                style={{
+                                  stroke: query.feedback == 'LIKE' ? '#8860DB' : '#c0c0c0',
+                                  visibility: query.feedback == 'LIKE' ? 'visible' : 'hidden'
+                                }}
+                                fill='none'
+                                onClick={() => handleFeedback("LIKE", index)} />
+                              <Dislike
+                                style={{
+                                  stroke: query.feedback == 'DISLIKE' ? '#ed8085' : '#c0c0c0',
+                                  visibility: query.feedback == 'DISLIKE' ? 'visible' : 'hidden'
+                                }}
+                                fill='none'
+                                onClick={() => handleFeedback("DISLIKE", index)} />
+                            </Feedback>}
+                        </MessageBubble>
+                          : <div>
+                            {
+                              query.error ? <ErrorAlert>
+
+                                <ExclamationTriangleIcon width={22} height={22} color='#b91c1c' />
+                                <div>
+                                  <h5 style={{ margin: 2 }}>Network Error</h5>
+                                  <span style={{ margin: 2, fontSize: '13px' }}>{query.error}</span>
+                                </div>
+                              </ErrorAlert>
+                                : <MessageBubble type='ANSWER'>
+                                  <Message type='ANSWER' style={{ fontWeight: 600 }}>
+                                    <DotAnimation>.</DotAnimation>
+                                    <Delay delay={200}>.</Delay>
+                                    <Delay delay={400}>.</Delay>
+                                  </Message>
+                                </MessageBubble>
+                            }
+                          </div>
+                      }
+                    </React.Fragment>)
+                })
+                  : <Hero title={heroTitle} description={heroDescription} theme={theme} />
+              }
+            </Conversation>
+            <div>
+              <PromptContainer
+                onSubmit={handleSubmit}>
+                <StyledInput
+                  autoFocus
+                  value={prompt} onChange={(event) => setPrompt(event.target.value)}
+                  type='text' placeholder="Ask your question" />
+                <StyledButton
+                  disabled={prompt.trim().length == 0 || status !== 'idle'}>
+                  <PaperPlaneIcon width={18} height={18} color='white' />
+                </StyledButton>
+              </PromptContainer>
+              <Tagline>
+                Powered by&nbsp;
+                <Hyperlink target='_blank' href='https://www.docsgpt.cloud/'>DocsGPT</Hyperlink>
+              </Tagline>
+            </div>
+          </StyledContainer>
+        </WidgetContainer>
+      )
+      }
     </ThemeProvider>
   )
 }
