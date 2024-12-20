@@ -7,7 +7,9 @@ import SettingsBar from '../components/SettingsBar';
 import i18n from '../locale/i18n';
 import { Doc } from '../models/misc';
 import {
+  selectPaginatedDocuments,
   selectSourceDocs,
+  setPaginatedDocuments,
   setSourceDocs,
 } from '../preferences/preferenceSlice';
 import Analytics from './Analytics';
@@ -15,6 +17,7 @@ import APIKeys from './APIKeys';
 import Documents from './Documents';
 import General from './General';
 import Logs from './Logs';
+import Tools from './Tools';
 import Widgets from './Widgets';
 
 export default function Settings() {
@@ -26,20 +29,29 @@ export default function Settings() {
   );
 
   const documents = useSelector(selectSourceDocs);
+  const paginatedDocuments = useSelector(selectPaginatedDocuments);
   const updateWidgetScreenshot = (screenshot: File | null) => {
     setWidgetScreenshot(screenshot);
   };
+
+  const updateDocumentsList = (documents: Doc[], index: number) => [
+    ...documents.slice(0, index),
+    ...documents.slice(index + 1),
+  ];
 
   const handleDeleteClick = (index: number, doc: Doc) => {
     userService
       .deletePath(doc.id ?? '')
       .then((response) => {
         if (response.ok && documents) {
-          const updatedDocuments = [
-            ...documents.slice(0, index),
-            ...documents.slice(index + 1),
-          ];
-          dispatch(setSourceDocs(updatedDocuments));
+          if (paginatedDocuments) {
+            dispatch(
+              setPaginatedDocuments(
+                updateDocumentsList(paginatedDocuments, index),
+              ),
+            );
+          }
+          dispatch(setSourceDocs(updateDocumentsList(documents, index)));
         }
       })
       .catch((error) => console.error(error));
@@ -72,7 +84,7 @@ export default function Settings() {
       case t('settings.documents.label'):
         return (
           <Documents
-            documents={documents}
+            paginatedDocuments={paginatedDocuments}
             handleDeleteDocument={handleDeleteClick}
           />
         );
@@ -89,6 +101,8 @@ export default function Settings() {
         return <Analytics />;
       case t('settings.logs.label'):
         return <Logs />;
+      case t('settings.tools.label'):
+        return <Tools />;
       default:
         return null;
     }

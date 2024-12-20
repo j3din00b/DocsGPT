@@ -2,7 +2,9 @@ import apiClient from '../client';
 import endpoints from '../endpoints';
 
 const userService = {
-  getDocs: (): Promise<any> => apiClient.get(endpoints.USER.DOCS),
+  getDocs: (): Promise<any> => apiClient.get(`${endpoints.USER.DOCS}`),
+  getDocsWithPagination: (query: string): Promise<any> =>
+    apiClient.get(`${endpoints.USER.DOCS_PAGINATED}?${query}`),
   checkDocs: (data: any): Promise<any> =>
     apiClient.post(endpoints.USER.DOCS_CHECK, data),
   getAPIKeys: (): Promise<any> => apiClient.get(endpoints.USER.API_KEYS),
@@ -33,6 +35,16 @@ const userService = {
     apiClient.post(endpoints.USER.LOGS, data),
   manageSync: (data: any): Promise<any> =>
     apiClient.post(endpoints.USER.MANAGE_SYNC, data),
+  getAvailableTools: (): Promise<any> =>
+    apiClient.get(endpoints.USER.GET_AVAILABLE_TOOLS),
+  getUserTools: (): Promise<any> =>
+    apiClient.get(endpoints.USER.GET_USER_TOOLS),
+  createTool: (data: any): Promise<any> =>
+    apiClient.post(endpoints.USER.CREATE_TOOL, data),
+  updateToolStatus: (data: any): Promise<any> =>
+    apiClient.post(endpoints.USER.UPDATE_TOOL_STATUS, data),
+  updateTool: (data: any): Promise<any> =>
+    apiClient.post(endpoints.USER.UPDATE_TOOL, data),
 };
 
 export default userService;

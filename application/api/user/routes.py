@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import shutil
 import uuid
@@ -6,8 +7,8 @@ import uuid
 from bson.binary import Binary, UuidRepresentation
 from bson.dbref import DBRef
 from bson.objectid import ObjectId
-from flask import Blueprint, jsonify, make_response, request
-from flask_restx import inputs, fields, Namespace, Resource
+from flask import Blueprint, jsonify, make_response, redirect, request
+from flask_restx import fields, inputs, Namespace, Resource
 from werkzeug.utils import secure_filename
 
 from application.api.user.tasks import ingest, ingest_remote
@@ -15,9 +16,10 @@ from application.api.user.tasks import ingest, ingest_remote
 from application.core.mongo_db import MongoDB
 from application.core.settings import settings
 from application.extensions import api
+from application.tools.tool_manager import ToolManager
+from application.tts.google_tts import GoogleTTS
 from application.utils import check_required_fields
 from application.vectorstore.vector_creator import VectorCreator
-from application.tts.google_tts import GoogleTTS
 
 mongo = MongoDB.get_client()
 db = mongo["docsgpt"]
@@ -29,6 +31,7 @@ api_key_collection = db["api_keys"]
 token_usage_collection = db["token_usage"]
 shared_conversations_collections = db["shared_conversations"]
 user_logs_collection = db["user_logs"]
+user_tools_collection = db["user_tools"]
 
 user = Blueprint("user", __name__)
 user_ns = Namespace("user", description="User related operations", path="/")
@@ -37,6 +40,9 @@ api.add_namespace(user_ns)
 current_dir = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+
+tool_config = {}
+tool_manager = ToolManager(config=tool_config)
 
 
 def generate_minute_range(start_date, end_date):
@@ -175,10 +181,12 @@ class SubmitFeedback(Resource):
             "FeedbackModel",
             {
                 "question": fields.String(
-                    required=True, description="The user question"
+                    required=False, description="The user question"
                 ),
-                "answer": fields.String(required=True, description="The AI answer"),
+                "answer": fields.String(required=False, description="The AI answer"),
                 "feedback": fields.String(required=True, description="User feedback"),
+                "question_index":fields.Integer(required=True, description="The question number in that particular conversation"),
+                "conversation_id":fields.String(required=True, description="id of the particular conversation"),
                 "api_key": fields.String(description="Optional API key"),
             },
         )
@@ -188,23 +196,21 @@ class SubmitFeedback(Resource):
     )
     def post(self):
         data = request.get_json()
-        required_fields = ["question", "answer", "feedback"]
+        required_fields = [ "feedback","conversation_id","question_index"]
         missing_fields = check_required_fields(data, required_fields)
         if missing_fields:
             return missing_fields
 
-        new_doc = {
-            "question": data["question"],
-            "answer": data["answer"],
-            "feedback": data["feedback"],
-            "timestamp": datetime.datetime.now(datetime.timezone.utc),
-        }
-
-        if "api_key" in data:
-            new_doc["api_key"] = data["api_key"]
-
         try:
-            feedback_collection.insert_one(new_doc)
+            conversations_collection.update_one(
+            {"_id": ObjectId(data["conversation_id"]), f"queries.{data['question_index']}": {"$exists": True}},
+            {
+                "$set": {
+                    f"queries.{data['question_index']}.feedback": data["feedback"]
+                }
+            }
+        )
+           
         except Exception as err:
             return make_response(jsonify({"success": False, "error": str(err)}), 400)
 
@@ -247,13 +253,12 @@ class DeleteOldIndexes(Resource):
                 jsonify({"success": False, "message": "Missing required fields"}), 400
             )
 
-        try:
-            doc = sources_collection.find_one(
+        doc = sources_collection.find_one(
                 {"_id": ObjectId(source_id), "user": "local"}
-            )
-            if not doc:
+        )
+        if not doc:
                 return make_response(jsonify({"status": "not found"}), 404)
-
+        try:
             if settings.VECTOR_STORE == "faiss":
                 shutil.rmtree(os.path.join(current_dir, "indexes", str(doc["_id"])))
             else:
@@ -262,12 +267,12 @@ class DeleteOldIndexes(Resource):
                 )
                 vectorstore.delete_index()
 
-            sources_collection.delete_one({"_id": ObjectId(source_id)})
         except FileNotFoundError:
             pass
         except Exception as err:
             return make_response(jsonify({"success": False, "error": str(err)}), 400)
-
+        
+        sources_collection.delete_one({"_id": ObjectId(source_id)})
         return make_response(jsonify({"success": True}), 200)
 
 
@@ -315,7 +320,7 @@ class UploadFile(Resource):
                 for file in files:
                     filename = secure_filename(file.filename)
                     file.save(os.path.join(temp_dir, filename))
-
+                    print(f"Saved file: {filename}")
                 zip_path = shutil.make_archive(
                     base_name=os.path.join(save_dir, job_name),
                     format="zip",
@@ -323,6 +328,29 @@ class UploadFile(Resource):
                 )
                 final_filename = os.path.basename(zip_path)
                 shutil.rmtree(temp_dir)
+                task = ingest.delay(
+                    settings.UPLOAD_FOLDER,
+                    [
+                        ".rst",
+                        ".md",
+                        ".pdf",
+                        ".txt",
+                        ".docx",
+                        ".csv",
+                        ".epub",
+                        ".html",
+                        ".mdx",
+                        ".json",
+                        ".xlsx",
+                        ".pptx",
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                    ],
+                    job_name,
+                    final_filename,
+                    user,
+                )
             else:
                 file = files[0]
                 final_filename = secure_filename(file.filename)
@@ -344,14 +372,18 @@ class UploadFile(Resource):
                         ".json",
                         ".xlsx",
                         ".pptx",
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
                     ],
                     job_name,
                     final_filename,
                     user,
                 )
-        except Exception as err:
-            return make_response(jsonify({"success": False, "error": str(err)}), 400)
 
+        except Exception as err:
+            print(f"Error: {err}")
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
         return make_response(jsonify({"success": True, "task_id": task.id}), 200)
 
 
@@ -422,6 +454,11 @@ class TaskStatus(Resource):
 
             task = celery.AsyncResult(task_id)
             task_meta = task.info
+            print(f"Task status: {task.status}")
+            if not isinstance(
+                task_meta, (dict, list, str, int, float, bool, type(None))
+            ):
+                task_meta = str(task_meta)  # Convert to a string representation
         except Exception as err:
             return make_response(jsonify({"success": False, "error": str(err)}), 400)
 
@@ -429,6 +466,77 @@ class TaskStatus(Resource):
 
 
 @user_ns.route("/api/combine")
+class RedirectToSources(Resource):
+    @api.doc(
+        description="Redirects /api/combine to /api/sources for backward compatibility"
+    )
+    def get(self):
+        return redirect("/api/sources", code=301)
+
+
+@user_ns.route("/api/sources/paginated")
+class PaginatedSources(Resource):
+    @api.doc(description="Get document with pagination, sorting and filtering")
+    def get(self):
+        user = "local"
+        sort_field = request.args.get("sort", "date")  # Default to 'date'
+        sort_order = request.args.get("order", "desc")  # Default to 'desc'
+        page = int(request.args.get("page", 1))  # Default to 1
+        rows_per_page = int(request.args.get("rows", 10))  # Default to 10
+        # add .strip() to remove leading and trailing whitespaces
+        search_term = request.args.get(
+            "search", ""
+        ).strip()  # add search for filter documents
+
+        # Prepare query for filtering
+        query = {"user": user}
+        if search_term:
+            query["name"] = {
+                "$regex": search_term,
+                "$options": "i",  # using case-insensitive search
+            }
+
+        total_documents = sources_collection.count_documents(query)
+        total_pages = max(1, math.ceil(total_documents / rows_per_page))
+        page = min(max(1, page), total_pages) # add this to make sure page inbound is within the range
+        sort_order = 1 if sort_order == "asc" else -1
+        skip = (page - 1) * rows_per_page
+
+        try:
+            documents = (
+                sources_collection.find(query)
+                .sort(sort_field, sort_order)
+                .skip(skip)
+                .limit(rows_per_page)
+            )
+
+            paginated_docs = []
+            for doc in documents:
+                doc_data = {
+                    "id": str(doc["_id"]),
+                    "name": doc.get("name", ""),
+                    "date": doc.get("date", ""),
+                    "model": settings.EMBEDDINGS_NAME,
+                    "location": "local",
+                    "tokens": doc.get("tokens", ""),
+                    "retriever": doc.get("retriever", "classic"),
+                    "syncFrequency": doc.get("sync_frequency", ""),
+                }
+                paginated_docs.append(doc_data)
+
+            response = {
+                "total": total_documents,
+                "totalPages": total_pages,
+                "currentPage": page,
+                "paginated": paginated_docs,
+            }
+            return make_response(jsonify(response), 200)
+
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+
+@user_ns.route("/api/sources")
 class CombinedJson(Resource):
     @api.doc(description="Provide JSON file with combined available indexes")
     def get(self):
@@ -483,6 +591,7 @@ class CombinedJson(Resource):
                         "retriever": "brave_search",
                     }
                 )
+
         except Exception as err:
             return make_response(jsonify({"success": False, "error": str(err)}), 400)
 
@@ -1672,7 +1781,9 @@ class TextToSpeech(Resource):
     tts_model = api.model(
         "TextToSpeechModel",
         {
-            "text": fields.String(required=True, description="Text to be synthesized as audio"),
+            "text": fields.String(
+                required=True, description="Text to be synthesized as audio"
+            ),
         },
     )
 
@@ -1682,10 +1793,309 @@ class TextToSpeech(Resource):
         data = request.get_json()
         text = data["text"]
         try:
-            tts_instance = GoogleTTS(text)
-            audio_base64, detected_language = tts_instance.text_to_speech()
-            return make_response(jsonify({"success": True,'audio_base64': audio_base64,'lang':detected_language}), 200)
+            tts_instance = GoogleTTS()
+            audio_base64, detected_language = tts_instance.text_to_speech(text)
+            return make_response(
+                jsonify(
+                    {
+                        "success": True,
+                        "audio_base64": audio_base64,
+                        "lang": detected_language,
+                    }
+                ),
+                200,
+            )
         except Exception as err:
             return make_response(jsonify({"success": False, "error": str(err)}), 400)
 
 
+@user_ns.route("/api/available_tools")
+class AvailableTools(Resource):
+    @api.doc(description="Get available tools for a user")
+    def get(self):
+        try:
+            tools_metadata = []
+            for tool_name, tool_instance in tool_manager.tools.items():
+                doc = tool_instance.__doc__.strip()
+                lines = doc.split("\n", 1)
+                name = lines[0].strip()
+                description = lines[1].strip() if len(lines) > 1 else ""
+                tools_metadata.append(
+                    {
+                        "name": tool_name,
+                        "displayName": name,
+                        "description": description,
+                        "configRequirements": tool_instance.get_config_requirements(),
+                        "actions": tool_instance.get_actions_metadata(),
+                    }
+                )
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True, "data": tools_metadata}), 200)
+
+
+@user_ns.route("/api/get_tools")
+class GetTools(Resource):
+    @api.doc(description="Get tools created by a user")
+    def get(self):
+        try:
+            user = "local"
+            tools = user_tools_collection.find({"user": user})
+            user_tools = []
+            for tool in tools:
+                tool["id"] = str(tool["_id"])
+                tool.pop("_id")
+                user_tools.append(tool)
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True, "tools": user_tools}), 200)
+
+
+@user_ns.route("/api/create_tool")
+class CreateTool(Resource):
+    @api.expect(
+        api.model(
+            "CreateToolModel",
+            {
+                "name": fields.String(required=True, description="Name of the tool"),
+                "displayName": fields.String(
+                    required=True, description="Display name for the tool"
+                ),
+                "description": fields.String(
+                    required=True, description="Tool description"
+                ),
+                "config": fields.Raw(
+                    required=True, description="Configuration of the tool"
+                ),
+                "actions": fields.List(
+                    fields.Raw,
+                    required=True,
+                    description="Actions the tool can perform",
+                ),
+                "status": fields.Boolean(
+                    required=True, description="Status of the tool"
+                ),
+            },
+        )
+    )
+    @api.doc(description="Create a new tool")
+    def post(self):
+        data = request.get_json()
+        required_fields = [
+            "name",
+            "displayName",
+            "description",
+            "actions",
+            "config",
+            "status",
+        ]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        user = "local"
+        transformed_actions = []
+        for action in data["actions"]:
+            action["active"] = True
+            if "parameters" in action:
+                if "properties" in action["parameters"]:
+                    for param_name, param_details in action["parameters"][
+                        "properties"
+                    ].items():
+                        param_details["filled_by_llm"] = True
+                        param_details["value"] = ""
+            transformed_actions.append(action)
+        try:
+            new_tool = {
+                "user": user,
+                "name": data["name"],
+                "displayName": data["displayName"],
+                "description": data["description"],
+                "actions": transformed_actions,
+                "config": data["config"],
+                "status": data["status"],
+            }
+            resp = user_tools_collection.insert_one(new_tool)
+            new_id = str(resp.inserted_id)
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"id": new_id}), 200)
+
+
+@user_ns.route("/api/update_tool")
+class UpdateTool(Resource):
+    @api.expect(
+        api.model(
+            "UpdateToolModel",
+            {
+                "id": fields.String(required=True, description="Tool ID"),
+                "name": fields.String(description="Name of the tool"),
+                "displayName": fields.String(description="Display name for the tool"),
+                "description": fields.String(description="Tool description"),
+                "config": fields.Raw(description="Configuration of the tool"),
+                "actions": fields.List(
+                    fields.Raw, description="Actions the tool can perform"
+                ),
+                "status": fields.Boolean(description="Status of the tool"),
+            },
+        )
+    )
+    @api.doc(description="Update a tool by ID")
+    def post(self):
+        data = request.get_json()
+        required_fields = ["id"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        try:
+            update_data = {}
+            if "name" in data:
+                update_data["name"] = data["name"]
+            if "displayName" in data:
+                update_data["displayName"] = data["displayName"]
+            if "description" in data:
+                update_data["description"] = data["description"]
+            if "actions" in data:
+                update_data["actions"] = data["actions"]
+            if "config" in data:
+                update_data["config"] = data["config"]
+            if "status" in data:
+                update_data["status"] = data["status"]
+
+            user_tools_collection.update_one(
+                {"_id": ObjectId(data["id"]), "user": "local"},
+                {"$set": update_data},
+            )
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True}), 200)
+
+
+@user_ns.route("/api/update_tool_config")
+class UpdateToolConfig(Resource):
+    @api.expect(
+        api.model(
+            "UpdateToolConfigModel",
+            {
+                "id": fields.String(required=True, description="Tool ID"),
+                "config": fields.Raw(
+                    required=True, description="Configuration of the tool"
+                ),
+            },
+        )
+    )
+    @api.doc(description="Update the configuration of a tool")
+    def post(self):
+        data = request.get_json()
+        required_fields = ["id", "config"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        try:
+            user_tools_collection.update_one(
+                {"_id": ObjectId(data["id"])},
+                {"$set": {"config": data["config"]}},
+            )
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True}), 200)
+
+
+@user_ns.route("/api/update_tool_actions")
+class UpdateToolActions(Resource):
+    @api.expect(
+        api.model(
+            "UpdateToolActionsModel",
+            {
+                "id": fields.String(required=True, description="Tool ID"),
+                "actions": fields.List(
+                    fields.Raw,
+                    required=True,
+                    description="Actions the tool can perform",
+                ),
+            },
+        )
+    )
+    @api.doc(description="Update the actions of a tool")
+    def post(self):
+        data = request.get_json()
+        required_fields = ["id", "actions"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        try:
+            user_tools_collection.update_one(
+                {"_id": ObjectId(data["id"])},
+                {"$set": {"actions": data["actions"]}},
+            )
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True}), 200)
+
+
+@user_ns.route("/api/update_tool_status")
+class UpdateToolStatus(Resource):
+    @api.expect(
+        api.model(
+            "UpdateToolStatusModel",
+            {
+                "id": fields.String(required=True, description="Tool ID"),
+                "status": fields.Boolean(
+                    required=True, description="Status of the tool"
+                ),
+            },
+        )
+    )
+    @api.doc(description="Update the status of a tool")
+    def post(self):
+        data = request.get_json()
+        required_fields = ["id", "status"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        try:
+            user_tools_collection.update_one(
+                {"_id": ObjectId(data["id"])},
+                {"$set": {"status": data["status"]}},
+            )
+        except Exception as err:
+            return make_response(jsonify({"success": False, "error": str(err)}), 400)
+
+        return make_response(jsonify({"success": True}), 200)
+
+
+@user_ns.route("/api/delete_tool")
+class DeleteTool(Resource):
+    @api.expect(
+        api.model(
+            "DeleteToolModel",
+            {"id": fields.String(required=True, description="Tool ID")},
+        )
+    )
+    @api.doc(description="Delete a tool by ID")
+    def post(self):
+        data = request.get_json()
+        required_fields = ["id"]
+        missing_fields = check_required_fields(data, required_fields)
+        if missing_fields:
+            return missing_fields
+
+        try:
+            result = user_tools_collection.delete_one({"_id": ObjectId(data["id"])})
+            if result.deleted_count == 0:
+                return {"success": False, "message": "Tool not found"}, 404
+        except Exception as err:
+            return {"success": False, "error": str(err)}, 400
+
+        return {"success": True}, 200
+      
