@@ -28,7 +28,7 @@ from application.core.settings import settings
 from application.extensions import api
 from application.storage.storage_creator import StorageCreator
 from application.tts.google_tts import GoogleTTS
-from application.utils import check_required_fields, validate_function_name
+from application.utils import check_required_fields, safe_filename, validate_function_name
 from application.vectorstore.vector_creator import VectorCreator
 
 storage = StorageCreator.get_storage()
@@ -45,6 +45,7 @@ shared_conversations_collections = db["shared_conversations"]
 users_collection = db["users"]
 user_logs_collection = db["user_logs"]
 user_tools_collection = db["user_tools"]
+attachments_collection = db["attachments"]
 
 agents_collection.create_index(
     [("shared", 1)],
@@ -252,13 +253,34 @@ class GetSingleConversation(Resource):
             )
             if not conversation:
                 return make_response(jsonify({"status": "not found"}), 404)
+            
+            # Process queries to include attachment names
+            queries = conversation["queries"]
+            for query in queries:
+                if "attachments" in query and query["attachments"]:
+                    attachment_details = []
+                    for attachment_id in query["attachments"]:
+                        try:
+                            attachment = attachments_collection.find_one(
+                                {"_id": ObjectId(attachment_id)}
+                            )
+                            if attachment:
+                                attachment_details.append({
+                                    "id": str(attachment["_id"]),
+                                    "fileName": attachment.get("filename", "Unknown file")
+                                })
+                        except Exception as e:
+                            current_app.logger.error(
+                                f"Error retrieving attachment {attachment_id}: {e}", exc_info=True
+                            )
+                    query["attachments"] = attachment_details
         except Exception as err:
             current_app.logger.error(
                 f"Error retrieving conversation: {err}", exc_info=True
             )
             return make_response(jsonify({"success": False}), 400)
         data = {
-            "queries": conversation["queries"],
+            "queries": queries,
             "agent_id": conversation.get("agent_id"),
             "is_shared_usage": conversation.get("is_shared_usage", False),
             "shared_token": conversation.get("shared_token", None),
@@ -475,29 +497,30 @@ class UploadFile(Resource):
                 ),
                 400,
             )
-        user = secure_filename(decoded_token.get("sub"))
-        job_name = secure_filename(request.form["name"])
+        user = decoded_token.get("sub")
+        job_name = request.form["name"]
+        
+        # Create safe versions for filesystem operations
+        safe_user = safe_filename(user)
+        dir_name = safe_filename(job_name)
 
         try:
-            from application.storage.storage_creator import StorageCreator
-
             storage = StorageCreator.get_storage()
-
-            base_path = f"{settings.UPLOAD_FOLDER}/{user}/{job_name}"
+            base_path = f"{settings.UPLOAD_FOLDER}/{safe_user}/{dir_name}"
 
             if len(files) > 1:
                 temp_files = []
                 for file in files:
-                    filename = secure_filename(file.filename)
+                    filename = safe_filename(file.filename)
                     temp_path = f"{base_path}/temp/{filename}"
                     storage.save_file(file, temp_path)
                     temp_files.append(temp_path)
                     print(f"Saved file: {filename}")
-                zip_filename = f"{job_name}.zip"
+                zip_filename = f"{dir_name}.zip"
                 zip_path = f"{base_path}/{zip_filename}"
                 zip_temp_path = None
 
-                def create_zip_archive(temp_paths, job_name, storage):
+                def create_zip_archive(temp_paths, dir_name, storage):
                     import tempfile
 
                     with tempfile.NamedTemporaryFile(
@@ -537,7 +560,7 @@ class UploadFile(Resource):
                     return zip_output_path
 
                 try:
-                    zip_temp_path = create_zip_archive(temp_files, job_name, storage)
+                    zip_temp_path = create_zip_archive(temp_files, dir_name, storage)
                     with open(zip_temp_path, "rb") as zip_file:
                         storage.save_file(zip_file, zip_path)
                     task = ingest.delay(
@@ -562,6 +585,8 @@ class UploadFile(Resource):
                         job_name,
                         zip_filename,
                         user,
+                        dir_name,
+                        safe_user,
                     )
                 finally:
                     # Clean up temporary files
@@ -582,7 +607,7 @@ class UploadFile(Resource):
                 # For single file
 
                 file = files[0]
-                filename = secure_filename(file.filename)
+                filename = safe_filename(file.filename)
                 file_path = f"{base_path}/{filename}"
 
                 storage.save_file(file, file_path)
@@ -609,6 +634,8 @@ class UploadFile(Resource):
                     job_name,
                     filename,  # Corrected variable for single-file case
                     user,
+                    dir_name,
+                    safe_user,
                 )
         except Exception as err:
             current_app.logger.error(f"Error uploading file: {err}", exc_info=True)
@@ -2205,7 +2232,7 @@ class GetPubliclySharedConversations(Resource):
                     return make_response(
                         jsonify(
                             {
-                                "sucess": False,
+                                "success": False,
                                 "error": "might have broken url or the conversation does not exist",
                             }
                         ),
@@ -2214,11 +2241,30 @@ class GetPubliclySharedConversations(Resource):
                 conversation_queries = conversation["queries"][
                     : (shared["first_n_queries"])
                 ]
+                
+                for query in conversation_queries:
+                    if "attachments" in query and query["attachments"]:
+                        attachment_details = []
+                        for attachment_id in query["attachments"]:
+                            try:
+                                attachment = attachments_collection.find_one(
+                                    {"_id": ObjectId(attachment_id)}
+                                )
+                                if attachment:
+                                    attachment_details.append({
+                                        "id": str(attachment["_id"]),
+                                        "fileName": attachment.get("filename", "Unknown file")
+                                    })
+                            except Exception as e:
+                                current_app.logger.error(
+                                    f"Error retrieving attachment {attachment_id}: {e}", exc_info=True
+                                )
+                        query["attachments"] = attachment_details
             else:
                 return make_response(
                     jsonify(
                         {
-                            "sucess": False,
+                            "success": False,
                             "error": "might have broken url or the conversation does not exist",
                         }
                     ),
@@ -3416,7 +3462,7 @@ class StoreAttachment(Resource):
                 jsonify({"status": "error", "message": "Missing file"}),
                 400,
             )
-        user = secure_filename(decoded_token.get("sub"))
+        user = safe_filename(decoded_token.get("sub"))
 
         try:
             attachment_id = ObjectId()

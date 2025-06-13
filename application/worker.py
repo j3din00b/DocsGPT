@@ -143,8 +143,8 @@ def run_agent_logic(agent_config, input_data):
         agent = AgentCreator.create_agent(
             agent_type,
             endpoint="webhook",
-            llm_name=settings.LLM_NAME,
-            gpt_model=settings.MODEL_NAME,
+            llm_name=settings.LLM_PROVIDER,
+            gpt_model=settings.LLM_NAME,
             api_key=settings.API_KEY,
             user_api_key=user_api_key,
             prompt=prompt,
@@ -159,7 +159,7 @@ def run_agent_logic(agent_config, input_data):
             prompt=prompt,
             chunks=chunks,
             token_limit=settings.DEFAULT_MAX_HISTORY,
-            gpt_model=settings.MODEL_NAME,
+            gpt_model=settings.LLM_NAME,
             user_api_key=user_api_key,
             decoded_token=decoded_token,
         )
@@ -194,7 +194,7 @@ def run_agent_logic(agent_config, input_data):
 
 # Define the main function for ingesting and processing documents.
 def ingest_worker(
-    self, directory, formats, name_job, filename, user, retriever="classic"
+    self, directory, formats, job_name, filename, user, dir_name=None, user_dir=None, retriever="classic"
 ):
     """
     Ingest and process documents.
@@ -203,9 +203,11 @@ def ingest_worker(
         self: Reference to the instance of the task.
         directory (str): Specifies the directory for ingesting ('inputs' or 'temp').
         formats (list of str): List of file extensions to consider for ingestion (e.g., [".rst", ".md"]).
-        name_job (str): Name of the job for this ingestion task.
+        job_name (str): Name of the job for this ingestion task (original, unsanitized).
         filename (str): Name of the file to be ingested.
-        user (str): Identifier for the user initiating the ingestion.
+        user (str): Identifier for the user initiating the ingestion (original, unsanitized).
+        dir_name (str, optional): Sanitized directory name for filesystem operations.
+        user_dir (str, optional): Sanitized user ID for filesystem operations.
         retriever (str): Type of retriever to use for processing the documents.
 
     Returns:
@@ -216,13 +218,13 @@ def ingest_worker(
     limit = None
     exclude = True
     sample = False
-
+    
     storage = StorageCreator.get_storage()
 
-    full_path = os.path.join(directory, user, name_job)
+    full_path = os.path.join(directory, user_dir, dir_name)
     source_file_path = os.path.join(full_path, filename)
 
-    logging.info(f"Ingest file: {full_path}", extra={"user": user, "job": name_job})
+    logging.info(f"Ingest file: {full_path}", extra={"user": user, "job": job_name})
 
     # Create temporary working directory
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -283,13 +285,14 @@ def ingest_worker(
                 for i in range(min(5, len(raw_docs))):
                     logging.info(f"Sample document {i}: {raw_docs[i]}")
             file_data = {
-                "name": name_job,
+                "name": job_name,  # Use original job_name
                 "file": filename,
-                "user": user,
+                "user": user,  # Use original user
                 "tokens": tokens,
                 "retriever": retriever,
                 "id": str(id),
                 "type": "local",
+                "original_file_path": source_file_path,
             }
 
             upload_index(vector_store_path, file_data)
@@ -301,9 +304,9 @@ def ingest_worker(
     return {
         "directory": directory,
         "formats": formats,
-        "name_job": name_job,
+        "name_job": job_name,  # Use original job_name
         "filename": filename,
-        "user": user,
+        "user": user,  # Use original user
         "limited": False,
     }
 
@@ -449,7 +452,7 @@ def attachment_worker(self, file_info, user):
     try:
         self.update_state(state="PROGRESS", meta={"current": 10})
         storage = StorageCreator.get_storage()
-        
+
         self.update_state(
             state="PROGRESS", meta={"current": 30, "status": "Processing content"}
         )
@@ -458,9 +461,11 @@ def attachment_worker(self, file_info, user):
             relative_path,
             lambda local_path, **kwargs: SimpleDirectoryReader(
                 input_files=[local_path], exclude_hidden=True, errors="ignore"
-            ).load_data()[0].text
+            )
+            .load_data()[0]
+            .text,
         )
-            
+
         token_count = num_tokens_from_string(content)
 
         self.update_state(
@@ -475,6 +480,7 @@ def attachment_worker(self, file_info, user):
                 "_id": doc_id,
                 "user": user,
                 "path": relative_path,
+                "filename": filename,
                 "content": content,
                 "token_count": token_count,
                 "mime_type": mime_type,
@@ -487,9 +493,7 @@ def attachment_worker(self, file_info, user):
             f"Stored attachment with ID: {attachment_id}", extra={"user": user}
         )
 
-        self.update_state(
-            state="PROGRESS", meta={"current": 100, "status": "Complete"}
-        )
+        self.update_state(state="PROGRESS", meta={"current": 100, "status": "Complete"})
 
         return {
             "filename": filename,
