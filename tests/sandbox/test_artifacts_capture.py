@@ -91,3 +91,39 @@ class TestCaptureFiltering:
         assert self._captured(monkeypatch, {"report.pdf": b"x"}, pre=pre) == []
         # Content change is captured.
         assert self._captured(monkeypatch, {"report.pdf": b"xy"}, pre=pre) == ["report.pdf"]
+
+
+class _CountingMgr:
+    """Serves a fixed {rel_path: bytes} workspace and counts every get_file read."""
+
+    def __init__(self, files):
+        self._files = files
+        self.reads = 0
+
+    def list_files(self, _sid):
+        return list(self._files)
+
+    def get_file(self, _sid, path):
+        self.reads += 1
+        return self._files[path]
+
+
+@pytest.mark.unit
+class TestReadSweepCap:
+    def test_snapshot_signature_scan_capped(self):
+        # An unchanged-file-heavy workspace can no longer be read in full each pass.
+        files = {f"f{i:04d}.txt": b"x" for i in range(ac.MAX_SCANNED_FILES + 50)}
+        mgr = _CountingMgr(files)
+        sigs = ac.snapshot_signatures(mgr, "sid")
+        assert mgr.reads == ac.MAX_SCANNED_FILES
+        assert len(sigs) == ac.MAX_SCANNED_FILES
+
+    def test_capture_read_sweep_capped(self, monkeypatch):
+        # Every get_file (even for unchanged, never-persisted files) counts toward the cap.
+        files = {f"f{i:04d}.txt": b"x" for i in range(ac.MAX_SCANNED_FILES + 50)}
+        pre = {name: (1, hashlib.sha256(b"x").hexdigest()) for name in files}  # all unchanged
+        mgr = _CountingMgr(files)
+        monkeypatch.setattr(ac, "persist_artifact", lambda *a, **k: None)
+        captured = ac.capture_artifacts(mgr, "sid", pre, user_id="u")
+        assert captured == []  # nothing changed -> nothing persisted
+        assert mgr.reads == ac.MAX_SCANNED_FILES  # but the sweep is still bounded

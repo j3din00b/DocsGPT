@@ -607,6 +607,44 @@ class ConversationsRepository:
         )
         return [_message_row_to_dict(r) for r in result.fetchall()]
 
+    def first_n_message_ids(self, conversation_id: str, first_n: int) -> set[str]:
+        """Return the ids of the first ``first_n`` messages (by position) of the conversation.
+
+        Same ordering a share snapshot uses (``get_messages``' ``position ASC``
+        then ``[:first_n]``); empty set for ``first_n <= 0`` or a non-UUID id.
+        """
+        if first_n <= 0 or not looks_like_uuid(conversation_id):
+            return set()
+        result = self._conn.execute(
+            text(
+                "SELECT id FROM conversation_messages "
+                "WHERE conversation_id = CAST(:cid AS uuid) "
+                "ORDER BY position ASC LIMIT :n"
+            ),
+            {"cid": conversation_id, "n": int(first_n)},
+        )
+        return {str(r[0]) for r in result.fetchall()}
+
+    def message_in_first_n(self, conversation_id: str, message_id: str, first_n: int) -> bool:
+        """True if message_id is among the first ``first_n`` messages (by position) of the conversation."""
+        if not message_id or first_n <= 0:
+            return False
+        # Shape-gate both ids: a non-UUID reaching CAST(... AS uuid) would raise
+        # and poison the enclosing transaction (see ``rename``).
+        if not looks_like_uuid(conversation_id) or not looks_like_uuid(message_id):
+            return False
+        row = self._conn.execute(
+            text(
+                "SELECT 1 FROM ( "
+                "  SELECT id FROM conversation_messages "
+                "  WHERE conversation_id = CAST(:cid AS uuid) "
+                "  ORDER BY position ASC LIMIT :n "
+                ") t WHERE t.id = CAST(:mid AS uuid)"
+            ),
+            {"cid": conversation_id, "mid": message_id, "n": int(first_n)},
+        ).fetchone()
+        return row is not None
+
     def get_message_at(self, conversation_id: str, position: int) -> Optional[dict]:
         # Shape-gate: see ``rename``. Callers today always pass a resolved
         # UUID (via ``get_any`` first), but the guard costs nothing and

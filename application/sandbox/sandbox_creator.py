@@ -1,6 +1,6 @@
 """Factory + process-wide singleton selecting a sandbox backend from settings."""
 
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional
 
 from application.core.settings import settings
 from application.sandbox.base import CodeSandbox
@@ -41,6 +41,10 @@ def _make_daytona() -> CodeSandbox:
         create_timeout=float(settings.SANDBOX_HTTP_TIMEOUT) * 6,
         auto_stop_interval=int(settings.DAYTONA_AUTO_STOP_INTERVAL),
         auto_delete_interval=auto_delete_interval,
+        # Bounds only what the app propagates from a response: the Daytona SDK still
+        # buffers the whole HTTP response before we see it, so a full in-sandbox cap
+        # would need runner-side support. This is a partial but real mitigation.
+        max_output_bytes=int(settings.SANDBOX_MAX_OUTPUT_BYTES),
         max_file_bytes=int(settings.SANDBOX_MAX_FILE_BYTES),
         max_sandboxes=int(settings.DAYTONA_MAX_SANDBOXES),
     )
@@ -66,6 +70,11 @@ class SandboxCreator:
                 max_ttl=float(settings.SANDBOX_MAX_TTL),
                 max_sessions=int(settings.SANDBOX_MAX_SESSIONS),
             )
+        return cls._instance
+
+    @classmethod
+    def peek_manager(cls) -> Optional[SandboxManager]:
+        """Return the process-wide manager if already built, else None (never constructs one)."""
         return cls._instance
 
     @classmethod

@@ -36,6 +36,7 @@ class ExecResult:
     results: List[DisplayData] = field(default_factory=list)
     display_data: List[DisplayData] = field(default_factory=list)
     plots: List[Plot] = field(default_factory=list)
+    truncated: bool = False  # output exceeded the budget and was cut; status stays "ok"
 
     @property
     def ok(self) -> bool:

@@ -64,6 +64,7 @@ class DaytonaSandbox(CodeSandbox):
         create_timeout: float = 60.0,
         auto_stop_interval: int = 15,
         auto_delete_interval: int = 60,
+        max_output_bytes: int = 0,
         max_file_bytes: int = 10 * 1024 * 1024,
         max_sandboxes: int = 50,
     ) -> None:
@@ -85,6 +86,7 @@ class DaytonaSandbox(CodeSandbox):
         self._create_timeout = create_timeout
         self._auto_stop_interval = auto_stop_interval
         self._auto_delete_interval = auto_delete_interval
+        self._max_output_bytes = max_output_bytes
         self._max_file_bytes = max_file_bytes
         self._max_sandboxes = max_sandboxes
         self._handles: Dict[str, _Handle] = {}
@@ -222,6 +224,23 @@ class DaytonaSandbox(CodeSandbox):
             logger.warning("Failed to start stopped Daytona sandbox %s: %s", getattr(sandbox, "id", "?"), exc)
             return None
 
+    def _ensure_started(self, handle: "_Handle") -> bool:
+        """Refresh the handle's sandbox; start it if auto-stopped. True only if it was woken."""
+        try:
+            fresh = self._client.get(handle.sandbox_id)
+        except Exception as exc:  # noqa: BLE001 - a failed refresh just means we don't retry
+            logger.warning("Daytona get for %s failed while ensuring started: %s", handle.sandbox_id, exc)
+            return False
+        state = getattr(fresh, "state", None)
+        state_value = getattr(state, "value", state)
+        if state_value == "started":
+            handle.sandbox = fresh
+            return False
+        if self._wake_if_stopped(fresh) is None:
+            return False
+        handle.sandbox = fresh
+        return True
+
     def _create_sandbox(self, session_id: str):
         """Create a fresh Daytona sandbox labelled for ``session_id``."""
         from daytona import CreateSandboxFromSnapshotParams
@@ -349,6 +368,14 @@ class DaytonaSandbox(CodeSandbox):
         try:
             response = handle.sandbox.process.code_run(wrapped, timeout=wall)
         except Exception as exc:  # noqa: BLE001 - any SDK/cloud error -> error result, never raise
+            # A cached handle may point at a sandbox Daytona auto-stopped; wake it and
+            # retry once. Genuine code errors return a nonzero-exit response (they do
+            # NOT raise), so this only retries transport/stopped faults.
+            if self._ensure_started(handle):
+                try:
+                    return self._to_result(handle.sandbox.process.code_run(wrapped, timeout=wall))
+                except Exception:  # noqa: BLE001 - second failure -> error result below
+                    pass
             return ExecResult(
                 status="error",
                 error_name=type(exc).__name__,
@@ -359,17 +386,54 @@ class DaytonaSandbox(CodeSandbox):
 
     @staticmethod
     def _with_workspace_cwd(workspace: str, code: str) -> str:
-        """Prepend a chdir into the session workspace so relative paths resolve there."""
+        """Prepend a chdir into the session workspace so relative paths resolve there.
+
+        Leading ``from __future__`` imports are hoisted above the prelude so they stay
+        the first statements of the module (Python rejects them anywhere else).
+        """
+        hoisted, rest = DaytonaSandbox._split_leading_future_imports(code)
         prelude = (
             "import os as _os\n"
             f"_os.makedirs({workspace!r}, exist_ok=True)\n"
             f"_os.chdir({workspace!r})\n"
         )
-        return prelude + code
+        return hoisted + prelude + rest
 
     @staticmethod
-    def _to_result(response) -> ExecResult:
-        """Map a Daytona ``ExecuteResponse`` into the shared ``ExecResult`` shape."""
+    def _split_leading_future_imports(code: str) -> tuple[str, str]:
+        """Split leading ``from __future__`` imports (and the blank/comment lines around them) from the rest.
+
+        A module docstring appearing BEFORE a future import is an unsupported edge (rare in
+        generated snippets); the common ``from __future__ import annotations`` first-line case
+        is handled. Everything from the first real statement onward stays in ``rest``.
+        """
+        lines = code.splitlines(keepends=True)
+        saw_future = False
+        split_at = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "" or stripped.startswith("#"):
+                continue  # blank/comment: part of the leading run
+            if stripped.startswith("from __future__ import"):
+                saw_future = True
+                continue
+            split_at = i  # first real statement: the leading run ends here
+            break
+        else:
+            split_at = len(lines)  # whole snippet was blank/comment/future
+        if not saw_future:
+            return "", code
+        hoisted = "".join(lines[:split_at])
+        if hoisted and not hoisted.endswith("\n"):
+            hoisted += "\n"
+        return hoisted, "".join(lines[split_at:])
+
+    def _to_result(self, response) -> ExecResult:
+        """Map a Daytona ``ExecuteResponse`` into the shared ``ExecResult`` shape.
+
+        Caps ``stdout`` at ``max_output_bytes`` (0 = disabled) BEFORE it is also reused as
+        ``error_value`` so a huge buffered response cannot propagate unbounded downstream.
+        """
         exit_code = getattr(response, "exit_code", 0) or 0
         artifacts = getattr(response, "artifacts", None)
         stdout = ""
@@ -378,10 +442,17 @@ class DaytonaSandbox(CodeSandbox):
         else:
             stdout = getattr(response, "result", "") or ""
 
+        truncated = False
+        if self._max_output_bytes and len(stdout.encode("utf-8", "ignore")) > self._max_output_bytes:
+            stdout = stdout.encode("utf-8", "ignore")[: self._max_output_bytes].decode("utf-8", "ignore")
+            stdout += f"\n[output truncated at {self._max_output_bytes} bytes]"
+            truncated = True
+
         result = ExecResult(
             status="ok" if exit_code == 0 else "error",
             stdout=stdout,
             exit_code=exit_code,
+            truncated=truncated,
         )
         if exit_code != 0:
             result.error_name = "ExecutionError"
@@ -401,31 +472,47 @@ class DaytonaSandbox(CodeSandbox):
         remote = self._remote_path(handle.workspace, dest_path)
         parent = posixpath.dirname(remote)
         try:
-            if parent and parent != handle.workspace:
-                try:
-                    handle.sandbox.fs.create_folder(parent, "755")
-                except Exception as folder_exc:  # noqa: BLE001 - folder may already exist
-                    logger.debug("put_file parent folder create returned: %s", folder_exc)
-            handle.sandbox.fs.upload_file(data, remote)
+            self._upload(handle, remote, parent, data)
         except Exception as exc:  # noqa: BLE001 - log detail server-side, return a generic error
+            # A cached handle may point at an auto-stopped sandbox; wake it and retry once.
+            if self._ensure_started(handle):
+                try:
+                    self._upload(handle, remote, parent, data)
+                    return
+                except Exception:  # noqa: BLE001 - second failure -> generic IOError below
+                    pass
             logger.warning("put_file failed for %r: %s", dest_path, exc)
             raise IOError(f"put_file failed: {type(exc).__name__}") from exc
+
+    def _upload(self, handle: "_Handle", remote: str, parent: str, data: bytes) -> None:
+        """Create the parent folder (best-effort) and upload ``data`` to ``remote``."""
+        if parent and parent != handle.workspace:
+            try:
+                handle.sandbox.fs.create_folder(parent, "755")
+            except Exception as folder_exc:  # noqa: BLE001 - folder may already exist
+                logger.debug("put_file parent folder create returned: %s", folder_exc)
+        handle.sandbox.fs.upload_file(data, remote)
 
     def get_file(self, session_id: str, path: str) -> bytes:
         """Download ``path`` from the session workspace as bytes, capped at ``max_file_bytes``."""
         handle = self._get_handle(session_id)
         remote = self._remote_path(handle.workspace, path)
         try:
-            info = handle.sandbox.fs.get_file_info(remote)
-            size = getattr(info, "size", None)
-            if size is not None and size > self._max_file_bytes:
-                raise IOError(f"file too large: {size} > {self._max_file_bytes} bytes")
-            data = handle.sandbox.fs.download_file(remote)
+            data = self._download(handle, remote)
         except IOError:
             raise
         except Exception as exc:  # noqa: BLE001 - log detail server-side, return a generic error
-            logger.warning("get_file failed for %r: %s", path, exc)
-            raise IOError(f"get_file failed: {type(exc).__name__}") from exc
+            # A cached handle may point at an auto-stopped sandbox; wake it and retry once.
+            if not self._ensure_started(handle):
+                logger.warning("get_file failed for %r: %s", path, exc)
+                raise IOError(f"get_file failed: {type(exc).__name__}") from exc
+            try:
+                data = self._download(handle, remote)
+            except IOError:
+                raise
+            except Exception:  # noqa: BLE001 - second failure -> generic IOError
+                logger.warning("get_file failed for %r: %s", path, exc)
+                raise IOError(f"get_file failed: {type(exc).__name__}") from exc
         if data is None:
             raise IOError(f"get_file produced no payload for {path!r}")
         data = data if isinstance(data, bytes) else bytes(data)
@@ -435,9 +522,27 @@ class DaytonaSandbox(CodeSandbox):
             raise IOError(f"file too large: {len(data)} > {self._max_file_bytes} bytes")
         return data
 
+    def _download(self, handle: "_Handle", remote: str) -> object:
+        """Fetch ``remote``'s bytes, rejecting a file whose declared size exceeds the cap."""
+        info = handle.sandbox.fs.get_file_info(remote)
+        size = getattr(info, "size", None)
+        if size is not None and size > self._max_file_bytes:
+            raise IOError(f"file too large: {size} > {self._max_file_bytes} bytes")
+        return handle.sandbox.fs.download_file(remote)
+
     def list_files(self, session_id: str) -> List[str]:
         """List workspace-relative file paths for ``session_id`` (recursive, never escapes the workspace)."""
         handle = self._get_handle(session_id)
+        try:
+            return self._list_all(handle)
+        except Exception:  # noqa: BLE001 - transport/stopped fault: wake and retry once, else re-raise
+            # A cached handle may point at an auto-stopped sandbox; wake it and retry once.
+            if self._ensure_started(handle):
+                return self._list_all(handle)
+            raise
+
+    def _list_all(self, handle: "_Handle") -> List[str]:
+        """Walk the workspace subtree for ``handle`` and return workspace-relative file paths."""
         out: List[str] = []
         self._walk(handle.sandbox, handle.workspace, "", out)
         return out

@@ -191,6 +191,17 @@ def test_sandbox_creator_manager_is_singleton():
     SandboxCreator.reset()
 
 
+def test_sandbox_creator_peek_manager_never_builds():
+    from application.sandbox.sandbox_creator import SandboxCreator
+
+    SandboxCreator.reset()
+    assert SandboxCreator.peek_manager() is None  # nothing built yet -> None, no construction
+    built = SandboxCreator.get_manager()
+    assert SandboxCreator.peek_manager() is built  # returns the existing singleton
+    SandboxCreator.reset()
+    assert SandboxCreator.peek_manager() is None
+
+
 # ---------------------------------------------------------------------------
 # Concurrent-session cap
 # ---------------------------------------------------------------------------
@@ -563,3 +574,80 @@ def test_evict_then_concurrent_reopen_closes_old_handle_not_new():
     # The new V is usable (its workspace was not torn down by the stale close).
     mgr.put_file("V", "f.txt", b"data")
     assert mgr.get_file("V", "f.txt") == b"data"
+
+
+# ---------------------------------------------------------------------------
+# Deferred close: a close while an op is in-use must not kill the in-flight op
+# ---------------------------------------------------------------------------
+
+
+def test_close_defers_while_in_use_then_tears_down_on_leave(backend):
+    """close() during an in-flight op defers teardown; the last _leave performs it."""
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    mgr._enter("conv-1")  # simulate a concurrent exec holding the session
+
+    mgr.close("conv-1")  # must DEFER, not tear the session out from under the op
+    assert mgr.has_session("conv-1")
+    assert backend.torn_down == []
+
+    mgr._leave("conv-1")  # last release performs the deferred close
+    assert not mgr.has_session("conv-1")
+    assert backend.torn_down == ["conv-1"]
+
+
+def test_close_defers_until_last_of_several_holds_releases(backend):
+    """With multiple in-use holds, the deferred close fires only on the final _leave."""
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    mgr._enter("conv-1")
+    mgr._enter("conv-1")
+    mgr.close("conv-1")
+
+    mgr._leave("conv-1")  # one hold remains -> still deferred
+    assert mgr.has_session("conv-1")
+    assert backend.torn_down == []
+
+    mgr._leave("conv-1")  # last hold -> deferred close runs
+    assert not mgr.has_session("conv-1")
+    assert backend.torn_down == ["conv-1"]
+
+
+def test_close_is_synchronous_when_not_in_use(backend):
+    """The common path (in_use == 0 at close time) stays synchronous as before."""
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    mgr.close("conv-1")  # caller's own exec already _left -> immediate teardown
+    assert not mgr.has_session("conv-1")
+    assert backend.torn_down == ["conv-1"]
+
+
+def test_exec_completes_despite_concurrent_close():
+    """A close racing an in-flight exec never turns it into a KernelDiedError/lost files."""
+    barrier = threading.Event()
+    release = threading.Event()
+
+    class _BlockingExecBackend(FakeBackend):
+        def exec(self, session_id, code, timeout=None):
+            barrier.set()
+            assert release.wait(timeout=5)
+            return ExecResult(status="ok", stdout=f"ran:{code}")
+
+    backend = _BlockingExecBackend()
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+
+    out: Dict[str, ExecResult] = {}
+    worker = threading.Thread(target=lambda: out.__setitem__("r", mgr.exec("conv-1", "1+1")))
+    worker.start()
+    assert barrier.wait(timeout=5)  # exec is in flight, holding the session in-use
+
+    mgr.close("conv-1")  # concurrent close must defer, not tear down the live exec
+    assert backend.torn_down == []
+
+    release.set()
+    worker.join(timeout=5)
+    assert out["r"].ok and out["r"].stdout == "ran:1+1"  # exec survived intact
+    # The deferred close ran on the exec's own _leave.
+    assert not mgr.has_session("conv-1")
+    assert backend.torn_down == ["conv-1"]

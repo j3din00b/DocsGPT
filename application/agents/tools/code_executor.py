@@ -273,13 +273,28 @@ class CodeExecutorTool(Tool):
             if not version or not version.get("storage_path"):
                 return {"error": f"input artifact {artifact_id} has no stored content."}
 
+            # Reject an oversize input BEFORE buffering it: the declared ``size``
+            # avoids pulling a huge file into worker memory, and the bounded read
+            # below backstops a missing/lying size column.
+            max_bytes = int(getattr(settings, "SANDBOX_MAX_INPUT_BYTES", 0) or 0)
+            declared_size = version.get("size")
+            if max_bytes and isinstance(declared_size, (int, float)) and declared_size > max_bytes:
+                return {"error": f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."}
+
             filename = safe_filename(version.get("filename") or artifact_id)
             try:
                 file_obj = storage.get_file(version["storage_path"])
-                data = file_obj.read()
+                try:
+                    data = file_obj.read(max_bytes + 1) if max_bytes else file_obj.read()
+                finally:
+                    close = getattr(file_obj, "close", None)
+                    if callable(close):
+                        close()
             except Exception:
                 logger.exception("code_executor: failed to read input artifact bytes")
                 return {"error": f"failed to read input artifact {artifact_id}."}
+            if max_bytes and len(data) > max_bytes:
+                return {"error": f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."}
             try:
                 manager.put_file(session_id, f"inputs/{filename}", data)
             except Exception:

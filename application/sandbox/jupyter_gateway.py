@@ -62,6 +62,11 @@ class _Kernel:
 class JupyterKernelGatewaySandbox(CodeSandbox):
     """Drives one always-on Jupyter Kernel Gateway, one stateful kernel per session."""
 
+    # Raw-byte chunk size for a staged upload: each execute_request carries one
+    # chunk's base64 (~4 MB at 3 MB raw), well under the gateway's 10 MiB websocket
+    # frame cap. The 3-byte boundary keeps every base64 block self-contained.
+    _PUT_CHUNK_BYTES = 3 * 1024 * 1024
+
     def __init__(
         self,
         gateway_url: str,
@@ -167,12 +172,23 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         return self.open(session_id)
 
     def close(self, session_id: str) -> None:
-        """Delete the gateway kernel for ``session_id`` and drop it from the registry."""
+        """Sweep the session workspace (best-effort) then delete its kernel and registry entry."""
         with self._lock:
             kernel = self._kernels.pop(session_id, None)
         if kernel is None:
             return
+        self._cleanup_workspace(kernel)
         self._delete_kernel(kernel.kernel_id)
+
+    def _cleanup_workspace(self, kernel: _Kernel) -> None:
+        """Best-effort rmtree of the per-session workspace while the kernel is still alive."""
+        if not kernel.initialized:
+            return
+        code = "import shutil as _sh\n" f"_sh.rmtree({kernel.workspace!r}, ignore_errors=True)\n"
+        try:
+            self._run(kernel, code, self._http_timeout)
+        except Exception:  # noqa: BLE001 - teardown is best-effort and must never raise
+            logger.warning("Failed to sweep workspace for kernel %s", kernel.kernel_id, exc_info=True)
 
     def close_handle(self, session_id: str, kernel_id: str) -> None:
         """Delete the SPECIFIC kernel captured at eviction time, never a re-opened one.
@@ -248,10 +264,16 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         # 0700 on the root and the per-session dir is defense-in-depth only: every
         # kernel runs under one shared uid here, so this is not a cross-session
         # boundary (that needs distinct uids / per-session VMs -- the Daytona backend).
+        # A fresh kernel always starts on a clean workspace: rmtree any stale dir a
+        # prior kernel for the same session id left behind (else artifacts_capture
+        # would re-read those files every exec). Only genuine new-kernel creation
+        # reaches here -- open() on a live kernel returns early -- so a warm
+        # persist=true session is never wiped mid-computation.
         setup = (
-            "import os as _os\n"
+            "import os as _os, shutil as _sh\n"
             f"_os.makedirs({_WORKSPACE_ROOT!r}, mode=0o700, exist_ok=True)\n"
             f"_os.chmod({_WORKSPACE_ROOT!r}, 0o700)\n"
+            f"_sh.rmtree({kernel.workspace!r}, ignore_errors=True)\n"
             f"_os.makedirs({kernel.workspace!r}, mode=0o700, exist_ok=True)\n"
             f"_os.chmod({kernel.workspace!r}, 0o700)\n"
             f"_os.chdir({kernel.workspace!r})\n"
@@ -268,8 +290,18 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         kernel = self._get_kernel(session_id)
         return self._run(kernel, code, timeout or self._default_timeout)
 
-    def _run(self, kernel: _Kernel, code: str, timeout: float) -> ExecResult:
-        """Execute one ``execute_request`` over the WS channel and assemble the reply."""
+    def _run(
+        self,
+        kernel: _Kernel,
+        code: str,
+        timeout: float,
+        max_output_bytes: Optional[int] = None,
+    ) -> ExecResult:
+        """Execute one ``execute_request`` over the WS channel and assemble the reply.
+
+        ``max_output_bytes`` overrides the default output budget for this call only
+        (file-transfer execs raise it so a multi-MB base64 payload is not truncated).
+        """
         try:
             ws = websocket.create_connection(
                 self._ws_url(kernel.kernel_id),
@@ -281,7 +313,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         try:
             msg_id = uuid.uuid4().hex
             ws.send(json.dumps(self._execute_request(msg_id, code)))
-            return self._collect(ws, msg_id, timeout, kernel.kernel_id)
+            return self._collect(ws, msg_id, timeout, kernel.kernel_id, max_output_bytes)
         finally:
             try:
                 ws.close()
@@ -317,8 +349,16 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             "channel": "shell",
         }
 
-    def _collect(self, ws: websocket.WebSocket, msg_id: str, timeout: float, kernel_id: str) -> ExecResult:
+    def _collect(
+        self,
+        ws: websocket.WebSocket,
+        msg_id: str,
+        timeout: float,
+        kernel_id: str,
+        max_output_bytes: Optional[int] = None,
+    ) -> ExecResult:
         """Read iopub/shell frames until ``execute_reply``/idle, a wall-clock deadline, or a closed socket."""
+        effective = max_output_bytes if max_output_bytes is not None else self._max_output_bytes
         result = ExecResult()
         stdout_parts: List[str] = []
         stderr_parts: List[str] = []
@@ -362,7 +402,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                 if not truncated:
                     text = content.get("text", "")
                     buffered += len(text.encode("utf-8", "ignore"))
-                    if buffered > self._max_output_bytes:
+                    if buffered > effective:
                         truncated = True
                         self._interrupt_and_drain(ws, msg_id, kernel_id)  # runaway output: stop and drain
                         break
@@ -377,7 +417,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                 # otherwise buffer unbounded. Drop and truncate once over budget.
                 if not truncated:
                     buffered += self._rich_payload_bytes(content)
-                    if buffered > self._max_output_bytes:
+                    if buffered > effective:
                         truncated = True
                         self._interrupt_and_drain(ws, msg_id, kernel_id)
                         break
@@ -403,7 +443,8 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                     idle_seen = True
 
         if truncated:
-            stderr_parts.append(f"\n[output truncated at {self._max_output_bytes} bytes]")
+            stderr_parts.append(f"\n[output truncated at {effective} bytes]")
+            result.truncated = True  # surface the cut without flipping status off "ok"
         result.stdout = "".join(stdout_parts)
         result.stderr = "".join(stderr_parts)
         return result
@@ -446,20 +487,42 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
 
     # -- File transfer ---------------------------------------------------
 
+    def _file_transfer_budget(self) -> int:
+        """Output budget for a file-transfer exec: max file bytes inflated by base64 plus marker slack."""
+        return self._max_file_bytes * 4 // 3 + 4096
+
     def put_file(self, session_id: str, dest_path: str, data: bytes) -> None:
-        """Decode ``data`` inside the kernel and write it under the session workspace."""
+        """Decode ``data`` inside the kernel and write it under the session workspace.
+
+        The upload is chunked so no single ``execute_request`` exceeds the gateway's
+        websocket message-size cap: the first chunk creates/truncates the file (``wb``)
+        and each later chunk appends (``ab``). Every chunk program re-resolves the path
+        -- kernel globals are not relied on to survive between execs.
+        """
         kernel = self._get_kernel(session_id)
-        encoded = base64.b64encode(data).decode("ascii")
-        code = (
-            "import base64 as _b64, os as _os\n"
-            + _CONTAINMENT_SNIPPET
-            + f"_p = _resolve({kernel.workspace!r}, {dest_path!r})\n"
-            "_os.makedirs(_os.path.dirname(_p) or '.', exist_ok=True)\n"
-            f"_f = open(_p, 'wb'); _f.write(_b64.b64decode({encoded!r})); _f.close()\n"
-        )
-        result = self._run(kernel, code, self._default_timeout)
-        if not result.ok:
-            raise IOError(f"put_file failed: {result.error_value}")
+        offset = 0
+        first = True
+        # Loop at least once so an empty file is still created (a single wb write of b"").
+        while first or offset < len(data):
+            chunk = data[offset:offset + self._PUT_CHUNK_BYTES]
+            encoded = base64.b64encode(chunk).decode("ascii")
+            if first:
+                body = (
+                    f"_p = _resolve({kernel.workspace!r}, {dest_path!r})\n"
+                    "_os.makedirs(_os.path.dirname(_p) or '.', exist_ok=True)\n"
+                    f"_f = open(_p, 'wb'); _f.write(_b64.b64decode({encoded!r})); _f.close()\n"
+                )
+            else:
+                body = (
+                    f"_p = _resolve({kernel.workspace!r}, {dest_path!r})\n"
+                    f"_f = open(_p, 'ab'); _f.write(_b64.b64decode({encoded!r})); _f.close()\n"
+                )
+            code = "import base64 as _b64, os as _os\n" + _CONTAINMENT_SNIPPET + body
+            result = self._run(kernel, code, self._default_timeout)
+            if not result.ok:
+                raise IOError(f"put_file failed: {result.error_value}")
+            offset += self._PUT_CHUNK_BYTES
+            first = False
 
     def get_file(self, session_id: str, path: str) -> bytes:
         """Read ``path`` inside the kernel and stream its base64 (with a length tag) over stdout."""
@@ -476,7 +539,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             f"print({_FILE_BEGIN!r} + str(len(_d)) + ':' + _h + ':'"
             f" + _b64.b64encode(_d).decode('ascii') + {_FILE_END!r})\n"
         )
-        result = self._run(kernel, code, self._default_timeout)
+        result = self._run(kernel, code, self._default_timeout, max_output_bytes=self._file_transfer_budget())
         if not result.ok:
             raise IOError(f"get_file failed: {result.error_value}")
         out = result.stdout
@@ -503,7 +566,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             "        _out.append(_os.path.relpath(_os.path.join(_dp, _name), _root))\n"
             f"print({_FILE_BEGIN!r} + _json.dumps(_out) + {_FILE_END!r})\n"
         )
-        result = self._run(kernel, code, self._default_timeout)
+        result = self._run(kernel, code, self._default_timeout, max_output_bytes=self._file_transfer_budget())
         if not result.ok:
             raise IOError(f"list_files failed: {result.error_value}")
         out = result.stdout

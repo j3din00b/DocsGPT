@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,57 @@ def test_create_rejects_unknown_kind():
     out = _tool()._create(kind="hologram", spec={})
     assert out["status"] == "error"
     assert "unsupported kind" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# _render session lifecycle: cleans its scratch dir, leaves the shared session open
+# ---------------------------------------------------------------------------
+
+
+class _FakeRenderManager:
+    """Records remove_path/close and returns fixed render bytes; no real sandbox."""
+
+    def __init__(self):
+        self.closed = []
+        self.removed = []
+
+    def open(self, session_id, ttl=None):
+        return session_id
+
+    def put_file(self, session_id, dest_path, data):
+        pass
+
+    def exec(self, session_id, code, timeout=None):
+        return SimpleNamespace(ok=True)
+
+    def get_file(self, session_id, path):
+        return b"%PDF-1.4 rendered"
+
+    def remove_path(self, session_id, path):
+        self.removed.append((session_id, path))
+
+    def close(self, session_id):
+        self.closed.append(session_id)
+
+
+def test_render_cleans_scratch_but_leaves_session_open(monkeypatch):
+    """_render drops its per-render scratch dir but must NOT close the shared session."""
+    manager = _FakeRenderManager()
+    monkeypatch.setattr(
+        "application.sandbox.sandbox_creator.SandboxCreator.get_manager", lambda: manager
+    )
+
+    out = _tool()._render("pdf", {"title": "t", "blocks": []})
+
+    assert out == {"data": b"%PDF-1.4 rendered"}
+    # The render owns only its scratch dir; the session is the shared conversation
+    # session that code_executor(persist=True) keeps warm, so it is left for the
+    # manager/conversation to reap.
+    assert manager.closed == []
+    assert len(manager.removed) == 1
+    session_id, path = manager.removed[0]
+    assert session_id == "conv-1"
+    assert path.startswith("artifacts/")
 
 
 # ---------------------------------------------------------------------------

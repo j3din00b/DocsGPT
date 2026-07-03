@@ -687,13 +687,12 @@ class ArtifactGeneratorTool(Tool):
             logger.exception("artifact_generator: render failed")
             return {"error": f"render failed: {type(exc).__name__}: {exc}"}
         finally:
-            # Drop this render's scratch dir before tearing the session down so a
-            # warm/reused session doesn't accumulate per-render files on disk.
+            # Drop this render's scratch dir, but do NOT close the session: it is the
+            # shared conversation/run session that code_executor(persist=True) keeps
+            # warm. A render is self-contained (it builds a document from the artifact
+            # spec, not from prior kernel state) and does not own that session -- its
+            # lifecycle belongs to the manager's TTL reaper / the conversation.
             manager.remove_path(session_id, token_dir)
-            try:
-                manager.close(session_id)
-            except Exception:
-                logger.exception("artifact_generator: session close failed")
         if not data:
             return {"error": "renderer produced an empty file."}
         return {"data": data}

@@ -82,6 +82,26 @@ class WorkflowEngine:
     def execute(
         self, initial_inputs: WorkflowState, query: str
     ) -> Generator[Dict[str, str], None, None]:
+        """Run the workflow graph, closing the run-scoped sandbox session once when the run ends."""
+        try:
+            yield from self._run_graph(initial_inputs, query)
+        finally:
+            # The sandbox session is keyed by the run id and shared by every code
+            # node and agent-node tool in this run, so it is torn down exactly once
+            # here rather than per node. peek_manager() never builds the manager, so
+            # a run that never opened a session closes nothing.
+            from application.sandbox.sandbox_creator import SandboxCreator
+
+            mgr = SandboxCreator.peek_manager()
+            if mgr is not None:
+                try:
+                    mgr.close(self._session_id())
+                except Exception:
+                    logger.exception("Workflow run failed to close its sandbox session")
+
+    def _run_graph(
+        self, initial_inputs: WorkflowState, query: str
+    ) -> Generator[Dict[str, str], None, None]:
         self._initialize_state(initial_inputs, query)
 
         # Surface the run id up front so the client can list this run's
@@ -392,37 +412,35 @@ class WorkflowEngine:
         timeout = self._resolve_code_timeout(config.timeout)
 
         manager = SandboxCreator.get_manager()
+        # The session is keyed by the run id and shared by every code node and every
+        # agent-node tool in this run, so it is NOT closed here: closing per node
+        # would cold-drop later nodes' interpreter/filesystem state. The run session
+        # is torn down once in ``execute``'s finally when the whole run ends.
         manager.open(session_id)
-        try:
-            loaded = self._materialize_code_inputs(manager, session_id, config.inputs, user_id)
-            # Stage prior state as DATA the node code reads with
-            # ``json.load(open("state.json"))`` -- e.g. ``state["decision"]``. The
-            # file lands at the workspace root, which is the kernel cwd, so a
-            # relative open resolves it. State is never templated into the program.
-            state_json = json.dumps(self._json_safe_state(), default=str).encode("utf-8")
-            manager.put_file(session_id, "state.json", state_json)
-            pre_signatures = snapshot_signatures(manager, session_id)
-            result = manager.exec(session_id, code, timeout=timeout)
-            if self.run_persisted:
-                artifacts = capture_artifacts(
-                    manager,
-                    session_id,
-                    pre_signatures,
-                    user_id=user_id,
-                    workflow_run_id=self.workflow_run_id,
-                    produced_by={"node_id": node.id, "node_type": NodeType.CODE.value},
-                )
-            else:
-                # No workflow_runs row backs this run (unsaved/embedded draft): an
-                # artifact parented to this run id would be an unreachable orphan
-                # (403 on get/download). Skip persistence; the sandbox still ran and
-                # ``_build_code_output`` handles the empty-artifacts case.
-                artifacts = []
-        finally:
-            try:
-                manager.close(session_id)
-            except Exception:
-                logger.exception("Code node failed to close sandbox session")
+        loaded = self._materialize_code_inputs(manager, session_id, config.inputs, user_id)
+        # Stage prior state as DATA the node code reads with
+        # ``json.load(open("state.json"))`` -- e.g. ``state["decision"]``. The
+        # file lands at the workspace root, which is the kernel cwd, so a
+        # relative open resolves it. State is never templated into the program.
+        state_json = json.dumps(self._json_safe_state(), default=str).encode("utf-8")
+        manager.put_file(session_id, "state.json", state_json)
+        pre_signatures = snapshot_signatures(manager, session_id)
+        result = manager.exec(session_id, code, timeout=timeout)
+        if self.run_persisted:
+            artifacts = capture_artifacts(
+                manager,
+                session_id,
+                pre_signatures,
+                user_id=user_id,
+                workflow_run_id=self.workflow_run_id,
+                produced_by={"node_id": node.id, "node_type": NodeType.CODE.value},
+            )
+        else:
+            # No workflow_runs row backs this run (unsaved/embedded draft): an
+            # artifact parented to this run id would be an unreachable orphan
+            # (403 on get/download). Skip persistence; the sandbox still ran and
+            # ``_build_code_output`` handles the empty-artifacts case.
+            artifacts = []
 
         if not result.ok:
             error = (
@@ -477,6 +495,7 @@ class WorkflowEngine:
     ) -> List[str]:
         """Stage referenced input artifacts (run-scoped, never cross-tenant) into the workspace."""
         from application.agents.tools.artifact_ref import resolve_artifact_id
+        from application.core.settings import settings
         from application.storage.db.repositories.artifacts import ArtifactsRepository
         from application.storage.db.session import db_readonly
         from application.storage.storage_creator import StorageCreator
@@ -486,6 +505,7 @@ class WorkflowEngine:
         raw_ids = self._resolve_input_artifact_ids(inputs)
         if not raw_ids:
             return loaded
+        max_bytes = int(getattr(settings, "SANDBOX_MAX_INPUT_BYTES", 0) or 0)
         storage = StorageCreator.get_storage()
         for raw in raw_ids:
             with db_readonly() as conn:
@@ -504,8 +524,23 @@ class WorkflowEngine:
                 version = repo.get_version(artifact_id, artifact["current_version"])
             if not version or not version.get("storage_path"):
                 raise ValueError(f"input artifact {artifact_id} has no stored content.")
+            declared_size = version.get("size")
+            if max_bytes and isinstance(declared_size, (int, float)) and declared_size > max_bytes:
+                raise ValueError(
+                    f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."
+                )
             filename = safe_filename(version.get("filename") or artifact_id)
-            data = storage.get_file(version["storage_path"]).read()
+            file_obj = storage.get_file(version["storage_path"])
+            try:
+                data = file_obj.read(max_bytes + 1) if max_bytes else file_obj.read()
+            finally:
+                close = getattr(file_obj, "close", None)
+                if callable(close):
+                    close()
+            if max_bytes and len(data) > max_bytes:
+                raise ValueError(
+                    f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."
+                )
             manager.put_file(session_id, f"inputs/{filename}", data)
             loaded.append(f"inputs/{filename}")
         return loaded

@@ -65,6 +65,12 @@ def _make_agent_conversation(conn, agent_id, user_id=OWNER):
     )
 
 
+def _make_message(conn, conversation_id, prompt="q", response="a"):
+    return ConversationsRepository(conn).append_message(
+        conversation_id, {"prompt": prompt, "response": response}
+    )
+
+
 def _wire_api_key(monkeypatch, conn):
     """Point ``resolve_principal``'s own readonly conn at the test conn.
 
@@ -289,15 +295,18 @@ class TestSharedAccess:
         from application.api.user.artifacts.routes import DownloadArtifact
 
         conv = _make_conversation(_patch_db)
+        # Attach to the first message so it falls inside the first_n_queries snapshot.
+        msg = _make_message(_patch_db, str(conv["id"]))
         art = _make_artifact(
             _patch_db,
             conversation_id=str(conv["id"]),
+            message_id=str(msg["id"]),
             filename="report.pdf",
             mime_type="application/pdf",
             storage_path="inputs/owner/artifacts/x/v1/report.pdf",
         )
         share = SharedConversationsRepository(_patch_db).create(
-            str(conv["id"]), OWNER
+            str(conv["id"]), OWNER, first_n_queries=1
         )
 
         storage = _FakeStorage(b"PDFDATA")
@@ -318,6 +327,160 @@ class TestSharedAccess:
         )
         assert resp.status_code == 200
         assert resp.data == b"PDFDATA"
+
+
+# ---------------------------------------------------------------------------
+# Share-token snapshot scoping (first_n_queries)
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+class TestShareTokenSnapshotScope:
+    """A share link exposes only artifacts within its first_n_queries snapshot."""
+
+    def _seed(self, conn, first_n=1):
+        conv = _make_conversation(conn)
+        conv_id = str(conv["id"])
+        m0 = _make_message(conn, conv_id, prompt="q0")  # position 0 (in snapshot)
+        m1 = _make_message(conn, conv_id, prompt="q1")  # position 1 (outside)
+        in_art = _make_artifact(
+            conn, conversation_id=conv_id, message_id=str(m0["id"]),
+            title="in", filename="in.pdf",
+            storage_path="inputs/owner/artifacts/in/v1/in.pdf",
+        )
+        out_art = _make_artifact(
+            conn, conversation_id=conv_id, message_id=str(m1["id"]),
+            title="out", filename="out.pdf",
+            storage_path="inputs/owner/artifacts/out/v1/out.pdf",
+        )
+        null_art = _make_artifact(
+            conn, conversation_id=conv_id, message_id=None, title="null",
+            filename="null.pdf",
+            storage_path="inputs/owner/artifacts/null/v1/null.pdf",
+        )
+        share = SharedConversationsRepository(conn).create(
+            conv_id, OWNER, first_n_queries=first_n
+        )
+        return conv_id, in_art, out_art, null_art, str(share["uuid"])
+
+    @staticmethod
+    def _mock_storage(monkeypatch, data=b"BYTES"):
+        storage = _FakeStorage(data)
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.StorageCreator.get_storage",
+            lambda: storage,
+        )
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.settings.URL_STRATEGY",
+            "backend", raising=False,
+        )
+        return storage
+
+    def test_share_token_list_only_snapshot(self, _patch_db, flask_app):
+        from application.api.user.artifacts.routes import ListArtifacts
+
+        conv_id, in_art, out_art, null_art, token = self._seed(_patch_db)
+        resp = _call(
+            flask_app, ListArtifacts, token=None,
+            query={"conversation_id": conv_id, "share_token": token},
+        )
+        assert resp.status_code == 200
+        ids = {a["id"] for a in resp.json["artifacts"]}
+        assert str(in_art["id"]) in ids
+        assert str(out_art["id"]) not in ids  # outside first_n_queries
+        assert str(null_art["id"]) not in ids  # NULL message_id -> not in snapshot
+
+    def test_share_token_get_in_snapshot_200(self, _patch_db, flask_app):
+        from application.api.user.artifacts.routes import GetArtifact
+
+        _, in_art, _out, _null, token = self._seed(_patch_db)
+        resp = _call(
+            flask_app, GetArtifact, in_art["id"], token=None,
+            query={"share_token": token},
+        )
+        assert resp.status_code == 200
+
+    def test_share_token_get_out_of_snapshot_403(self, _patch_db, flask_app):
+        from application.api.user.artifacts.routes import GetArtifact
+
+        _, _in, out_art, _null, token = self._seed(_patch_db)
+        resp = _call(
+            flask_app, GetArtifact, out_art["id"], token=None,
+            query={"share_token": token},
+        )
+        assert resp.status_code == 403
+
+    def test_share_token_null_message_id_denied(self, _patch_db, flask_app):
+        from application.api.user.artifacts.routes import GetArtifact
+
+        _, _in, _out, null_art, token = self._seed(_patch_db)
+        resp = _call(
+            flask_app, GetArtifact, null_art["id"], token=None,
+            query={"share_token": token},
+        )
+        assert resp.status_code == 403
+
+    def test_share_token_download_in_snapshot_200(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        from application.api.user.artifacts.routes import DownloadArtifact
+
+        _, in_art, _out, _null, token = self._seed(_patch_db)
+        self._mock_storage(monkeypatch, b"INDATA")
+        resp = _call(
+            flask_app, DownloadArtifact, in_art["id"], token=None,
+            query={"share_token": token},
+        )
+        assert resp.status_code == 200
+        assert resp.data == b"INDATA"
+
+    def test_share_token_download_out_of_snapshot_403(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        from application.api.user.artifacts.routes import DownloadArtifact
+
+        _, _in, out_art, _null, token = self._seed(_patch_db)
+        self._mock_storage(monkeypatch, b"OUTDATA")
+        resp = _call(
+            flask_app, DownloadArtifact, out_art["id"], token=None,
+            query={"share_token": token},
+        )
+        assert resp.status_code == 403
+
+    def test_owner_sees_all_artifacts(self, _patch_db, flask_app, token_owner):
+        # Snapshot scoping is share-token-only: the owner lists every artifact and
+        # can fetch one attached to a message outside the first_n_queries snapshot.
+        from application.api.user.artifacts.routes import GetArtifact, ListArtifacts
+
+        conv_id, in_art, out_art, null_art, _token = self._seed(_patch_db)
+        listed = _call(
+            flask_app, ListArtifacts, token=token_owner,
+            query={"conversation_id": conv_id},
+        )
+        assert listed.status_code == 200
+        ids = {a["id"] for a in listed.json["artifacts"]}
+        assert {str(in_art["id"]), str(out_art["id"]), str(null_art["id"])} <= ids
+
+        got = _call(flask_app, GetArtifact, out_art["id"], token=token_owner)
+        assert got.status_code == 200
+
+    def test_shared_with_collaborator_sees_all_artifacts(self, _patch_db, flask_app):
+        # A read-only shared_with collaborator (JWT) is not snapshot-scoped either.
+        from application.api.user.artifacts.routes import GetArtifact, ListArtifacts
+
+        conv_id, in_art, out_art, null_art, _token = self._seed(_patch_db)
+        ConversationsRepository(_patch_db).add_shared_user(conv_id, SHARED_USER)
+
+        listed = _call(
+            flask_app, ListArtifacts, token={"sub": SHARED_USER},
+            query={"conversation_id": conv_id},
+        )
+        assert listed.status_code == 200
+        ids = {a["id"] for a in listed.json["artifacts"]}
+        assert {str(in_art["id"]), str(out_art["id"]), str(null_art["id"])} <= ids
+
+        got = _call(
+            flask_app, GetArtifact, out_art["id"], token={"sub": SHARED_USER}
+        )
+        assert got.status_code == 200
 
 
 # ---------------------------------------------------------------------------

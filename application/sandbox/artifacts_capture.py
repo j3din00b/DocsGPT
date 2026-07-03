@@ -34,6 +34,11 @@ class QuotaExceeded(Exception):
 # one exec into an unbounded read+persist sweep.
 MAX_CAPTURED_FILES = 64
 
+# Cap the per-pass READ sweep independently of the persist cap: unchanged files are
+# read (to detect a change) then skipped without counting toward MAX_CAPTURED_FILES,
+# so a workspace full of unchanged files could otherwise be re-read in full every exec.
+MAX_SCANNED_FILES = 256
+
 # Auto-capture skips scratch/intermediate workspace paths so install steps, extracted
 # archives, and temp files don't each become a downloadable artifact. Agents write
 # throwaway files under ``tmp/``; an explicit ``outputs`` list bypasses this skip (the
@@ -99,9 +104,14 @@ def snapshot_signatures(manager: Any, session_id: str) -> Dict[str, Tuple[int, O
     except Exception:
         logger.exception("artifacts_capture: pre-exec listing failed")
         return signatures
-    for rel_path in files:
-        if rel_path.startswith("inputs/") or _is_scratch(rel_path):
-            continue
+    candidates = sorted(f for f in files if not f.startswith("inputs/") and not _is_scratch(f))
+    if len(candidates) > MAX_SCANNED_FILES:
+        logger.warning(
+            "artifacts_capture: pre-exec signature scan capped at %d of %d files",
+            MAX_SCANNED_FILES,
+            len(candidates),
+        )
+    for rel_path in candidates[:MAX_SCANNED_FILES]:
         try:
             data = manager.get_file(session_id, rel_path)
         except Exception:
@@ -142,10 +152,15 @@ def capture_artifacts(
     else:
         candidates = sorted(f for f in produced if not _is_scratch(f))
     captured: List[Dict[str, Any]] = []
+    scanned = 0
     for rel_path in candidates:
         if len(captured) >= MAX_CAPTURED_FILES:
             logger.warning("artifacts_capture: capture cap reached; remaining files skipped")
             break
+        if scanned >= MAX_SCANNED_FILES:
+            logger.warning("artifacts_capture: read-scan cap reached; remaining files skipped")
+            break
+        scanned += 1
         try:
             data = manager.get_file(session_id, rel_path)
         except Exception:

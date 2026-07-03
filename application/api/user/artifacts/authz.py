@@ -60,23 +60,31 @@ def resolve_principal() -> Principal:
     return Principal()
 
 
+def _shared_row_for(conn, conversation_id, share_token):
+    """Return the shared_conversations row iff share_token grants this conversation, else None."""
+    if not share_token:
+        return None
+    shared = SharedConversationsRepository(conn).find_by_uuid(share_token)
+    if shared and str(shared.get("conversation_id")) == str(conversation_id):
+        return shared
+    return None
+
+
 def user_can_access_conversation(
     conn, conversation_id: str, user_id: Optional[str], share_token: Optional[str]
 ) -> bool:
     """Allow if the caller owns/shares the conversation, or holds a valid share token.
 
-    Reuses ``ConversationsRepository.get`` (owner OR ``shared_with``) so artifact
-    access tracks message access; a publicly shared link inherits download access
-    via its share token (see ``SharedConversationsRepository.find_by_uuid``).
+    Conversation-level gate only. Reuses ``ConversationsRepository.get`` (owner OR
+    ``shared_with``) so artifact access tracks message access, and honours a valid
+    share token. A share-token caller reaches the conversation here but must still
+    be snapshot-scoped per-artifact by the caller (see ``authorize_artifact``): a
+    valid token does NOT imply access to every artifact in the conversation.
     """
     if user_id:
         if ConversationsRepository(conn).get(conversation_id, user_id) is not None:
             return True
-    if share_token:
-        shared = SharedConversationsRepository(conn).find_by_uuid(share_token)
-        if shared and str(shared.get("conversation_id")) == str(conversation_id):
-            return True
-    return False
+    return _shared_row_for(conn, conversation_id, share_token) is not None
 
 
 def authorize_artifact(conn, artifact: dict, principal: Principal) -> bool:
@@ -85,8 +93,9 @@ def authorize_artifact(conn, artifact: dict, principal: Principal) -> bool:
     A low-trust agent api_key is confined to a single conversation it proves by
     carrying that artifact's parent ``conversation_id`` query param (owner match +
     matching conversation + agent scope) and never inherits share-link access. A
-    JWT owner, ``shared_with`` collaborator, or share-token holder is authorized by
-    resolving the artifact's parent (conversation or workflow run).
+    JWT owner or ``shared_with`` collaborator gets full access to every artifact of
+    the parent; a share-token holder is confined to the shared ``first_n_queries``
+    snapshot (an artifact whose ``message_id`` is outside it, or NULL, is denied).
     """
     if principal.is_agent_scoped:
         # An agent key is not the owner's session and is embedded in public widget
@@ -108,8 +117,21 @@ def authorize_artifact(conn, artifact: dict, principal: Principal) -> bool:
     share_token = request.args.get("share_token")
 
     if conversation_id is not None:
-        return user_can_access_conversation(
-            conn, str(conversation_id), principal.user_id, share_token
+        # Owner or shared_with collaborator: full access to every artifact.
+        if principal.user_id and ConversationsRepository(conn).get(
+            str(conversation_id), principal.user_id
+        ) is not None:
+            return True
+        # Share-token holder: only artifacts inside the shared first_n_queries snapshot.
+        shared = _shared_row_for(conn, str(conversation_id), share_token)
+        if shared is None:
+            return False
+        message_id = artifact.get("message_id")
+        if not message_id:
+            return False
+        first_n = int(shared.get("first_n_queries") or 0)
+        return ConversationsRepository(conn).message_in_first_n(
+            str(conversation_id), str(message_id), first_n
         )
     if workflow_run_id is not None:
         if not principal.user_id:

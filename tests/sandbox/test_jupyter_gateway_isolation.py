@@ -185,6 +185,7 @@ def test_collect_caps_oversize_rich_output(monkeypatch):
     result = sb._collect(_FakeWS(frames), msg_id, timeout=5, kernel_id="k1")
     assert result.results == []  # over-budget bundle dropped, not materialized
     assert "[output truncated" in result.stderr
+    assert result.truncated is True  # truncation is surfaced explicitly, not hidden behind "ok"
 
 
 def test_collect_keeps_small_rich_output(monkeypatch):
@@ -199,6 +200,7 @@ def test_collect_keeps_small_rich_output(monkeypatch):
     result = sb._collect(_FakeWS(frames), msg_id, timeout=5, kernel_id="k2")
     assert len(result.results) == 1
     assert "[output truncated" not in (result.stderr or "")
+    assert result.truncated is False  # nothing was cut
 
 
 # -- open() is idempotent under concurrency -----------------------------------
@@ -244,3 +246,110 @@ def test_concurrent_open_creates_one_kernel(monkeypatch):
 
     assert posts["n"] == 1, "concurrent open() created more than one kernel"
     assert results[0] == results[1]  # both callers got the same kernel id
+
+
+# -- Chunked put_file + large get_file round-trip ------------------------------
+
+
+def _inprocess_run(calls):
+    """A ``_run`` stand-in that execs the kernel program in-process and captures its stdout."""
+    import io as _io
+    from contextlib import redirect_stdout
+
+    def fake_run(_kernel, code, _timeout, max_output_bytes=None):
+        calls.append(code)
+        buf = _io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                exec(compile(code, "<kernel>", "exec"), {})
+        except Exception as exc:  # surface as an error ExecResult, like the real gateway
+            return ExecResult(status="error", error_name=type(exc).__name__, error_value=str(exc), exit_code=-1)
+        return ExecResult(status="ok", stdout=buf.getvalue(), exit_code=0)
+
+    return fake_run
+
+
+def test_put_file_chunks_large_upload_and_get_file_round_trips(tmp_path, monkeypatch):
+    """A >4 MB file is staged in multiple chunks and read back byte-for-byte.
+
+    A 7 MB file's base64 (~9.3 MB) exceeds the default 8 MB output cap, so the
+    file-transfer budget on get_file is what keeps it from truncating.
+    """
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused", max_file_bytes=10 * 1024 * 1024)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sb._kernels["sid"] = _Kernel("kid", str(workspace))
+
+    put_calls: list = []
+    monkeypatch.setattr(sb, "_run", _inprocess_run(put_calls))
+
+    data = os.urandom(7 * 1024 * 1024 + 123)  # 7 MB -> 3 chunks (3 + 3 + ~1)
+    sb.put_file("sid", "big.bin", data)
+
+    # Chunking actually happened (one execute_request could not carry this).
+    assert len(put_calls) == 3
+    assert (workspace / "big.bin").read_bytes() == data
+    # get_file reassembles the same bytes and passes its length+sha256 integrity check.
+    assert sb.get_file("sid", "big.bin") == data
+
+
+def test_put_file_writes_empty_file(tmp_path, monkeypatch):
+    """An empty upload still creates the file with a single wb write."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sb._kernels["sid"] = _Kernel("kid", str(workspace))
+    calls: list = []
+    monkeypatch.setattr(sb, "_run", _inprocess_run(calls))
+
+    sb.put_file("sid", "empty.bin", b"")
+    assert len(calls) == 1
+    assert (workspace / "empty.bin").read_bytes() == b""
+    assert sb.get_file("sid", "empty.bin") == b""
+
+
+def test_collect_file_transfer_budget_prevents_truncation(monkeypatch):
+    """A payload over the default output cap but under the file-transfer budget is not truncated."""
+    sb = JupyterKernelGatewaySandbox(
+        gateway_url="http://unused", max_output_bytes=1000, max_file_bytes=5000
+    )
+    monkeypatch.setattr(sb, "_interrupt_and_drain", lambda *a, **k: None)
+    big = "Z" * 4000  # > max_output_bytes (1000), < _file_transfer_budget()
+    assert 1000 < len(big) < sb._file_transfer_budget()
+
+    # Default budget -> truncated (the get_file END marker would be dropped here).
+    default = sb._collect(
+        _FakeWS([_frame("m", "stream", {"name": "stdout", "text": big})]),
+        "m", timeout=5, kernel_id="k",
+    )
+    assert "[output truncated" in default.stderr
+
+    # Raised file-transfer budget -> the full payload is kept intact.
+    ok = sb._collect(
+        _FakeWS([
+            _frame("m", "stream", {"name": "stdout", "text": big}),
+            _frame("m", "execute_reply", {"status": "ok"}),
+            _frame("m", "status", {"execution_state": "idle"}),
+        ]),
+        "m", timeout=5, kernel_id="k", max_output_bytes=sb._file_transfer_budget(),
+    )
+    assert "[output truncated" not in (ok.stderr or "")
+    assert ok.stdout == big
+
+
+def test_prime_sweeps_stale_workspace_before_recreate(tmp_path, monkeypatch):
+    """A new kernel's _prime rmtrees any stale per-session dir so old files never carry over."""
+    root = tmp_path / "docsgpt-sandbox"
+    monkeypatch.setattr(jupyter_gateway, "_WORKSPACE_ROOT", str(root))
+    workspace = root / "conv-stale"
+    workspace.mkdir(parents=True)
+    (workspace / "stale.txt").write_text("old")
+
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    kernel = _Kernel("kid", str(workspace))
+    monkeypatch.setattr(sb, "_run", lambda _k, code, _t: (_exec_setup_in_tmp(code), ExecResult(status="ok"))[1])
+    monkeypatch.chdir(tmp_path)
+    sb._prime(kernel)
+
+    assert kernel.initialized
+    assert not (workspace / "stale.txt").exists()  # stale file swept on re-open

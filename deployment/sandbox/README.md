@@ -1,9 +1,34 @@
 # docsgpt-sandbox runner
 
-Always-on Jupyter Kernel Gateway that executes sandboxed LLM code. The DocsGPT
+Opt-in Jupyter Kernel Gateway that executes sandboxed LLM code. The DocsGPT
 backend/worker is the **client** and connects over HTTP + WebSocket via
 `SANDBOX_GATEWAY_URL`. Each session is an **in-process kernel** (child process),
 never a child container; the Docker socket is **not** mounted.
+
+## Enabling code execution (opt-in)
+
+The runner is **opt-in**. `code_executor` is no longer a default chat tool (it
+was removed from `DEFAULT_CHAT_TOOLS`), so a plain `docker compose up` does
+**not** start `docsgpt-sandbox`. Start it explicitly with the `sandbox`
+profile:
+
+```bash
+docker compose -f deployment/docker-compose.yaml --profile sandbox up
+```
+
+With the egress-firewall overlay (see *Network egress / SSRF* below):
+
+```bash
+docker compose \
+  -f deployment/docker-compose.yaml \
+  -f deployment/optional/docker-compose.optional.sandbox-egress.yaml \
+  --profile sandbox up
+```
+
+Then enable `code_executor` **per-agent** in the agent tool picker — it is not a
+default chat tool. Agents without it never call the runner, and the
+backend/worker degrade gracefully when the runner is absent. The `-hub` and
+`-azure` compose variants gate the runner behind the same `sandbox` profile.
 
 ## Isolation model
 
@@ -102,7 +127,9 @@ required there.
 ## In docker-compose
 
 The `docsgpt-sandbox` service is defined in `deployment/docker-compose.yaml` on
-an internal-only network. The backend and worker reach it at
+an internal-only network and is gated behind the `sandbox` Compose profile
+(opt-in — start it with `docker compose --profile sandbox up`; see *Enabling
+code execution (opt-in)* above). The backend and worker reach it at
 `http://docsgpt-sandbox:8888` and select the scrubbing kernel by setting
 `SANDBOX_KERNEL_NAME=docsgpt-python` (the runner only ships the kernelspec; the
 app chooses it). The same applies to k8s: `SANDBOX_KERNEL_NAME=docsgpt-python`
@@ -194,14 +221,19 @@ The hardened container runs **without `NET_ADMIN`**, so it cannot self-apply
   ```
 
 - **docker-compose** — compose cannot express L3 egress filtering natively. The
-  base stack puts the runner on an `internal: true` network (no host port), but
-  that does not by itself block the metadata IP or RFC1918 reachable via the
-  default bridge. Add a **host/cloud firewall rule** (drop the four private
-  ranges on the sandbox container's interface) **or** route egress through an
-  **egress-gateway proxy** sidecar. Both are documented in
-  [`deployment/optional/docker-compose.optional.sandbox-egress.yaml`](../optional/docker-compose.optional.sandbox-egress.yaml).
-  On untrusted/multi-tenant hosts prefer the host-firewall rule — a forward
-  proxy only constrains code that honors `HTTP(S)_PROXY`.
+  base stack reaches the runner over an `internal: true` control network
+  (`sandbox-net`, no host port) and gives it internet egress on a dedicated
+  `sandbox-egress` bridge — but that bridge does not by itself block the metadata
+  IP or RFC1918. Apply
+  [`deployment/optional/docker-compose.optional.sandbox-egress.yaml`](../optional/docker-compose.optional.sandbox-egress.yaml),
+  which flips `sandbox-egress` to `internal: true` (removing the runner's direct
+  internet/RFC1918/metadata route entirely) and forces egress through a
+  deny-private **egress-gateway proxy** sidecar; for belt-and-suspenders on
+  untrusted/multi-tenant hosts also add a **host/cloud firewall rule** (drop the
+  four private ranges on the sandbox container's interface), since a forward
+  proxy only filters code that honors `HTTP(S)_PROXY` — the `internal` flip is
+  what contains raw sockets. Note the broker/DB published ports are bound to
+  `127.0.0.1` so the runner cannot reach them via the host gateway either.
 
 ## Other hardening (deployment-level)
 

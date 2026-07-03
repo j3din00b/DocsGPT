@@ -22,7 +22,8 @@ class _Session:
     ``handle`` is the backend handle id returned by ``backend.open``; ``None`` while a
     slot is RESERVED (a placeholder occupying a cap slot during a cold backend open that
     runs outside the lock). ``ready`` is False for such a placeholder so reuse/reap/evict
-    skip it until the backend open finalizes it.
+    skip it until the backend open finalizes it. ``pending_close`` marks a session whose
+    ``close`` arrived while an op held it ``in_use``; the last ``_leave`` then tears it down.
     """
 
     session_id: str
@@ -32,6 +33,7 @@ class _Session:
     in_use: int = field(default=0)
     handle: Optional[str] = field(default=None)
     ready: bool = field(default=False)
+    pending_close: bool = field(default=False)
 
     def is_expired(self, now: float) -> bool:
         """True when the session has been idle longer than its (clamped) TTL."""
@@ -256,10 +258,22 @@ class SandboxManager:
         The backend ``close`` runs OUTSIDE the lock (it may be slow network I/O) and is
         keyed by the captured handle so it tears down only the resource this session
         owned, never one a concurrent re-open created.
+
+        Teardown is DEFERRED when an op holds the session ``in_use`` (a concurrent
+        exec/put_file/get_file): the session is flagged ``pending_close`` and the last
+        ``_leave`` performs the actual close, so a concurrent close never kills an
+        in-flight exec (which would lose its captured files). The common path -- the
+        caller's own exec has already ``_left``, so ``in_use == 0`` -- stays synchronous.
         """
         with self._lock:
-            session = self._sessions.pop(session_id, None)
-            handle = session.handle if session is not None else None
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            if session.in_use > 0:
+                session.pending_close = True
+                return
+            self._sessions.pop(session_id, None)
+            handle = session.handle
         self._close_backend(session_id, handle)
 
     def has_session(self, session_id: str) -> bool:
@@ -288,12 +302,25 @@ class SandboxManager:
             session.in_use += 1
 
     def _leave(self, session_id: str) -> None:
-        """Release an in-use hold taken by ``_enter`` (idempotent if the session was closed)."""
+        """Release an in-use hold taken by ``_enter``; run a close deferred by ``close`` on the last release.
+
+        Idempotent if the session was already closed. When the final hold is released and
+        a ``close`` was deferred (``pending_close``), the session is popped here and its
+        backend torn down OUTSIDE the lock, keyed by the captured handle.
+        """
+        handle: Optional[str] = None
+        do_close = False
         with self._lock:
             session = self._sessions.get(session_id)
             if session is not None and session.in_use > 0:
                 session.in_use -= 1
                 session.last_access = time.monotonic()
+                if session.in_use == 0 and session.pending_close:
+                    self._sessions.pop(session_id, None)
+                    handle = session.handle
+                    do_close = True
+        if do_close:
+            self._close_backend(session_id, handle)
 
     def _close_backend(self, session_id: str, handle: Optional[str]) -> None:
         """Close the SPECIFIC backend resource captured for this session, best-effort.

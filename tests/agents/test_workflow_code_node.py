@@ -15,6 +15,7 @@ from application.agents.workflows.cel_evaluator import evaluate_cel
 from application.agents.workflows.schemas import (
     NodeType,
     Workflow,
+    WorkflowEdge,
     WorkflowGraph,
     WorkflowNode,
 )
@@ -140,10 +141,12 @@ def test_code_node_writes_artifact_reference_into_state(patch_sandbox):
     assert engine.state["node_code_1_output"] == ref
     assert engine.state["report"] == ref
     assert all(not isinstance(v, (bytes, bytearray)) for v in engine.state["report"].values())
-    # The sandbox session is bound to the run id and closed after the run.
+    # The sandbox session is bound to the run id. It is NOT closed per node: the
+    # session is shared across nodes and torn down once at end of the run (in
+    # WorkflowEngine.execute), so a code node leaves it open.
     manager = patch_sandbox["manager_holder"]["manager"]
     assert manager.opened == ["11111111-1111-1111-1111-111111111111"]
-    assert manager.closed == ["11111111-1111-1111-1111-111111111111"]
+    assert manager.closed == []
 
 
 def test_code_node_no_artifacts_still_writes_status(patch_sandbox):
@@ -184,10 +187,49 @@ def test_code_node_skips_capture_when_run_not_persisted(patch_sandbox):
 
     assert patch_sandbox["capture_calls"] == 0
     assert engine.state["out"] == {"artifacts": [], "status": "ok"}
-    # The sandbox session still opened and closed (only persistence was skipped).
+    # The sandbox session still opened (only persistence was skipped) and is left open
+    # for the run to reap -- the node never closes the shared run session.
     manager = patch_sandbox["manager_holder"]["manager"]
     assert manager.opened == ["11111111-1111-1111-1111-111111111111"]
-    assert manager.closed == ["11111111-1111-1111-1111-111111111111"]
+    assert manager.closed == []
+
+
+def test_execute_closes_run_session_once_at_end(monkeypatch):
+    """The run-scoped sandbox session opened by a code node is closed once when execute() ends."""
+    manager = _FakeManager(_Result(ok=True, stdout="ok"))
+    monkeypatch.setattr(
+        "application.sandbox.sandbox_creator.SandboxCreator.get_manager", lambda: manager
+    )
+    monkeypatch.setattr(
+        "application.sandbox.sandbox_creator.SandboxCreator.peek_manager", lambda: manager
+    )
+    monkeypatch.setattr(
+        "application.sandbox.artifacts_capture.snapshot_signatures", lambda *a, **k: {}
+    )
+    monkeypatch.setattr(
+        "application.sandbox.artifacts_capture.capture_artifacts", lambda *a, **k: []
+    )
+
+    start = WorkflowNode(
+        id="start_1", workflow_id="wf-1", type=NodeType.START, title="Start",
+        position={"x": 0, "y": 0}, config={},
+    )
+    code = _code_node(node_id="code_1", output_variable="out", code="print('x')")
+    edge = WorkflowEdge(id="e1", workflow_id="wf-1", source="start_1", target="code_1")
+    graph = WorkflowGraph(workflow=Workflow(name="Close Once"), nodes=[start, code], edges=[edge])
+    agent = SimpleNamespace(
+        endpoint="stream", llm_name="openai", model_id="gpt-4o-mini", api_key="test-key",
+        chat_history=[], user="user-code", decoded_token={"sub": "user-code"},
+    )
+    sid = "11111111-1111-1111-1111-111111111111"
+    engine = WorkflowEngine(graph, agent, workflow_run_id=sid)
+
+    list(engine.execute({}, "q"))
+
+    # The code node opened the run session and left it open; execute() closed it
+    # exactly once at the end of the run (not once per node).
+    assert manager.opened == [sid]
+    assert manager.closed == [sid]
 
 
 def test_code_node_reads_prior_state_from_state_json(patch_sandbox):
@@ -306,6 +348,52 @@ def test_resolve_input_artifact_ids_from_state_refs_and_raw():
     # A state var holding a ref resolves to its artifact_id; any other entry is
     # taken as a raw artifact id (the literal token, not a resolved value).
     assert ids == ["art-from-ref", "art-raw-id", "not_a_ref"]
+
+
+def test_materialize_code_inputs_rejects_oversize(monkeypatch):
+    """A code-node input whose declared version ``size`` exceeds the cap raises before staging."""
+    from contextlib import contextmanager
+
+    from application.core.settings import settings
+
+    monkeypatch.setattr(settings, "SANDBOX_MAX_INPUT_BYTES", 100, raising=False)
+    monkeypatch.setattr(
+        "application.agents.tools.artifact_ref.resolve_artifact_id",
+        lambda repo, raw, **k: str(raw),
+    )
+
+    class _Repo:
+        def __init__(self, conn):
+            pass
+
+        def get_artifact_in_parent(self, artifact_id, *, workflow_run_id=None, conversation_id=None):
+            return {"id": artifact_id, "current_version": 1}
+
+        def get_version(self, artifact_id, version):
+            return {"filename": "big.csv", "size": 10_000, "storage_path": "p/big.csv"}
+
+    @contextmanager
+    def _readonly():
+        yield object()
+
+    class _Storage:
+        def get_file(self, path):
+            raise AssertionError("bytes must not be read when declared size exceeds the cap")
+
+    monkeypatch.setattr(
+        "application.storage.db.repositories.artifacts.ArtifactsRepository", _Repo
+    )
+    monkeypatch.setattr("application.storage.db.session.db_readonly", _readonly)
+    monkeypatch.setattr(
+        "application.storage.storage_creator.StorageCreator.get_storage",
+        staticmethod(lambda: _Storage()),
+    )
+
+    engine = _engine()
+    manager = _FakeManager(_Result(ok=True, stdout="ok"))
+    with pytest.raises(ValueError, match="exceeds"):
+        engine._materialize_code_inputs(manager, engine._session_id(), ["art-raw-id"], "user-code")
+    assert manager.put_files == []  # nothing staged
 
 
 # ---------------------------------------------------------------------------

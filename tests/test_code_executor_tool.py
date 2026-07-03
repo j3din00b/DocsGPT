@@ -381,3 +381,50 @@ def test_materialize_inputs_out_of_range_ref_is_clean_error(monkeypatch):
     assert "A2" in out["error"]
     assert "not found in this conversation/run" in out["error"]
     assert manager.put_files == {}
+
+
+def test_materialize_inputs_rejects_oversize_by_declared_size(monkeypatch):
+    """An input whose declared version ``size`` exceeds SANDBOX_MAX_INPUT_BYTES is rejected pre-read."""
+    from application.agents.tools import code_executor as ce
+    from application.core import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "SANDBOX_MAX_INPUT_BYTES", 100, raising=False)
+
+    class _Repo:
+        def __init__(self, conn):
+            pass
+
+        def artifact_id_at_position(self, n, *, conversation_id=None, workflow_run_id=None):
+            return None
+
+        def get_artifact_in_parent(self, artifact_id, *, conversation_id=None, workflow_run_id=None):
+            if conversation_id != "conv-1":
+                return None
+            return {"id": artifact_id, "current_version": 1, "title": "big.csv"}
+
+        def get_version(self, artifact_id, version):
+            return {
+                "filename": "big.csv",
+                "size": 10_000,  # far over the 100-byte cap
+                "storage_path": f"inputs/u/artifacts/{artifact_id}/v1/big.csv",
+            }
+
+    class _Conn:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Storage:
+        def get_file(self, path):
+            raise AssertionError("bytes must not be read when declared size exceeds the cap")
+
+    monkeypatch.setattr(ce, "db_readonly", lambda: _Conn())
+    monkeypatch.setattr(ce, "ArtifactsRepository", _Repo)
+    monkeypatch.setattr(ce.StorageCreator, "get_storage", staticmethod(lambda: _Storage()))
+
+    manager = _InputManager()
+    out = _tool()._materialize_inputs(manager, "conv-1", [_ART_ID])
+    assert "exceeds" in out["error"] and "sandbox input limit" in out["error"]
+    assert manager.put_files == {}  # nothing staged

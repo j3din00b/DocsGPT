@@ -2,40 +2,52 @@
 #
 # Docker Compose cannot express L3 egress filtering the way a Kubernetes
 # NetworkPolicy can, so SSRF containment in compose deployments is delivered by
-# routing the sandbox's outbound traffic through an egress-gateway sidecar that
-# DENIES private / link-local / metadata ranges and ALLOWS the public internet.
+# taking away the runner's direct internet route and forcing its outbound
+# traffic through an egress-gateway sidecar that DENIES private / link-local /
+# metadata ranges and ALLOWS the public internet.
+#
+# HOW THIS OVERLAY WORKS
+# The base stack puts docsgpt-sandbox on two networks: the internal `sandbox-net`
+# (control plane to backend/worker) and `sandbox-egress` (its internet route).
+# This overlay flips `sandbox-egress` to `internal: true`, which removes the
+# runner's direct route to the internet / host / RFC1918 / metadata entirely --
+# so even raw sockets in arbitrary sandbox code have nowhere to go except the
+# proxy on `sandbox-net`. The proxy is the ONLY container with an internet route
+# (on its own `sandbox-egress-out` network) and its ACL denies private
+# destinations. We flip a network's scalar property by KEY (a well-defined
+# Compose merge); we do NOT try to remove an item from the service's `networks`
+# LIST, which Compose cannot express (it unions lists) -- the reason a naive
+# `networks: [sandbox-net]` override silently leaves the runner on its old net.
 #
 # Two viable approaches; pick one:
 #
-#  (1) Host / cloud firewall (simplest, recommended for single-host compose):
-#      Drop egress to RFC1918 (10/8, 172.16/12, 192.168/16), link-local
+#  (1) Host / cloud firewall (simplest, belt-and-suspenders for single-host):
+#      Also drop egress to RFC1918 (10/8, 172.16/12, 192.168/16), link-local
 #      (169.254/16, incl. the 169.254.169.254 metadata IP), and ULA on the
 #      docsgpt-sandbox container's interface using iptables/nftables on the
-#      Docker host (Docker does not do this for you). Example (host root):
-#        SBX=$(docker inspect -f '{{.NetworkSettings.Networks.docsgpt_sandbox-net.IPAddress}}' docsgpt-sandbox)
+#      Docker host. Example (host root):
+#        SBX=$(docker inspect -f '{{.NetworkSettings.Networks.docsgpt-oss_sandbox-egress.IPAddress}}' docsgpt-sandbox)
 #        iptables -I DOCKER-USER -s "$SBX" -d 169.254.0.0/16 -j DROP
 #        iptables -I DOCKER-USER -s "$SBX" -d 10.0.0.0/8     -j DROP
 #        iptables -I DOCKER-USER -s "$SBX" -d 172.16.0.0/12  -j DROP
 #        iptables -I DOCKER-USER -s "$SBX" -d 192.168.0.0/16 -j DROP
 #      (Allow established/return traffic and DNS as needed for your setup.)
 #
-#  (2) Egress-gateway sidecar (this overlay): pin the sandbox to an
-#      internal-only network with NO direct internet route, and force all of
-#      its outbound traffic through a small forward proxy that blocks private
-#      destinations. The proxy is the ONLY container on both the internal and
-#      the egress network, so the sandbox cannot reach internal services
-#      directly. Configure the runner's outbound HTTP(S) via the proxy env
-#      vars below; lock down non-HTTP egress with the proxy's own rules.
+#  (2) Egress-gateway sidecar (this overlay): the runner has NO direct internet
+#      route (see above); its only path out is the deny-private forward proxy.
+#      Point the runner's HTTP(S) client at the proxy via the env vars below.
 #
 # Apply alongside the base stack:
 #   docker compose -f deployment/docker-compose.yaml \
 #     -f deployment/optional/docker-compose.optional.sandbox-egress.yaml up -d
+# (also works layered on docker-compose-hub.yaml / docker-compose-azure.yaml,
+# which share the same service/network names).
 #
-# NOTE: a forward proxy only constrains traffic that honors the proxy env vars.
-# Truly arbitrary sandbox code can ignore them, so on a multi-tenant or
-# untrusted deployment prefer approach (1) (or the Kubernetes NetworkPolicy)
-# which enforces at the network layer regardless of what the code does.
-version: "3.8"
+# NOTE: because `sandbox-egress` is internal here, non-HTTP raw egress is blocked
+# at L3 regardless of what the code does (there is simply no route). HTTP(S) that
+# honors the proxy env is filtered by the proxy ACL. For belt-and-suspenders on a
+# multi-tenant or untrusted deployment, also apply approach (1) or the Kubernetes
+# NetworkPolicy.
 
 services:
   # Forward proxy that denies private/link-local/metadata destinations and
@@ -46,26 +58,28 @@ services:
     image: ghcr.io/example/egress-deny-private:latest # replace with your proxy image
     restart: unless-stopped
     networks:
-      - sandbox-net # reachable by the sandbox
-      - sandbox-egress # the only container with an internet route
+      - sandbox-net        # reachable by the runner (control-plane net)
+      - sandbox-egress-out # the ONLY container with an internet route
 
   docsgpt-sandbox:
-    # Cut the sandbox off from the default (internet) bridge; it keeps only the
-    # internal sandbox-net and must egress via the proxy.
-    networks:
-      - sandbox-net
+    # Match the base service's profile so this overlay fragment merges onto the
+    # profiled base and the runner still starts only under `--profile sandbox`
+    # (Compose unions service fragments across -f files; keeping the profile
+    # here means a bare `up` never starts the runner via this overlay either).
+    profiles: ["sandbox"]
+    # No `networks:` override here on purpose: the base already attaches the
+    # runner to sandbox-net + sandbox-egress. Flipping sandbox-egress to internal
+    # (below) removes its direct internet route; its only way out is this proxy.
     environment:
       - HTTP_PROXY=http://sandbox-egress-proxy:8080
       - HTTPS_PROXY=http://sandbox-egress-proxy:8080
       - NO_PROXY=localhost,127.0.0.1
 
 networks:
-  # Internal-only network shared by the sandbox and the proxy. ``internal:
-  # true`` removes the default gateway so the sandbox has NO direct internet
-  # route -- its only path out is through the proxy on the egress network.
-  sandbox-net:
-    driver: bridge
-    internal: true
-  # Internet-facing network for the proxy only.
+  # Flip the runner's egress net to internal: no direct route to the internet,
+  # host, RFC1918, or cloud metadata. (Merged by key over the base definition.)
   sandbox-egress:
+    internal: true
+  # Internet-facing route for the proxy ONLY.
+  sandbox-egress-out:
     driver: bridge

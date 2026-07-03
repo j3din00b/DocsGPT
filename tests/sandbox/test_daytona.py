@@ -564,6 +564,156 @@ def test_list_files_error_wrapped_as_ioerror(sandbox):
     assert "api.daytona" not in str(exc.value)
 
 
+# --- Output cap in _to_result --------------------------------------------
+
+
+def test_to_result_truncates_stdout_over_cap(fake_sdk):
+    """Stdout beyond max_output_bytes is byte-capped, noted, and flagged truncated."""
+    from application.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=10)
+    resp = _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="X" * 100))
+    res = s._to_result(resp)
+    assert res.truncated is True
+    prefix = res.stdout.split("\n[output truncated")[0]
+    assert prefix == "X" * 10  # capped to exactly the byte budget before the note
+    assert "[output truncated at 10 bytes]" in res.stdout
+
+
+def test_to_result_keeps_small_stdout_intact(fake_sdk):
+    from application.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=1000)
+    res = s._to_result(_FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="hello")))
+    assert res.truncated is False
+    assert res.stdout == "hello"
+
+
+def test_to_result_cap_disabled_by_default(fake_sdk):
+    """max_output_bytes defaults to 0 (disabled): a large stdout is passed through whole."""
+    from application.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k")
+    res = s._to_result(_FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="Y" * 5000)))
+    assert res.truncated is False
+    assert res.stdout == "Y" * 5000
+
+
+def test_to_result_truncation_bounds_error_value(fake_sdk):
+    """On a nonzero exit the capped stdout (not the raw buffer) is what feeds error_value."""
+    from application.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=10)
+    res = s._to_result(_FakeExecuteResponse(exit_code=1, artifacts=_FakeArtifacts(stdout="E" * 100)))
+    assert res.status == "error" and res.truncated is True
+    assert res.error_value == res.stdout
+    assert res.error_value.split("\n[output truncated")[0] == "E" * 10
+
+
+# --- Wake an auto-stopped sandbox on the cached-handle path ---------------
+
+
+def test_exec_wakes_auto_stopped_sandbox_and_retries(sandbox):
+    """A cached handle to an auto-stopped sandbox: exec wakes it and retries once."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"  # Daytona auto-stopped it under the still-cached handle
+    created.process.code_run.side_effect = [
+        RuntimeError("sandbox is stopped"),
+        _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="woke\n")),
+    ]
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.ok and res.stdout == "woke\n"
+    sandbox._client.start.assert_called_once()
+    assert created.process.code_run.call_count == 2
+
+
+def test_exec_does_not_retry_when_started(sandbox):
+    """A started sandbox that raises is a genuine transport fault: no wake, no spurious retry."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("transport blip")
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.status == "error" and res.error_name == "RuntimeError"
+    sandbox._client.start.assert_not_called()
+    assert created.process.code_run.call_count == 1
+
+
+def test_exec_no_retry_when_wake_fails(sandbox):
+    """If the stopped sandbox cannot be started, exec returns the error without retrying."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    sandbox._client.start.side_effect = RuntimeError("cannot start")
+    created.process.code_run.side_effect = RuntimeError("stopped")
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.status == "error"
+    assert created.process.code_run.call_count == 1
+
+
+def test_put_file_wakes_auto_stopped_sandbox_and_retries(sandbox):
+    """put_file wakes an auto-stopped sandbox and retries the upload once."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    created.fs.upload_file.side_effect = [RuntimeError("stopped"), None]
+    sandbox.put_file("conv-1", "data.csv", b"x")
+    sandbox._client.start.assert_called_once()
+    assert created.fs.upload_file.call_count == 2
+
+
+def test_ensure_started_returns_false_when_get_fails(sandbox):
+    """A failed refresh means we cannot wake, so no retry is attempted."""
+    sandbox.open("conv-1")
+    handle = sandbox._handles["conv-1"]
+    sandbox._client.get = mock.Mock(side_effect=KeyError("gone"))
+    assert sandbox._ensure_started(handle) is False
+
+
+# --- from __future__ imports survive the workspace prelude ---------------
+
+
+def test_with_workspace_cwd_hoists_future_import(sandbox):
+    """A leading ``from __future__`` import stays the first statement of the wrapped code."""
+    wrapped = sandbox._with_workspace_cwd("/ws", "from __future__ import annotations\nprint('hi')\n")
+    assert wrapped.startswith("from __future__ import annotations\n")
+    assert wrapped.index("from __future__") < wrapped.index("import os as _os")
+    assert "_os.chdir('/ws')" in wrapped
+    assert wrapped.rstrip().endswith("print('hi')")
+
+
+def test_with_workspace_cwd_no_future_import_is_prelude_prefix(sandbox):
+    """Without a future import the wrapper is just prelude + code, unchanged."""
+    wrapped = sandbox._with_workspace_cwd("/ws", "print('hi')\n")
+    assert wrapped.startswith("import os as _os\n")
+    assert wrapped.endswith("print('hi')\n")
+
+
+def test_split_leading_future_imports_multiple_with_comment():
+    from application.sandbox.daytona import DaytonaSandbox
+
+    code = "# header\nfrom __future__ import annotations\nfrom __future__ import division\nx = 1\n"
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports(code)
+    assert "from __future__ import annotations" in hoisted
+    assert "from __future__ import division" in hoisted
+    assert rest == "x = 1\n"
+
+
+def test_split_leading_future_imports_none():
+    from application.sandbox.daytona import DaytonaSandbox
+
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports("x = 1\n")
+    assert hoisted == "" and rest == "x = 1\n"
+
+
+def test_split_leading_future_imports_adds_trailing_newline():
+    from application.sandbox.daytona import DaytonaSandbox
+
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports("from __future__ import annotations")
+    assert hoisted.endswith("\n")  # ensures the prelude begins on its own line
+    assert rest == ""
+
+
 # --- Registry wiring -----------------------------------------------------
 
 

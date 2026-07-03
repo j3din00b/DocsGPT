@@ -18,6 +18,7 @@ from flask_restx import Namespace, Resource
 
 from application.api import api
 from application.api.user.artifacts.authz import (
+    _shared_row_for,
     authorize_artifact,
     authorize_artifact_write,
     resolve_principal,
@@ -26,6 +27,7 @@ from application.api.user.artifacts.authz import (
 from application.core.settings import settings
 from application.storage.db.base_repository import looks_like_uuid
 from application.storage.db.repositories.artifacts import ArtifactsRepository
+from application.storage.db.repositories.conversations import ConversationsRepository
 from application.storage.db.repositories.workflow_runs import WorkflowRunsRepository
 from application.storage.db.session import db_readonly, db_session
 from application.storage.storage_creator import StorageCreator
@@ -149,6 +151,25 @@ class ListArtifacts(Resource):
                             jsonify({"success": False, "message": "Forbidden"}), 403
                         )
                     rows = repo.list_artifacts(conversation_id=conversation_id)
+                    # Owner / shared_with collaborator sees every artifact; a
+                    # share-token caller is confined to the shared first_n_queries
+                    # snapshot (drop artifacts whose message is outside it or NULL).
+                    conv_repo = ConversationsRepository(conn)
+                    is_owner = bool(
+                        user_id and conv_repo.get(conversation_id, user_id) is not None
+                    )
+                    if not is_owner:
+                        shared = _shared_row_for(conn, conversation_id, share_token)
+                        first_n = int(shared.get("first_n_queries") or 0) if shared else 0
+                        snapshot_ids = conv_repo.first_n_message_ids(
+                            conversation_id, first_n
+                        )
+                        rows = [
+                            r
+                            for r in rows
+                            if r.get("message_id") is not None
+                            and str(r.get("message_id")) in snapshot_ids
+                        ]
                 elif workflow_run_id:
                     run = WorkflowRunsRepository(conn).get(workflow_run_id)
                     if run is None or run.get("user_id") != user_id:
