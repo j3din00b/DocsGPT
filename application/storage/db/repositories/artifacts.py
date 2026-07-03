@@ -184,20 +184,29 @@ class ArtifactsRepository:
         )
         return [_artifact_to_dict(r) for r in result.fetchall()]
 
-    def list_artifacts_for_agent(self, agent_id: str, user_id: str) -> list[dict]:
-        """List artifacts whose parent conversation belongs to ``agent_id`` (owner-scoped).
+    def list_artifacts_for_agent(
+        self, agent_id: str, user_id: str, conversation_id: Optional[str] = None
+    ) -> list[dict]:
+        """List an agent's artifacts (owner-scoped), optionally narrowed to one conversation.
 
         Scopes a per-agent api-key's artifact visibility to the conversations that
-        agent produced, so the key cannot enumerate the owner's whole corpus.
+        agent produced, so the key cannot enumerate the owner's whole corpus. When
+        ``conversation_id`` is given, the SQL narrows to that single conversation
+        (the per-visitor bearer capability for a public widget key).
         """
+        clauses = ["c.agent_id = CAST(:agent_id AS uuid)", "a.user_id = :user_id"]
+        params: dict[str, Any] = {"agent_id": str(agent_id), "user_id": user_id}
+        if conversation_id is not None:
+            clauses.append("a.conversation_id = CAST(:conversation_id AS uuid)")
+            params["conversation_id"] = conversation_id
         result = self._conn.execute(
             text(
                 "SELECT a.* FROM artifacts a "
                 "JOIN conversations c ON a.conversation_id = c.id "
-                "WHERE c.agent_id = CAST(:agent_id AS uuid) AND a.user_id = :user_id "
+                f"WHERE {' AND '.join(clauses)} "
                 "ORDER BY a.created_at DESC, a.id DESC"
             ),
-            {"agent_id": str(agent_id), "user_id": user_id},
+            params,
         )
         return [_artifact_to_dict(r) for r in result.fetchall()]
 

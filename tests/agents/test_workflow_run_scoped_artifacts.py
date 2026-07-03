@@ -97,6 +97,27 @@ def test_agent_node_run_scopes_tool_executor(monkeypatch):
     assert stub.tool_executor.conversation_id is None
 
 
+def test_agent_node_skips_run_scope_when_not_persisted(monkeypatch):
+    """An unpersisted run must NOT stamp workflow_run_id (it would orphan artifacts)."""
+    engine = _create_engine(workflow_run_id="22222222-2222-2222-2222-222222222222")
+    engine.run_persisted = False
+    node = _agent_node()
+    stub = _StubNodeAgent([{"answer": "done"}])
+
+    monkeypatch.setattr(
+        WorkflowNodeAgentFactory, "create", staticmethod(lambda **kwargs: stub)
+    )
+    monkeypatch.setattr(
+        "application.core.model_utils.get_api_key_for_provider", lambda _provider: None
+    )
+
+    list(engine._execute_agent_node(node))
+
+    # Left unset: the run-scoped tools then persist under a conversation parent or
+    # cleanly error, never orphaning an artifact under a nonexistent run row.
+    assert stub.tool_executor.workflow_run_id is None
+
+
 # ---------------------------------------------------------------------------
 # ToolExecutor stamping
 # ---------------------------------------------------------------------------

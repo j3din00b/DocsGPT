@@ -24,10 +24,11 @@ class Principal:
     A decoded JWT is a full *owner* session (``agent_id`` is ``None``). An
     ``api_key`` is a low-trust, publicly-distributed *agent* credential -- it is
     embedded client-side in the widget and accepted from the query string -- so
-    it resolves to the owning ``user_id`` but stays **agent-scoped**: it may only
-    reach artifacts from that agent's own conversations, never the owner's whole
-    corpus, and may not perform mutating operations. This mirrors the scoping the
-    MCP resource layer already enforces (see ``artifact_resource_service``).
+    it resolves to the owning ``user_id`` but stays **agent-scoped**: it may reach
+    an artifact only when the request also carries that artifact's parent
+    ``conversation_id`` (the unguessable per-visitor secret), confining it to a
+    single conversation rather than the agent's whole corpus, and may not perform
+    mutating operations.
     """
 
     user_id: Optional[str] = None
@@ -81,16 +82,22 @@ def user_can_access_conversation(
 def authorize_artifact(conn, artifact: dict, principal: Principal) -> bool:
     """Authorize a READ of ``artifact`` for ``principal``; missing parent fails closed.
 
-    A low-trust agent api_key is confined to its own agent's conversations (owner
-    match + agent scope) and never inherits share-link access. A JWT owner,
-    ``shared_with`` collaborator, or share-token holder is authorized by resolving
-    the artifact's parent (conversation or workflow run).
+    A low-trust agent api_key is confined to a single conversation it proves by
+    carrying that artifact's parent ``conversation_id`` query param (owner match +
+    matching conversation + agent scope) and never inherits share-link access. A
+    JWT owner, ``shared_with`` collaborator, or share-token holder is authorized by
+    resolving the artifact's parent (conversation or workflow run).
     """
     if principal.is_agent_scoped:
-        # An agent key is not the owner's session: require both that the artifact
-        # belongs to the owner AND that its parent conversation is this agent's,
-        # so a public widget key cannot enumerate the owner's whole corpus.
+        # An agent key is not the owner's session and is embedded in public widget
+        # JS, so require the artifact to belong to the owner AND the request to
+        # carry the parent conversation_id (the unguessable per-visitor secret):
+        # the key alone, without that id, cannot download a known artifact.
         if str(artifact.get("user_id")) != str(principal.user_id):
+            return False
+        req_conv = request.args.get("conversation_id")
+        parent = artifact.get("conversation_id")
+        if not req_conv or parent is None or str(parent) != str(req_conv):
             return False
         return ArtifactsRepository(conn).artifact_in_agent_scope(
             str(artifact.get("id")), str(principal.agent_id)

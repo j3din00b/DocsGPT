@@ -8,7 +8,9 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from application.storage.db.repositories.agents import AgentsRepository
 from application.storage.db.repositories.artifacts import ArtifactsRepository
+from application.storage.db.repositories.conversations import ConversationsRepository
 
 
 def _repo(conn) -> ArtifactsRepository:
@@ -222,6 +224,57 @@ class TestListArtifacts:
         repo = _repo(pg_conn)
         with pytest.raises(ValueError):
             repo.list_artifacts()
+
+
+class TestListArtifactsForAgent:
+    """Agent-scoped listing + optional conversation_id narrowing (public widget key path)."""
+
+    @staticmethod
+    def _agent_with_conv(pg_conn, user_id: str, key: str):
+        agent = AgentsRepository(pg_conn).create(user_id, "widget", "active", key=key)
+        agent_id = str(agent["id"])
+        conv = ConversationsRepository(pg_conn).create(user_id, name="c", agent_id=agent_id)
+        return agent_id, str(conv["id"])
+
+    def test_two_arg_returns_all_agent_artifacts(self, pg_conn):
+        # Back-compat: the 2-arg call (used by the MCP resource layer) still sees
+        # every artifact across the agent's conversations.
+        repo = _repo(pg_conn)
+        agent_id, conv_a = self._agent_with_conv(pg_conn, "owner-a", "k-a")
+        conv_b = str(
+            ConversationsRepository(pg_conn).create("owner-a", name="c2", agent_id=agent_id)["id"]
+        )
+        repo.create_artifact("owner-a", "document", conversation_id=conv_a)
+        repo.create_artifact("owner-a", "document", conversation_id=conv_b)
+        # A conversation not owned by this agent is excluded by the JOIN.
+        stray = str(ConversationsRepository(pg_conn).create("owner-a", name="c3")["id"])
+        repo.create_artifact("owner-a", "document", conversation_id=stray)
+
+        rows = repo.list_artifacts_for_agent(agent_id, "owner-a")
+        assert len(rows) == 2
+
+    def test_conversation_id_narrows_to_single_conversation(self, pg_conn):
+        repo = _repo(pg_conn)
+        agent_id, conv_a = self._agent_with_conv(pg_conn, "owner-b", "k-b")
+        conv_b = str(
+            ConversationsRepository(pg_conn).create("owner-b", name="c2", agent_id=agent_id)["id"]
+        )
+        a1 = repo.create_artifact("owner-b", "document", conversation_id=conv_a)
+        repo.create_artifact("owner-b", "document", conversation_id=conv_b)
+
+        rows = repo.list_artifacts_for_agent(agent_id, "owner-b", conversation_id=conv_a)
+        assert [r["id"] for r in rows] == [a1["id"]]
+
+    def test_foreign_conversation_id_yields_empty(self, pg_conn):
+        # A conversation_id that is not this agent's leaks nothing (JOIN filters it).
+        repo = _repo(pg_conn)
+        agent_id, conv_a = self._agent_with_conv(pg_conn, "owner-c", "k-c")
+        repo.create_artifact("owner-c", "document", conversation_id=conv_a)
+        other_agent_id, other_conv = self._agent_with_conv(pg_conn, "owner-c", "k-c2")
+        repo.create_artifact("owner-c", "document", conversation_id=other_conv)
+
+        rows = repo.list_artifacts_for_agent(agent_id, "owner-c", conversation_id=other_conv)
+        assert rows == []
 
 
 class TestQuotaAccounting:

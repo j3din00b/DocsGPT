@@ -82,6 +82,7 @@ def _agent(workflow_id, attachments, owner: str = OWNER) -> WorkflowAgent:
     agent._workflow_data = None
     agent._engine = None
     agent._run_persisted = False
+    agent._bridge_error = None
     return agent
 
 
@@ -354,6 +355,99 @@ def test_no_attachments_run_still_works(pg_engine, tmp_path, monkeypatch):
         ).scalar()
     assert run is not None
     assert n == 0
+
+
+def test_quota_exceeded_fails_run_and_does_not_execute(pg_engine, tmp_path, monkeypatch):
+    """Over quota: the bridge raises, an error is surfaced, the run is finalized FAILED,
+    and the engine never executes with silently-missing documents."""
+    storage = _wire(pg_engine, tmp_path, monkeypatch)
+    wf_id = _make_workflow(pg_engine)
+    attachments = [_stage_attachment(storage, b"doc", "d.txt", "text/plain")]
+    agent = _agent(wf_id, attachments)
+    _patch_engine(monkeypatch)
+
+    from application.sandbox.artifacts_capture import QuotaExceeded
+
+    def _raise_quota(**kwargs):
+        raise QuotaExceeded("artifact storage quota reached")
+
+    monkeypatch.setattr(
+        "application.sandbox.artifacts_capture.persist_new_artifact", _raise_quota
+    )
+
+    events = list(agent._gen_inner("summarize", log_context=None))
+    engine = _RecordingEngine.instances[-1]
+
+    # A fatal error was surfaced on the stream.
+    errors = [e for e in events if e.get("type") == "error"]
+    assert errors and "quota" in errors[0]["error"].lower()
+    # The engine never executed (execute was not reached -> no captured inputs).
+    assert engine.captured_inputs is None
+    # The pre-created RUNNING row was finalized FAILED (not left dangling), and no
+    # artifact rows were persisted for the run.
+    with pg_engine.connect() as conn:
+        run = WorkflowRunsRepository(conn).get(engine.workflow_run_id)
+        n = conn.execute(
+            text("SELECT count(*) FROM artifacts WHERE workflow_run_id = CAST(:r AS uuid)"),
+            {"r": engine.workflow_run_id},
+        ).scalar()
+    assert run is not None
+    assert run["status"] == "failed"
+    assert n == 0
+
+
+def test_oversize_declared_attachment_skipped_with_notice(pg_engine, tmp_path, monkeypatch):
+    """A declared-oversize attachment is dropped with a surfaced notice; the run still proceeds."""
+    from application.core.settings import settings
+
+    storage = _wire(pg_engine, tmp_path, monkeypatch)
+    wf_id = _make_workflow(pg_engine)
+    att = _stage_attachment(storage, b"tiny", "big.txt", "text/plain")
+    att["size"] = int(settings.ARTIFACT_MAX_BYTES) + 1  # declared past the per-file cap
+    agent = _agent(wf_id, [att])
+    _patch_engine(monkeypatch)
+
+    events = list(agent._gen_inner("summarize", log_context=None))
+    engine = _RecordingEngine.instances[-1]
+
+    # The oversize doc was dropped -> no input documents bridged, but the run ran.
+    assert engine.captured_inputs is not None
+    assert engine.captured_inputs["input_documents"] == []
+    # A non-fatal notice naming the dropped document was surfaced.
+    errors = [e for e in events if e.get("type") == "error"]
+    assert errors and "big.txt" in errors[0]["error"]
+    # Nothing was persisted for the oversize doc.
+    with pg_engine.connect() as conn:
+        n = conn.execute(
+            text("SELECT count(*) FROM artifacts WHERE workflow_run_id = CAST(:r AS uuid)"),
+            {"r": engine.workflow_run_id},
+        ).scalar()
+    assert n == 0
+
+
+def test_read_attachment_bytes_closes_handle_on_bounded_read():
+    """The bounded read pulls at most max_bytes+1 and always closes the storage handle."""
+
+    class _Handle:
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+            self.closed = False
+
+        def read(self, n: int = -1) -> bytes:
+            return self._data if n is None or n < 0 else self._data[:n]
+
+        def close(self) -> None:
+            self.closed = True
+
+    handle = _Handle(b"x" * 100)
+
+    class _Storage:
+        def get_file(self, _path):
+            return handle
+
+    data = WorkflowAgent._read_attachment_bytes(_Storage(), "p", max_bytes=10)
+    assert data == b"x" * 11  # bounded to max_bytes + 1 (backstops a lying size)
+    assert handle.closed is True  # handle is never left open
 
 
 def test_extract_parse_opts_out_of_sync_subtask_guard(monkeypatch):

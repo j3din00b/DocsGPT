@@ -21,6 +21,7 @@ def _make_agent(*, workflow_id=None, workflow=None, workflow_owner=None,
     agent._workflow_data = workflow
     agent._engine = None
     agent._run_persisted = False
+    agent._bridge_error = None
     agent.decoded_token = decoded_token or {}
     return agent
 

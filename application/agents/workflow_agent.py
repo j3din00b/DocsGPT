@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from application.agents.base import BaseAgent
 from application.agents.workflows.schemas import (
@@ -12,7 +12,9 @@ from application.agents.workflows.schemas import (
     WorkflowRun,
 )
 from application.agents.workflows.workflow_engine import WorkflowEngine
+from application.core.settings import settings
 from application.logging import log_activity, LogContext
+from application.sandbox.artifacts_capture import QuotaExceeded
 from application.storage.db.base_repository import looks_like_uuid
 from application.storage.db.repositories.workflow_edges import WorkflowEdgesRepository
 from application.storage.db.repositories.workflow_nodes import WorkflowNodesRepository
@@ -44,6 +46,9 @@ class WorkflowAgent(BaseAgent):
         self._workflow_data = workflow
         self._engine: Optional[WorkflowEngine] = None
         self._run_persisted = False
+        # Set to a message when the input-document bridge fails fatally (quota), so
+        # the run is finalized FAILED instead of running with missing documents.
+        self._bridge_error: Optional[str] = None
 
     @log_activity()
     def gen(
@@ -73,10 +78,33 @@ class WorkflowAgent(BaseAgent):
         )
         self._run_persisted = pg_workflow_id is not None
 
-        input_documents = self._bridge_attachments(
-            run_user_id, persisted=self._run_persisted
-        )
+        try:
+            input_documents, dropped = self._bridge_attachments(
+                run_user_id, persisted=self._run_persisted
+            )
+        except QuotaExceeded as exc:
+            # The run's input documents exceed the uploader's artifact quota. Surface
+            # a clean error and finalize the pre-created RUNNING row as FAILED rather
+            # than executing nodes with silently-missing documents.
+            self._bridge_error = str(exc)
+            yield {
+                "type": "error",
+                "error": (
+                    "This run's input documents exceed your artifact storage quota. "
+                    "Delete some artifacts and try again."
+                ),
+            }
+            self._finalize_workflow_run(
+                workflow_owner_id, run_user_id, pg_workflow_id, query
+            )
+            return
 
+        # Non-fatal: some attachments were dropped (oversize / unreadable). Tell the
+        # user which, then still run with the documents that did bridge.
+        if dropped:
+            yield {"type": "error", "error": " ".join(dropped)}
+
+        self._engine.run_persisted = self._run_persisted
         yield from self._engine.execute({"input_documents": input_documents}, query)
         self._finalize_workflow_run(
             workflow_owner_id, run_user_id, pg_workflow_id, query
@@ -270,66 +298,77 @@ class WorkflowAgent(BaseAgent):
 
     def _bridge_attachments(
         self, run_user_id: Optional[str], *, persisted: bool
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
         """Stage uploaded attachments as run-scoped artifacts the nodes can read.
 
-        Bytes are read server-side from each attachment's ``upload_path`` and
-        re-persisted through ``persist_new_artifact`` (size/sha256/storage key all
-        derived server-side); only the resulting references enter the run state.
-        Artifacts are owned by the *runner* (the uploader), not the workflow owner.
+        Bytes are read server-side from each attachment's ``upload_path`` (bounded
+        by ``ARTIFACT_MAX_BYTES``, handle always closed) and re-persisted through
+        ``persist_new_artifact`` (size/sha256/storage key all derived server-side);
+        only the resulting references enter the run state. Artifacts are owned by
+        the *runner* (the uploader), not the workflow owner.
+
+        Returns the bridged references and a list of user-facing notices for
+        attachments that were dropped (oversize / unreadable / unstorable).
+        ``QuotaExceeded`` is NOT swallowed: it propagates to the caller so the run
+        fails cleanly instead of running with silently-missing documents.
         """
         if not self._engine or not self.attachments or not run_user_id:
-            return []
+            return [], []
         # Without a persisted run row the artifacts would be orphaned (no authz
         # parent), so skip the bridge for unowned/draft ids.
         if not persisted:
-            return []
+            return [], []
         from application.sandbox.artifacts_capture import persist_new_artifact
         from application.storage.storage_creator import StorageCreator
 
         storage = StorageCreator.get_storage()
+        max_bytes = int(getattr(settings, "ARTIFACT_MAX_BYTES", 0) or 0)
+        dropped: List[str] = []
         if len(self.attachments) > _MAX_INPUT_DOCUMENTS:
-            dropped = len(self.attachments) - _MAX_INPUT_DOCUMENTS
+            over = len(self.attachments) - _MAX_INPUT_DOCUMENTS
             logger.warning(
                 "Workflow run input documents exceed cap (%d); dropping %d attachment(s)",
                 _MAX_INPUT_DOCUMENTS,
-                dropped,
+                over,
+            )
+            dropped.append(
+                f"Only the first {_MAX_INPUT_DOCUMENTS} input document(s) were used; "
+                f"{over} additional attachment(s) were dropped."
             )
         refs: List[Dict[str, Any]] = []
-        for index, attachment in enumerate(self.attachments[:_MAX_INPUT_DOCUMENTS]):
+        for attachment in self.attachments[:_MAX_INPUT_DOCUMENTS]:
             upload_path = attachment.get("upload_path") or attachment.get("path")
             if not upload_path:
                 continue
             filename = attachment.get("filename") or "attachment"
             mime_type = attachment.get("mime_type") or "application/octet-stream"
-            attachment_id = attachment.get("id", index)
-            try:
-                data = storage.get_file(upload_path).read()
-            except Exception as exc:
-                logger.error(
-                    "Failed to read attachment %s for workflow run: %s",
-                    attachment_id,
-                    type(exc).__name__,
-                )
+            # Reject oversize attachments via the authoritative ``size`` column
+            # BEFORE buffering the bytes into worker memory (a memory-DoS guard);
+            # the bounded read below backstops a missing/lying ``size``.
+            declared_size = attachment.get("size")
+            if max_bytes and isinstance(declared_size, (int, float)) and declared_size > max_bytes:
+                dropped.append(f'Document "{filename}" exceeds the artifact size limit and was skipped.')
                 continue
-            try:
-                ref = persist_new_artifact(
-                    user_id=run_user_id,
-                    kind="file",
-                    data=data,
-                    filename=filename,
-                    mime_type=mime_type,
-                    title=filename,
-                    workflow_run_id=self._engine.workflow_run_id,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Failed to persist attachment %s artifact: %s",
-                    attachment_id,
-                    type(exc).__name__,
-                )
+            data = self._read_attachment_bytes(storage, upload_path, max_bytes)
+            if data is None:
+                dropped.append(f'Document "{filename}" could not be read and was skipped.')
                 continue
+            if max_bytes and len(data) > max_bytes:
+                dropped.append(f'Document "{filename}" exceeds the artifact size limit and was skipped.')
+                continue
+            # QuotaExceeded propagates (fatal); persist_new_artifact returns None on
+            # any other error, which we report as a per-attachment drop.
+            ref = persist_new_artifact(
+                user_id=run_user_id,
+                kind="file",
+                data=data,
+                filename=filename,
+                mime_type=mime_type,
+                title=filename,
+                workflow_run_id=self._engine.workflow_run_id,
+            )
             if ref is None:
+                dropped.append(f'Document "{filename}" could not be stored and was skipped.')
                 continue
             refs.append(
                 {
@@ -339,7 +378,25 @@ class WorkflowAgent(BaseAgent):
                     "mime_type": ref["mime_type"],
                 }
             )
-        return refs
+        return refs, dropped
+
+    @staticmethod
+    def _read_attachment_bytes(storage: Any, upload_path: str, max_bytes: int) -> Optional[bytes]:
+        """Read an attachment with a bounded read and a guaranteed handle close; None on failure."""
+        try:
+            file_obj = storage.get_file(upload_path)
+        except Exception as exc:
+            logger.error("Failed to open attachment for workflow run: %s", type(exc).__name__)
+            return None
+        try:
+            return file_obj.read(max_bytes + 1) if max_bytes else file_obj.read()
+        except Exception as exc:
+            logger.error("Failed to read attachment for workflow run: %s", type(exc).__name__)
+            return None
+        finally:
+            close = getattr(file_obj, "close", None)
+            if callable(close):
+                close()
 
     def _finalize_workflow_run(
         self,
@@ -410,6 +467,10 @@ class WorkflowAgent(BaseAgent):
             logger.error(f"Failed to save workflow run: {e}")
 
     def _determine_run_status(self) -> ExecutionStatus:
+        # A fatal input-document bridge failure (quota) means the engine never ran;
+        # the run is FAILED even though there is no per-node failure log entry.
+        if self._bridge_error is not None:
+            return ExecutionStatus.FAILED
         if not self._engine or not self._engine.execution_log:
             return ExecutionStatus.COMPLETED
         for log in self._engine.execution_log:

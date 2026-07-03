@@ -69,6 +69,10 @@ class WorkflowEngine:
         # artifact's parent; mint one when the caller has not supplied a
         # pre-created ``workflow_runs`` id so the engine is self-contained.
         self.workflow_run_id: str = workflow_run_id or str(uuid.uuid4())
+        # False when no ``workflow_runs`` row backs ``workflow_run_id`` (unsaved /
+        # embedded draft), so run-scoped artifacts must NOT be persisted as orphans.
+        # Defaults True; WorkflowAgent flips it off on the draft path.
+        self.run_persisted: bool = True
         self.state: WorkflowState = {}
         self.execution_log: List[Dict[str, Any]] = []
         self._condition_result: Optional[str] = None
@@ -299,8 +303,11 @@ class WorkflowEngine:
         node_agent = WorkflowNodeAgentFactory.create(**factory_kwargs)
         # Run-scope the node agent's tools so artifact_generator / code_executor
         # address artifacts by this workflow run: a short ref (A1) created by one
-        # node resolves for edit_artifact in a later node within the same run.
-        if getattr(node_agent, "tool_executor", None) is not None:
+        # node resolves for edit_artifact in a later node within the same run. Only
+        # when a workflow_runs row backs the run -- otherwise an artifact parented
+        # to this run id would be an orphan (403 on get/download); left unset, the
+        # run-scoped tools persist under a conversation parent or cleanly error.
+        if self.run_persisted and getattr(node_agent, "tool_executor", None) is not None:
             node_agent.tool_executor.workflow_run_id = self.workflow_run_id
 
         # Decide native-eligibility from the SAME supported-types list the provider
@@ -396,14 +403,21 @@ class WorkflowEngine:
             manager.put_file(session_id, "state.json", state_json)
             pre_signatures = snapshot_signatures(manager, session_id)
             result = manager.exec(session_id, code, timeout=timeout)
-            artifacts = capture_artifacts(
-                manager,
-                session_id,
-                pre_signatures,
-                user_id=user_id,
-                workflow_run_id=self.workflow_run_id,
-                produced_by={"node_id": node.id, "node_type": NodeType.CODE.value},
-            )
+            if self.run_persisted:
+                artifacts = capture_artifacts(
+                    manager,
+                    session_id,
+                    pre_signatures,
+                    user_id=user_id,
+                    workflow_run_id=self.workflow_run_id,
+                    produced_by={"node_id": node.id, "node_type": NodeType.CODE.value},
+                )
+            else:
+                # No workflow_runs row backs this run (unsaved/embedded draft): an
+                # artifact parented to this run id would be an unreachable orphan
+                # (403 on get/download). Skip persistence; the sandbox still ran and
+                # ``_build_code_output`` handles the empty-artifacts case.
+                artifacts = []
         finally:
             try:
                 manager.close(session_id)

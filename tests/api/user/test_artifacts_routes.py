@@ -677,9 +677,30 @@ class TestMalformedArtifactId:
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
 class TestApiKeyPrincipal:
-    def test_api_key_reads_artifact_in_its_agent_scope(
+    def test_api_key_reads_artifact_with_matching_conversation_id(
         self, _patch_db, flask_app, monkeypatch
     ):
+        # The public widget key reads an artifact ONLY when the request also
+        # carries the parent conversation_id (the per-visitor bearer capability).
+        from application.api.user.artifacts.routes import GetArtifact
+
+        agent = _make_agent(_patch_db)
+        conv = _make_agent_conversation(_patch_db, agent["id"])
+        art = _make_artifact(_patch_db, conversation_id=str(conv["id"]))
+        _wire_api_key(monkeypatch, _patch_db)
+
+        resp = _call(
+            flask_app, GetArtifact, art["id"], token=None,
+            query={"api_key": "secret-key", "conversation_id": str(conv["id"])},
+        )
+        assert resp.status_code == 200
+        assert resp.json["artifact"]["id"] == str(art["id"])
+
+    def test_api_key_get_without_conversation_id_denied(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        # Regression (critical IDOR): the public widget key alone -- without the
+        # unguessable per-visitor conversation_id -- cannot fetch a known artifact.
         from application.api.user.artifacts.routes import GetArtifact
 
         agent = _make_agent(_patch_db)
@@ -691,15 +712,15 @@ class TestApiKeyPrincipal:
             flask_app, GetArtifact, art["id"], token=None,
             query={"api_key": "secret-key"},
         )
-        assert resp.status_code == 200
-        assert resp.json["artifact"]["id"] == str(art["id"])
+        assert resp.status_code == 403
 
     def test_api_key_cannot_read_owner_artifact_outside_agent_scope(
         self, _patch_db, flask_app, monkeypatch
     ):
         # Regression (critical IDOR): a public widget key resolves to the owner
         # but must NOT reach an artifact from the owner's OTHER (non-agent)
-        # conversation -- it is confined to its own agent's conversations.
+        # conversation -- even when it supplies that conversation_id, the agent
+        # scope gate still blocks it.
         from application.api.user.artifacts.routes import GetArtifact
 
         _make_agent(_patch_db)  # the widget agent (key=secret-key)
@@ -709,31 +730,106 @@ class TestApiKeyPrincipal:
 
         resp = _call(
             flask_app, GetArtifact, art["id"], token=None,
-            query={"api_key": "secret-key"},
+            query={"api_key": "secret-key", "conversation_id": str(other_conv["id"])},
         )
         assert resp.status_code == 403
 
-    def test_api_key_list_is_scoped_to_agent_not_whole_corpus(
+    def test_api_key_download_requires_conversation_id(
         self, _patch_db, flask_app, monkeypatch
     ):
-        # Regression (critical IDOR): the no-filter list must return only the
-        # agent's own conversations' artifacts, never the owner's whole corpus.
+        # Download follows the same bearer-capability rule as get: the key alone is
+        # denied; the key + matching conversation_id is served.
+        from application.api.user.artifacts.routes import DownloadArtifact
+
+        agent = _make_agent(_patch_db)
+        conv = _make_agent_conversation(_patch_db, agent["id"])
+        art = _make_artifact(
+            _patch_db, conversation_id=str(conv["id"]),
+            filename="f.bin", storage_path="inputs/owner/artifacts/x/v1/f.bin",
+        )
+        _wire_api_key(monkeypatch, _patch_db)
+        storage = _FakeStorage(b"BYTES")
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.StorageCreator.get_storage",
+            lambda: storage,
+        )
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.settings.URL_STRATEGY",
+            "backend", raising=False,
+        )
+
+        denied = _call(
+            flask_app, DownloadArtifact, art["id"], token=None,
+            query={"api_key": "secret-key"},
+        )
+        assert denied.status_code == 403
+
+        ok = _call(
+            flask_app, DownloadArtifact, art["id"], token=None,
+            query={"api_key": "secret-key", "conversation_id": str(conv["id"])},
+        )
+        assert ok.status_code == 200
+        assert ok.data == b"BYTES"
+
+    def test_api_key_list_without_conversation_id_forbidden(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        # Regression (critical IDOR): the public widget key cannot enumerate the
+        # agent's artifacts -- a list with no conversation_id is refused outright.
         from application.api.user.artifacts.routes import ListArtifacts
 
         agent = _make_agent(_patch_db)
-        agent_conv = _make_agent_conversation(_patch_db, agent["id"])
-        in_scope = _make_artifact(_patch_db, conversation_id=str(agent_conv["id"]))
-        other_conv = _make_conversation(_patch_db, user_id=OWNER)
-        out_of_scope = _make_artifact(_patch_db, conversation_id=str(other_conv["id"]))
+        conv = _make_agent_conversation(_patch_db, agent["id"])
+        _make_artifact(_patch_db, conversation_id=str(conv["id"]))
+        _wire_api_key(monkeypatch, _patch_db)
+
+        resp = _call(flask_app, ListArtifacts, token=None, query={"api_key": "secret-key"})
+        assert resp.status_code == 403
+
+    def test_api_key_list_with_conversation_id_scoped_to_it(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        # With the per-visitor conversation_id the list returns only that
+        # conversation's artifacts -- not the agent's other conversations.
+        from application.api.user.artifacts.routes import ListArtifacts
+
+        agent = _make_agent(_patch_db)
+        conv_a = _make_agent_conversation(_patch_db, agent["id"])
+        conv_b = _make_agent_conversation(_patch_db, agent["id"])
+        in_scope = _make_artifact(_patch_db, conversation_id=str(conv_a["id"]))
+        other = _make_artifact(_patch_db, conversation_id=str(conv_b["id"]))
         _wire_api_key(monkeypatch, _patch_db)
 
         resp = _call(
-            flask_app, ListArtifacts, token=None, query={"api_key": "secret-key"},
+            flask_app, ListArtifacts, token=None,
+            query={"api_key": "secret-key", "conversation_id": str(conv_a["id"])},
         )
         assert resp.status_code == 200
         ids = {a["id"] for a in resp.json["artifacts"]}
         assert str(in_scope["id"]) in ids
-        assert str(out_of_scope["id"]) not in ids
+        assert str(other["id"]) not in ids
+
+    def test_api_key_list_foreign_conversation_id_returns_empty(
+        self, _patch_db, flask_app, monkeypatch
+    ):
+        # A conversation_id belonging to a DIFFERENT agent leaks nothing: the JOIN
+        # filters it out, yielding an empty 200 rather than a cross-visitor leak.
+        from application.api.user.artifacts.routes import ListArtifacts
+
+        agent = _make_agent(_patch_db)
+        agent_conv = _make_agent_conversation(_patch_db, agent["id"])
+        _make_artifact(_patch_db, conversation_id=str(agent_conv["id"]))
+        other_agent = _make_agent(_patch_db, user_id=OWNER, key="other-key")
+        other_conv = _make_agent_conversation(_patch_db, other_agent["id"])
+        _make_artifact(_patch_db, conversation_id=str(other_conv["id"]))
+        _wire_api_key(monkeypatch, _patch_db)
+
+        resp = _call(
+            flask_app, ListArtifacts, token=None,
+            query={"api_key": "secret-key", "conversation_id": str(other_conv["id"])},
+        )
+        assert resp.status_code == 200
+        assert resp.json["artifacts"] == []
 
     def test_api_key_cannot_delete_even_in_scope(
         self, _patch_db, flask_app, monkeypatch

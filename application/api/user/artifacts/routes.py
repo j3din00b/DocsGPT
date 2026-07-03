@@ -124,21 +124,23 @@ class ListArtifacts(Resource):
             with db_readonly() as conn:
                 repo = ArtifactsRepository(conn)
                 if principal.is_agent_scoped:
-                    # A low-trust agent api_key only ever sees its OWN agent's
-                    # artifacts (never the owner's whole corpus): scope to the
-                    # agent, then optionally narrow to the requested conversation.
-                    # Workflow runs are not agent-scoped, so reject that filter.
+                    # A low-trust agent api_key is embedded in public widget JS and
+                    # shared by every anonymous visitor, so it may NOT enumerate the
+                    # agent's artifacts. The unguessable conversation_id (UUIDv4) is
+                    # the only per-visitor secret: require it as a bearer capability
+                    # and scope the query to it. Workflow runs are not agent-scoped,
+                    # so reject that filter.
                     if workflow_run_id:
                         return make_response(
                             jsonify({"success": False, "message": "Forbidden"}), 403
                         )
-                    rows = repo.list_artifacts_for_agent(principal.agent_id, user_id)
-                    if conversation_id:
-                        rows = [
-                            r
-                            for r in rows
-                            if str(r.get("conversation_id")) == str(conversation_id)
-                        ]
+                    if not conversation_id:
+                        return make_response(
+                            jsonify({"success": False, "message": "Forbidden"}), 403
+                        )
+                    rows = repo.list_artifacts_for_agent(
+                        principal.agent_id, user_id, conversation_id=conversation_id
+                    )
                 elif conversation_id:
                     if not user_can_access_conversation(
                         conn, conversation_id, user_id, share_token

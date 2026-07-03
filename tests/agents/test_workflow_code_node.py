@@ -90,7 +90,12 @@ class _FakeManager:
 @pytest.fixture()
 def patch_sandbox(monkeypatch):
     """Patch the sandbox manager + capture helper; return knobs to drive them."""
-    state = {"result": _Result(ok=True, stdout="ok"), "captured": [], "snapshot_calls": 0}
+    state = {
+        "result": _Result(ok=True, stdout="ok"),
+        "captured": [],
+        "snapshot_calls": 0,
+        "capture_calls": 0,
+    }
 
     manager_holder = {}
 
@@ -98,6 +103,10 @@ def patch_sandbox(monkeypatch):
         manager = _FakeManager(state["result"])
         manager_holder["manager"] = manager
         return manager
+
+    def _capture(*a, **k):
+        state["capture_calls"] += 1
+        return list(state["captured"])
 
     monkeypatch.setattr(
         "application.sandbox.sandbox_creator.SandboxCreator.get_manager", _get_manager
@@ -107,8 +116,7 @@ def patch_sandbox(monkeypatch):
         lambda *a, **k: state.__setitem__("snapshot_calls", state["snapshot_calls"] + 1) or {},
     )
     monkeypatch.setattr(
-        "application.sandbox.artifacts_capture.capture_artifacts",
-        lambda *a, **k: list(state["captured"]),
+        "application.sandbox.artifacts_capture.capture_artifacts", _capture
     )
     state["manager_holder"] = manager_holder
     return state
@@ -146,6 +154,40 @@ def test_code_node_no_artifacts_still_writes_status(patch_sandbox):
     list(engine._execute_code_node(node))
 
     assert engine.state["out"] == {"artifacts": [], "status": "ok"}
+
+
+def test_code_node_captures_when_run_persisted(patch_sandbox):
+    # The default persisted run captures produced files into artifacts.
+    engine = _engine()  # run_persisted defaults True
+    patch_sandbox["captured"] = []
+    node = _code_node(output_variable="out", code="print('x')")
+
+    list(engine._execute_code_node(node))
+
+    assert patch_sandbox["capture_calls"] == 1
+
+
+def test_code_node_skips_capture_when_run_not_persisted(patch_sandbox):
+    # An unsaved/draft run has no workflow_runs row, so capturing would create
+    # orphan artifacts (403 on get/download): capture is skipped entirely and the
+    # node emits the empty-artifacts shape. The sandbox still ran.
+    engine = _engine()
+    engine.run_persisted = False
+    ref = {
+        "artifact_id": "art-1", "version": 1, "filename": "r.pdf",
+        "mime_type": "application/pdf", "size": 3,
+    }
+    patch_sandbox["captured"] = [ref]
+    node = _code_node(output_variable="out", code="open('r.pdf','wb').write(b'x')")
+
+    list(engine._execute_code_node(node))
+
+    assert patch_sandbox["capture_calls"] == 0
+    assert engine.state["out"] == {"artifacts": [], "status": "ok"}
+    # The sandbox session still opened and closed (only persistence was skipped).
+    manager = patch_sandbox["manager_holder"]["manager"]
+    assert manager.opened == ["11111111-1111-1111-1111-111111111111"]
+    assert manager.closed == ["11111111-1111-1111-1111-111111111111"]
 
 
 def test_code_node_reads_prior_state_from_state_json(patch_sandbox):

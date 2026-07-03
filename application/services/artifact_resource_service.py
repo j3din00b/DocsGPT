@@ -133,6 +133,11 @@ def list_artifact_resources(api_key: Optional[str]) -> List[Resource]:
         return []
     try:
         with db_readonly() as conn:
+            # Known residual enumeration gap (tracked separately): unlike the HTTP
+            # artifact list route, MCP-over-key has no per-visitor conversation
+            # context, so this lists every artifact across the agent's
+            # conversations. Whether MCP-over-key should enumerate at all is a
+            # separate product decision; do not "fix" it by neutering the feature.
             rows = ArtifactsRepository(conn).list_artifacts_for_agent(
                 str(agent["id"]), str(agent["user_id"])
             )
