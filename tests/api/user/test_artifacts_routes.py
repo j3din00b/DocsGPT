@@ -580,6 +580,36 @@ class TestDownloadArtifact:
         assert resp.status_code == 302
         assert resp.headers["Location"].startswith("https://signed.example/")
 
+    def test_s3_strategy_disposition_url_returns_json(
+        self, _patch_db, flask_app, token_owner, monkeypatch
+    ):
+        # ?disposition=url opts into a JSON envelope (for a top-level browser
+        # navigation) instead of the CORS-blocked cross-origin 302.
+        from application.api.user.artifacts.routes import DownloadArtifact
+
+        art = self._seed(_patch_db)
+        storage = _FakeStorage(b"unused")
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.StorageCreator.get_storage",
+            lambda: storage,
+        )
+        monkeypatch.setattr(
+            "application.api.user.artifacts.routes.settings.URL_STRATEGY",
+            "s3",
+            raising=False,
+        )
+
+        resp = _call(
+            flask_app,
+            DownloadArtifact,
+            art["id"],
+            token=token_owner,
+            query={"disposition": "url"},
+        )
+        assert resp.status_code == 200
+        assert resp.json["success"] is True
+        assert resp.json["url"].startswith("https://signed.example/")
+
     def test_stranger_denied(self, _patch_db, flask_app, monkeypatch):
         from application.api.user.artifacts.routes import DownloadArtifact
 

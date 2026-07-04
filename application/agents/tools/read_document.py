@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from celery import current_task
+
 from application.agents.tools.artifact_ref import resolve_artifact_id
 from application.agents.tools.attachment_bridge import (
     AttachmentBridgeError,
@@ -188,31 +190,44 @@ class ReadDocumentTool(Tool):
         return result
 
     def _dispatch(self, artifact_id: str, options: Dict[str, Any]) -> Dict[str, Any]:
-        """Enqueue ``parse_document`` on the dedicated parsing queue and await with a timeout.
+        """Parse INLINE inside a Celery worker, else dispatch to the parsing queue and await.
 
-        Deadlock note: this tool may run in the WEB process (/stream) OR inside a
-        Celery worker (headless/scheduled agents). Routing to the dedicated
-        ``parsing`` queue + separate parsing workers avoids worker-self-deadlock;
-        the await degrades (returns an error) on timeout/failure rather than hanging.
+        This tool runs in the WEB process (/stream) OR inside a Celery worker
+        (headless/scheduled/workflow agents). When it already runs inside a worker that also
+        serves the ``parsing`` queue (the shipped default ``-Q docsgpt,parsing``), dispatching
+        and blocking on ``get()`` would self-deadlock: concurrent agent tasks each hold a pool
+        slot blocked in ``get()`` so ``parse_document`` never gets a free slot. So parse INLINE
+        in-process inside a worker; only dispatch+await (degrading on timeout/failure) from web.
         """
+        parent = self._parent()
+
+        # ``current_task`` is a Celery proxy: truthy only while this runs inside a worker task,
+        # falsy in the web process (the bare proxy is NOT identity-None, so test truthiness).
+        if current_task:
+            from application.worker import run_parse_document
+
+            try:
+                result = run_parse_document(artifact_id, parent, self.user_id, options)
+            except Exception as exc:
+                logger.exception("read_document: inline parse failed")
+                return {"status": "error", "error": f"document parsing failed: {type(exc).__name__}: {exc}"}
+            if not isinstance(result, dict):
+                return {"status": "error", "error": "document parsing produced an unexpected result."}
+            return result
+
         from celery.exceptions import TimeoutError as CeleryTimeoutError
 
         from application.api.user.tasks import parse_document
 
-        parent = self._parent()
         timeout = float(getattr(settings, "DOCUMENT_PARSE_TIMEOUT", 120))
         queue = getattr(settings, "DOCUMENT_PARSE_QUEUE", "parsing")
         try:
             async_result = parse_document.apply_async(
                 args=[artifact_id, parent, self.user_id, options], queue=queue
             )
-            # ``read_document`` runs both from the web request path AND from inside a
-            # Celery task (headless/scheduled agents). In a prefork worker
-            # ``task_join_will_block()`` is process-wide, so the default
-            # ``disable_sync_subtasks=True`` makes ``get()`` raise RuntimeError
-            # ("Never call result.get() within a task!"). The dedicated ``parsing``
-            # queue + separate workers already avoid the real self-deadlock, so opt
-            # out of the blanket guard explicitly.
+            # The web process (not a worker) awaits here; ``disable_sync_subtasks=False`` keeps
+            # the call correct if invoked from a non-prefork (eventlet/gevent) worker where the
+            # inline branch above still ran but the blanket guard would otherwise raise.
             result = async_result.get(timeout=timeout, disable_sync_subtasks=False)
         except (CeleryTimeoutError, TimeoutError):
             return {"status": "error", "error": f"document parsing timed out after {int(timeout)}s."}

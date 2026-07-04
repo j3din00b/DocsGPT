@@ -76,6 +76,40 @@ export function collectCompletedAttachmentIds(
     .map((att) => att.id);
 }
 
+/** User-facing message shown when a Preview send is blocked. */
+export const UNSAVED_DRAFT_ATTACHMENTS_MESSAGE =
+  'Save the workflow before attaching documents in Preview.';
+
+/**
+ * Reason a Preview send must be blocked, or null when it may proceed. An
+ * unsaved draft has no persisted ``workflow_id``, so the backend can't bridge
+ * uploaded documents into the run — it would execute with the docs silently
+ * dropped. Block instead, keeping the uploads for a retry after the save.
+ */
+export function previewSendBlockReason(
+  workflowId: string | null | undefined,
+  hasCompletedAttachment: boolean,
+): string | null {
+  if (!workflowId && hasCompletedAttachment) {
+    return UNSAVED_DRAFT_ATTACHMENTS_MESSAGE;
+  }
+  return null;
+}
+
+/**
+ * Completed attachment ids eligible for a run. Attachments only survive as
+ * run-scoped artifacts when the run persists a ``workflow_runs`` row, which
+ * needs a saved ``workflow_id``; on an unsaved draft none are eligible (the UI
+ * blocks that send upstream), so they are neither sent nor cleared.
+ */
+export function collectRunAttachmentIds(
+  attachments: Attachment[],
+  workflowId: string | null | undefined,
+): string[] {
+  if (!workflowId) return [];
+  return collectCompletedAttachmentIds(attachments);
+}
+
 export const fetchWorkflowPreviewAnswer = createAsyncThunk<
   void,
   {
@@ -100,8 +134,12 @@ export const fetchWorkflowPreviewAnswer = createAsyncThunk<
     if (state.preference) {
       // Doc-driven workflows read uploaded files as run-scoped artifacts; pass
       // the completed attachment ids so the backend bridges them (user-scoped).
-      const attachmentIds = collectCompletedAttachmentIds(
+      // Gated on a saved workflow_id: an unsaved draft can't bridge them, so we
+      // neither send nor clear the uploads (the Preview UI blocks that send and
+      // keeps them for a retry after saving).
+      const attachmentIds = collectRunAttachmentIds(
         state.upload.attachments,
+        workflowId,
       );
       if (attachmentIds.length > 0) dispatch(clearAttachments());
 

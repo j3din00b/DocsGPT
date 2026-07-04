@@ -22,10 +22,10 @@ from application.utils import safe_filename
 
 logger = logging.getLogger(__name__)
 
-# Cap the text returned to the LLM so a huge document can't flood context; the
-# full result is still persisted as a ``data`` artifact. When the text exceeds
-# the cap a head+tail window keeps both the document's beginning AND end (e.g.
-# totals/signatures) within the byte budget.
+# Default cap for the LLM-facing VIEW of the text (applied in ``bound_parse_payload``,
+# NOT during parsing) so a huge document can't flood context; the full result is still
+# persisted as a ``data`` artifact. When the text exceeds the cap a head+tail window keeps
+# both the document's beginning AND end (e.g. totals/signatures) within the byte budget.
 _TEXT_MAX_BYTES = 8000
 _MAX_TABLES_RETURNED = 20
 _MAX_TABLE_ROWS = 50
@@ -55,18 +55,26 @@ def truncate_text_head_tail(text: str, max_bytes: Optional[int] = None) -> str:
     return f"{head_text}\n\n...[truncated {dropped} bytes]...\n\n{tail_text}"
 
 
-def bound_parse_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def bound_parse_payload(payload: Dict[str, Any], max_chars: Optional[int] = None) -> Dict[str, Any]:
     """Bound every shape of a parse payload so the Redis-backed result stays small.
 
-    ``content`` is re-windowed and ``chunks`` is capped in count and per-chunk
-    length. ``structured`` is left as-is: it rides back so json_schema validation
-    in the tool can run against it, and it is already bounded by the input byte
-    cap plus the table caps (``_compact_table`` / ``summary``); the full result is
-    also persisted as a ``data`` artifact. The dict is mutated in place.
+    This is where ALL view-bounding happens: parsing now returns the FULL content and the
+    persisted ``data`` artifact keeps it, while the view ridden back through the Redis result
+    backend is bounded here. ``content`` is capped to ``max_chars`` when given, else re-windowed
+    to a head+tail byte window; ``chunks`` is capped in count and per-chunk length. ``structured``
+    is left as-is: it rides back so json_schema validation in the tool can run against it, and it
+    is already bounded by the input byte cap plus the table caps (``_compact_table`` /
+    ``summary``). ``payload['truncated']`` is set when the content view actually cut. The dict is
+    mutated in place.
     """
     content = payload.get("content")
     if isinstance(content, str):
-        payload["content"] = truncate_text_head_tail(content)
+        if max_chars and int(max_chars) > 0:
+            capped = content[: int(max_chars)]
+        else:
+            capped = truncate_text_head_tail(content)
+        payload["content"] = capped
+        payload["truncated"] = capped != content
 
     chunks = payload.get("chunks")
     if isinstance(chunks, list):
@@ -336,7 +344,7 @@ def _shape(
             extracted = _docling_structured(path, ocr_enabled=ocr_enabled, include_tables=include_tables)
         except Exception as exc:
             return {"error": f"structured parsing requires Docling: {type(exc).__name__}: {exc}"}
-        bounded, truncated = _bounded(extracted["markdown"], max_chars)
+        bounded, truncated = _bounded(extracted["markdown"])
         return {
             "output": "structured",
             "content": bounded,
@@ -364,7 +372,7 @@ def _shape(
         except Exception:
             text, tables = _parse_to_text(parser, path), []
         text = _apply_pages(text, pages)
-        bounded, truncated = _bounded(text, max_chars)
+        bounded, truncated = _bounded(text)
         payload: Dict[str, Any] = {"output": output, "content": bounded, "truncated": truncated}
         if tables:
             payload["tables"] = tables
@@ -388,17 +396,17 @@ def _shape(
                 path, ocr_enabled=ocr_enabled, include_tables=True)["tables"]]
         except Exception:
             tables = []
-    bounded, truncated = _bounded(text, max_chars)
+    bounded, truncated = _bounded(text)
     payload: Dict[str, Any] = {"output": output, "content": bounded, "truncated": truncated}
     if tables:
         payload["tables"] = tables
     return payload
 
 
-def _bounded(text: str, max_chars: Optional[int]) -> tuple[str, bool]:
-    """Bound text to ``max_chars`` (chars) or the default byte window; flag truncation."""
-    if max_chars and int(max_chars) > 0:
-        capped = text[: int(max_chars)]
-        return capped, len(capped) < len(text)
-    bounded = truncate_text_head_tail(text)
-    return bounded, bounded != text
+def _bounded(text: str) -> tuple[str, bool]:
+    """Return the FULL extracted text (never truncated here); the view is bounded in ``bound_parse_payload``.
+
+    Parsing keeps the complete text so the persisted ``data`` artifact is the full parse;
+    ``max_chars`` and the default head+tail window now bound only the LLM-facing view.
+    """
+    return text, False

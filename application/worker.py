@@ -1611,11 +1611,18 @@ def attachment_worker(self, file_info, user):
 
 
 def parse_document_worker(self, artifact_id, parent, user_id, options):
-    """Parse an input artifact's bytes to a shaped result on the dedicated parsing queue.
+    """Thin Celery-task wrapper; delegates to the process-agnostic ``run_parse_document``."""
+    return run_parse_document(artifact_id, parent, user_id, options)
 
-    Security: the artifact is re-resolved through the run-scoped gate IN THE WORKER
-    (never trusting a raw storage path) so authz is enforced independently here, in
-    addition to the pre-enqueue check in the tool.
+
+def run_parse_document(artifact_id, parent, user_id, options):
+    """Parse an input artifact's bytes to a shaped result; runnable inline OR on the parsing queue.
+
+    Security: the artifact is re-resolved through the run-scoped gate here (never trusting a
+    raw storage path) so authz is enforced independently, in addition to the pre-enqueue check
+    in the tool. ``read_document`` calls this directly (in-process) when it already runs inside a
+    Celery worker; the web process dispatches ``parse_document`` to the parsing queue, which lands
+    here via ``parse_document_worker``.
     """
     from application.agents.tools.artifact_ref import resolve_artifact_id
     from application.parser.document_reader import bound_parse_payload, parse_document_bytes
@@ -1628,7 +1635,7 @@ def parse_document_worker(self, artifact_id, parent, user_id, options):
         return {"status": "error", "error": "parse_document requires a conversation_id or workflow_run_id."}
 
     # Re-resolve through the parent-scoped gate so a forged/cross-run id is rejected
-    # in the worker too; resolve a short ref to an id within this parent only.
+    # here too; resolve a short ref to an id within this parent only.
     try:
         with db_readonly() as conn:
             repo = ArtifactsRepository(conn)
@@ -1646,7 +1653,7 @@ def parse_document_worker(self, artifact_id, parent, user_id, options):
                 return {"status": "error", "error": f"input artifact {artifact_id} not found in this conversation/run."}
             version = repo.get_version(resolved_id, artifact["current_version"])
     except Exception:
-        logging.error("parse_document_worker: failed to resolve input artifact", exc_info=True)
+        logging.error("run_parse_document: failed to resolve input artifact", exc_info=True)
         return {"status": "error", "error": f"failed to load input artifact {artifact_id}."}
 
     if not version or not version.get("storage_path"):
@@ -1657,9 +1664,11 @@ def parse_document_worker(self, artifact_id, parent, user_id, options):
     try:
         data = StorageCreator.get_storage().get_file(version["storage_path"]).read()
     except Exception:
-        logging.error("parse_document_worker: failed to read input artifact bytes", exc_info=True)
+        logging.error("run_parse_document: failed to read input artifact bytes", exc_info=True)
         return {"status": "error", "error": f"failed to read input artifact {artifact_id}."}
 
+    # Parse returns the FULL content (no max_chars/window here) so the persisted artifact is the
+    # complete parse; all view-bounding is applied by ``bound_parse_payload`` below.
     result = parse_document_bytes(
         data,
         filename,
@@ -1667,7 +1676,6 @@ def parse_document_worker(self, artifact_id, parent, user_id, options):
         ocr=options.get("ocr", "auto"),
         pages=options.get("pages"),
         engine=options.get("engine", "auto"),
-        max_chars=options.get("max_chars"),
         include_tables=bool(options.get("include_tables", True)),
     )
     if result.get("error"):
@@ -1675,17 +1683,17 @@ def parse_document_worker(self, artifact_id, parent, user_id, options):
 
     payload = {"status": "ok", **result}
     if options.get("persist"):
-        # The full shaped result is persisted by reference; only a bounded view rides
-        # back through the Redis result backend (the bytes live in the artifact).
+        # Persist the FULL shaped result by reference (bytes live in the artifact); only the
+        # bounded view computed below rides back through the Redis result backend.
         artifact_ref = _persist_parse_result(result, display_name, user_id, parent, options)
         if isinstance(artifact_ref, dict) and artifact_ref.get("error"):
             payload["artifact_error"] = artifact_ref["error"]
         elif artifact_ref is not None:
             payload["artifact"] = artifact_ref
-    # Bound the Redis-backed view across all shapes: content is re-windowed, chunks are
-    # capped, and structured (needed for json_schema validation) is bounded by the input
-    # cap + table caps. The FULL result already lives in the persisted artifact above.
-    payload = bound_parse_payload(payload)
+    # Bound the Redis-backed VIEW across all shapes: content is capped by max_chars (else the
+    # default head+tail window), chunks are count/length-capped, and structured (needed for
+    # json_schema validation) rides back as-is. The FULL result already lives in the artifact.
+    payload = bound_parse_payload(payload, max_chars=options.get("max_chars"))
     return payload
 
 

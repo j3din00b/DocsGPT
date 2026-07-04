@@ -32,6 +32,7 @@ import {
   addQuery,
   fetchWorkflowPreviewAnswer,
   handleWorkflowPreviewAbort,
+  previewSendBlockReason,
   resendQuery,
   resetWorkflowPreview,
   selectActiveNodeId,
@@ -443,6 +444,9 @@ export default function WorkflowPreview({
   const hasCompletedAttachment = completedAttachments.length > 0;
 
   const [lastQueryReturnedErr, setLastQueryReturnedErr] = useState(false);
+  const [sendBlockedMessage, setSendBlockedMessage] = useState<string | null>(
+    null,
+  );
   const [openDetailsIndex, setOpenDetailsIndex] = useState<number | null>(null);
   const [openArtifactsIndex, setOpenArtifactsIndex] = useState<number | null>(
     null,
@@ -493,6 +497,20 @@ export default function WorkflowPreview({
       isRetry?: boolean;
       index?: number;
     }) => {
+      // An unsaved draft can't bridge uploaded documents into the run (no
+      // persisted workflow_id), so block the send rather than run with the docs
+      // silently dropped. The uploads are kept (not cleared) for a retry after
+      // the workflow is saved.
+      const blockReason = previewSendBlockReason(
+        workflowId,
+        hasCompletedAttachment,
+      );
+      if (blockReason) {
+        setSendBlockedMessage(blockReason);
+        return;
+      }
+      setSendBlockedMessage(null);
+
       const trimmedQuestion = question.trim();
       // Doc-driven nodes read ``input_documents`` rather than the query, so an
       // attachment-only run is allowed to proceed with an empty question.
@@ -509,8 +527,14 @@ export default function WorkflowPreview({
         handleFetchAnswer({ question: trimmedQuestion, index: undefined });
       }
     },
-    [dispatch, handleFetchAnswer, hasCompletedAttachment],
+    [dispatch, handleFetchAnswer, hasCompletedAttachment, workflowId],
   );
+
+  // Clear the block message once it no longer applies (the workflow was saved,
+  // or the attachments were removed) so a stale warning doesn't linger.
+  useEffect(() => {
+    if (workflowId || !hasCompletedAttachment) setSendBlockedMessage(null);
+  }, [workflowId, hasCompletedAttachment]);
 
   const handleQuestionSubmission = (
     question?: string,
@@ -710,6 +734,11 @@ export default function WorkflowPreview({
             )}
           </div>
           <div className="bg-card absolute right-0 bottom-0 left-0 flex w-full flex-col gap-2 px-4 pt-2 pb-4">
+            {sendBlockedMessage && (
+              <p className="text-xs text-red-500" role="alert">
+                {sendBlockedMessage}
+              </p>
+            )}
             <MessageInput
               onSubmit={(text) => handleQuestionSubmission(text)}
               loading={status === 'loading'}

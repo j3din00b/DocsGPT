@@ -428,3 +428,54 @@ def test_materialize_inputs_rejects_oversize_by_declared_size(monkeypatch):
     out = _tool()._materialize_inputs(manager, "conv-1", [_ART_ID])
     assert "exceeds" in out["error"] and "sandbox input limit" in out["error"]
     assert manager.put_files == {}  # nothing staged
+
+
+def test_materialize_inputs_dedupes_same_filename(monkeypatch):
+    """Two inputs whose current versions share a filename stage to DISTINCT inputs/ paths."""
+    from application.agents.tools import code_executor as ce
+
+    id_a = str(uuid.uuid4())
+    id_b = str(uuid.uuid4())
+
+    class _Repo:
+        def __init__(self, conn):
+            pass
+
+        def artifact_id_at_position(self, n, *, conversation_id=None, workflow_run_id=None):
+            return None
+
+        def get_artifact_in_parent(self, artifact_id, *, conversation_id=None, workflow_run_id=None):
+            if conversation_id != "conv-1":
+                return None
+            return {"id": artifact_id, "current_version": 1, "title": "seed.csv"}
+
+        def get_version(self, artifact_id, version):
+            # Both inputs carry the SAME current filename but distinct stored bytes.
+            return {"filename": "seed.csv", "storage_path": f"p/{artifact_id}.csv"}
+
+    class _Conn:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Storage:
+        def get_file(self, path):
+            import io
+
+            return io.BytesIO(path.encode())  # distinct bytes per artifact path
+
+    monkeypatch.setattr(ce, "db_readonly", lambda: _Conn())
+    monkeypatch.setattr(ce, "ArtifactsRepository", _Repo)
+    monkeypatch.setattr(ce.StorageCreator, "get_storage", staticmethod(lambda: _Storage()))
+
+    manager = _InputManager()
+    out = _tool()._materialize_inputs(manager, "conv-1", [id_a, id_b])
+
+    assert "error" not in out
+    # The colliding second input is suffixed before the extension; both are reported.
+    assert out["loaded"] == ["inputs/seed.csv", "inputs/seed-2.csv"]
+    assert set(manager.put_files) == {"inputs/seed.csv", "inputs/seed-2.csv"}
+    # Each path holds its own artifact's bytes (no clobber).
+    assert manager.put_files["inputs/seed.csv"] != manager.put_files["inputs/seed-2.csv"]

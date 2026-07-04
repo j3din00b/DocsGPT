@@ -396,6 +396,57 @@ def test_materialize_code_inputs_rejects_oversize(monkeypatch):
     assert manager.put_files == []  # nothing staged
 
 
+def test_materialize_code_inputs_dedupes_same_filename(monkeypatch):
+    """Two code-node inputs sharing a filename stage to DISTINCT inputs/ paths (no clobber)."""
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(
+        "application.agents.tools.artifact_ref.resolve_artifact_id",
+        lambda repo, raw, **k: str(raw),
+    )
+
+    class _Repo:
+        def __init__(self, conn):
+            pass
+
+        def get_artifact_in_parent(self, artifact_id, *, workflow_run_id=None, conversation_id=None):
+            return {"id": artifact_id, "current_version": 1}
+
+        def get_version(self, artifact_id, version):
+            # Same filename, distinct stored bytes per input.
+            return {"filename": "data.csv", "storage_path": f"p/{artifact_id}.csv"}
+
+    @contextmanager
+    def _readonly():
+        yield object()
+
+    class _Storage:
+        def get_file(self, path):
+            import io
+
+            return io.BytesIO(path.encode())
+
+    monkeypatch.setattr(
+        "application.storage.db.repositories.artifacts.ArtifactsRepository", _Repo
+    )
+    monkeypatch.setattr("application.storage.db.session.db_readonly", _readonly)
+    monkeypatch.setattr(
+        "application.storage.storage_creator.StorageCreator.get_storage",
+        staticmethod(lambda: _Storage()),
+    )
+
+    engine = _engine()
+    manager = _FakeManager(_Result(ok=True, stdout="ok"))
+    loaded = engine._materialize_code_inputs(
+        manager, engine._session_id(), ["art-a", "art-b"], "user-code"
+    )
+
+    assert loaded == ["inputs/data.csv", "inputs/data-2.csv"]
+    staged = dict(manager.put_files)
+    assert set(staged) == {"inputs/data.csv", "inputs/data-2.csv"}
+    assert staged["inputs/data.csv"] != staged["inputs/data-2.csv"]  # no clobber
+
+
 # ---------------------------------------------------------------------------
 # Pass-by-reference: survives serialization + CEL branches on the metadata.
 # ---------------------------------------------------------------------------

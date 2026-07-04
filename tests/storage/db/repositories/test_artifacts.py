@@ -41,7 +41,8 @@ class TestCreateArtifact:
         assert artifact["user_id"] == "user-1"
         assert artifact["kind"] == "presentation"
         assert artifact["title"] == "Q3 deck"
-        assert artifact["metadata"] == {"source": "chat"}
+        # A stable per-parent ref_seq is merged into the caller's metadata at creation.
+        assert artifact["metadata"] == {"source": "chat", "ref_seq": 1}
         assert artifact["current_version"] == 1
         assert artifact["id"] is not None
         assert artifact["_id"] == artifact["id"]
@@ -458,6 +459,97 @@ class TestVirtualRefPositions:
             repo.position_in_parent(created["id"])
         with pytest.raises(ValueError):
             repo.artifact_id_at_position(1)
+
+
+class TestStableRefSeq:
+    """A stable per-parent ``ref_seq`` (stored in metadata) backs the ``A{n}`` refs and survives deletes."""
+
+    def test_create_assigns_incrementing_ref_seq(self, pg_conn):
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        a = repo.create_artifact("u", "document", conversation_id=conv)
+        b = repo.create_artifact("u", "document", conversation_id=conv)
+        c = repo.create_artifact("u", "document", conversation_id=conv)
+        assert a["metadata"]["ref_seq"] == 1
+        assert b["metadata"]["ref_seq"] == 2
+        assert c["metadata"]["ref_seq"] == 3
+
+    def test_ref_seq_is_parent_scoped(self, pg_conn):
+        repo = _repo(pg_conn)
+        a1 = repo.create_artifact("u", "document", conversation_id=_conversation_id())
+        b1 = repo.create_artifact("u", "document", workflow_run_id=_conversation_id())
+        # Each parent numbers ref_seq from 1 independently.
+        assert a1["metadata"]["ref_seq"] == 1
+        assert b1["metadata"]["ref_seq"] == 1
+
+    def test_ref_seq_merges_without_clobbering_caller_metadata(self, pg_conn):
+        repo = _repo(pg_conn)
+        a = repo.create_artifact(
+            "u", "document", conversation_id=_conversation_id(), metadata={"k": "v"}
+        )
+        assert a["metadata"] == {"k": "v", "ref_seq": 1}
+
+    def test_next_ref_seq_is_monotonic_across_delete(self, pg_conn):
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        a = repo.create_artifact("u", "document", conversation_id=conv)
+        repo.create_artifact("u", "document", conversation_id=conv)  # ref_seq 2
+        repo.create_artifact("u", "document", conversation_id=conv)  # ref_seq 3
+        assert repo.next_ref_seq(conversation_id=conv) == 4
+        # Deleting an earlier artifact must NOT lower the next seq (no reuse -> no re-point).
+        repo.delete_artifact(a["id"])
+        assert repo.next_ref_seq(conversation_id=conv) == 4
+
+    def test_resolve_id_by_ref_seq_is_stable_after_delete(self, pg_conn):
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        a = repo.create_artifact("u", "document", conversation_id=conv)
+        b = repo.create_artifact("u", "document", conversation_id=conv)
+        c = repo.create_artifact("u", "document", conversation_id=conv)
+        assert repo.resolve_id_by_ref_seq(2, conversation_id=conv) == b["id"]
+        assert repo.resolve_id_by_ref_seq(3, conversation_id=conv) == c["id"]
+        # Delete the FIRST artifact; B/C refs must NOT shift.
+        repo.delete_artifact(a["id"])
+        assert repo.resolve_id_by_ref_seq(2, conversation_id=conv) == b["id"]
+        assert repo.resolve_id_by_ref_seq(3, conversation_id=conv) == c["id"]
+        assert repo.resolve_id_by_ref_seq(1, conversation_id=conv) is None  # A is gone
+
+    def test_resolve_id_by_ref_seq_missing_and_invalid(self, pg_conn):
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        repo.create_artifact("u", "document", conversation_id=conv)
+        assert repo.resolve_id_by_ref_seq(99, conversation_id=conv) is None
+        assert repo.resolve_id_by_ref_seq(0, conversation_id=conv) is None
+        with pytest.raises(ValueError):
+            repo.next_ref_seq()
+        with pytest.raises(ValueError):
+            repo.resolve_id_by_ref_seq(1)
+
+    def test_resolver_resolves_a_n_by_stable_seq_after_delete(self, pg_conn):
+        from application.agents.tools.artifact_ref import resolve_artifact_id
+
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        a = repo.create_artifact("u", "document", conversation_id=conv)
+        b = repo.create_artifact("u", "document", conversation_id=conv)
+        repo.delete_artifact(a["id"])
+        # The tool path resolves A2 to B via ref_seq even though B is now positionally first.
+        assert resolve_artifact_id(repo, "A2", conversation_id=conv) == b["id"]
+
+    def test_legacy_row_without_ref_seq_falls_back_to_position(self, pg_conn):
+        from application.agents.tools.artifact_ref import resolve_artifact_id
+
+        repo = _repo(pg_conn)
+        conv = _conversation_id()
+        art = repo.create_artifact("u", "document", conversation_id=conv)
+        # Simulate a pre-migration row that never got a ref_seq.
+        pg_conn.execute(
+            text("UPDATE artifacts SET metadata = NULL WHERE id = CAST(:id AS uuid)"),
+            {"id": art["id"]},
+        )
+        assert repo.resolve_id_by_ref_seq(1, conversation_id=conv) is None
+        # No ref_seq -> positional fallback still resolves A1.
+        assert resolve_artifact_id(repo, "A1", conversation_id=conv) == art["id"]
 
 
 class TestCascadeDelete:

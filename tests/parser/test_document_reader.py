@@ -61,19 +61,21 @@ def test_markdown_output_default():
 
 
 @pytest.mark.unit
-def test_max_chars_truncates_and_flags():
+def test_max_chars_does_not_truncate_parse_output():
+    # max_chars now bounds only the VIEW (bound_parse_payload); parse returns the FULL text
+    # so the persisted artifact is the complete parse.
     out = parse_document_bytes(("A" * 100).encode(), "note.txt", output="text", max_chars=10, include_tables=False)
-    assert out["truncated"] is True
-    assert len(out["content"]) == 10
+    assert out["content"] == "A" * 100
+    assert out["truncated"] is False
 
 
 @pytest.mark.unit
-def test_default_window_truncates_large_text():
-    big = ("A" * (dr._TEXT_MAX_BYTES * 3)).encode()
-    out = parse_document_bytes(big, "note.txt", output="text", include_tables=False)
-    assert out["truncated"] is True
-    assert "...[truncated" in out["content"]
-    assert len(out["content"].encode("utf-8")) <= dr._TEXT_MAX_BYTES + 64
+def test_large_text_is_full_in_parse_output():
+    # The default head+tail window moved to bound_parse_payload; parse keeps the full text.
+    big = "A" * (dr._TEXT_MAX_BYTES * 3)
+    out = parse_document_bytes(big.encode(), "note.txt", output="text", include_tables=False)
+    assert out["content"] == big
+    assert out["truncated"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +350,28 @@ def test_bound_parse_payload_keeps_structured_for_validation():
     out = bound_parse_payload({"output": "structured", "content": "# ok", "structured": structured})
     # structured must survive so the tool's json_schema validation can run on it.
     assert out["structured"] == structured
+
+
+@pytest.mark.unit
+def test_bound_parse_payload_max_chars_bounds_view_only():
+    # max_chars caps the returned view; the parse itself is unaffected (see parse tests above).
+    content = "A" * 100
+    out = bound_parse_payload({"output": "text", "content": content}, max_chars=10)
+    assert out["content"] == "A" * 10
+    assert out["truncated"] is True
+
+
+@pytest.mark.unit
+def test_bound_parse_payload_default_window_when_no_max_chars():
+    big = "A" * (dr._TEXT_MAX_BYTES * 3)
+    out = bound_parse_payload({"output": "text", "content": big})
+    assert "...[truncated" in out["content"]
+    assert len(out["content"].encode("utf-8")) <= dr._TEXT_MAX_BYTES + 64
+    assert out["truncated"] is True
+
+
+@pytest.mark.unit
+def test_bound_parse_payload_small_content_not_flagged():
+    out = bound_parse_payload({"output": "text", "content": "hi"}, max_chars=10)
+    assert out["content"] == "hi"
+    assert out["truncated"] is False

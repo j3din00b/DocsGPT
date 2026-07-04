@@ -47,9 +47,15 @@ export default function WorkflowRunArtifacts({
       .then(async (res: Response) => {
         if (cancelled) return;
         if (!res.ok) {
-          // The run row is missing/unauthorized (e.g. an unsaved-draft preview):
-          // show an informational empty state rather than a hard error.
-          setArtifacts([]);
+          // A 403 is the expected unsaved-draft / unauthorized case (no
+          // persisted run row): show the informational empty state. Any other
+          // non-OK status (500, an expired 401, ...) is a real failure — surface
+          // an error + Retry instead of masquerading as "no artifacts".
+          if (res.status === 403) {
+            setArtifacts([]);
+          } else {
+            setError('Failed to load artifacts');
+          }
           setLoading(false);
           return;
         }

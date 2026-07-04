@@ -102,3 +102,62 @@ def test_resolve_ref_under_workflow_run_parent():
     repo = _FakeRepo(mapping={2: target}, run="run-9")
     assert resolve_artifact_id(repo, "A2", workflow_run_id="run-9") == target
     assert repo.calls == [(2, None, "run-9")]
+
+
+# ---------------------------------------------------------------------------
+# Stable per-parent ref_seq: a ref no longer re-points after an earlier delete
+# ---------------------------------------------------------------------------
+class _SeqRepo:
+    """Fake repo backing resolve_id_by_ref_seq (stable) with the legacy positional fallback."""
+
+    def __init__(self, *, seq_map=None, pos_map=None, conv=None, run=None):
+        self.seq_map = seq_map or {}
+        self.pos_map = pos_map or {}
+        self.conv = conv
+        self.run = run
+        self.seq_calls = []
+        self.pos_calls = []
+
+    def _in_scope(self, conversation_id, workflow_run_id) -> bool:
+        if self.conv is not None and conversation_id != self.conv:
+            return False
+        if self.run is not None and workflow_run_id != self.run:
+            return False
+        return True
+
+    def resolve_id_by_ref_seq(self, seq, *, conversation_id=None, workflow_run_id=None):
+        self.seq_calls.append((seq, conversation_id, workflow_run_id))
+        if not self._in_scope(conversation_id, workflow_run_id):
+            return None
+        return self.seq_map.get(seq)
+
+    def artifact_id_at_position(self, n, *, conversation_id=None, workflow_run_id=None):
+        self.pos_calls.append((n, conversation_id, workflow_run_id))
+        if not self._in_scope(conversation_id, workflow_run_id):
+            return None
+        return self.pos_map.get(n)
+
+
+def test_ref_resolves_by_stable_seq_not_shifted_position():
+    b, c = str(uuid.uuid4()), str(uuid.uuid4())
+    # After deleting the earlier A(seq 1): ref_seq keeps B=2/C=3; positions shifted to B=1/C=2.
+    repo = _SeqRepo(seq_map={2: b, 3: c}, pos_map={1: b, 2: c}, conv="conv-1")
+    assert resolve_artifact_id(repo, "A2", conversation_id="conv-1") == b
+    assert resolve_artifact_id(repo, "A3", conversation_id="conv-1") == c
+    # The stable ref_seq hit; the (shifted) positional fallback was never consulted.
+    assert repo.pos_calls == []
+
+
+def test_ref_falls_back_to_position_for_legacy_rows():
+    legacy = str(uuid.uuid4())
+    # Legacy row has no ref_seq -> resolve_id_by_ref_seq misses -> positional fallback resolves it.
+    repo = _SeqRepo(seq_map={}, pos_map={1: legacy}, conv="conv-1")
+    assert resolve_artifact_id(repo, "A1", conversation_id="conv-1") == legacy
+    assert repo.seq_calls == [(1, "conv-1", None)]
+    assert repo.pos_calls == [(1, "conv-1", None)]
+
+
+def test_ref_seq_does_not_cross_parents():
+    b = str(uuid.uuid4())
+    repo = _SeqRepo(seq_map={2: b}, pos_map={2: b}, conv="conv-1")
+    assert resolve_artifact_id(repo, "A2", conversation_id="conv-OTHER") is None

@@ -59,23 +59,25 @@ export function stripAgentPrefix(templatePath: string): string {
   return trimmed;
 }
 
-/** Multiselect options of upstream document variables, stored as bare names. */
+/**
+ * Multiselect options of upstream document variables, stored as bare names.
+ *
+ * Only variables that carry artifact references at run time are offered
+ * (`producesArtifact`): the uploaded `input_documents` and code-node outputs.
+ * Plain agent/state TEXT outputs are excluded — the engine can't resolve them
+ * to artifacts, so picking one appends the literal variable name and the node
+ * hard-fails. The distinction is assigned upstream in `extractUpstreamVariables`
+ * keyed on the producing node type.
+ */
 export function toDocumentVariableOptions(
   variables: WorkflowVariable[],
 ): { value: string; label: string }[] {
   const options: { value: string; label: string }[] = [];
   const seen = new Set<string>();
   for (const variable of variables) {
-    const path = variable.templatePath;
-    const isInputDocuments = path === 'agent.input_documents';
-    const isAgentOutput =
-      path.startsWith('agent.') &&
-      path !== 'agent.query' &&
-      path !== 'agent.chat_history';
-    const isAgentBracket = path.startsWith('agent[');
-    if (!isInputDocuments && !isAgentOutput && !isAgentBracket) continue;
+    if (!variable.producesArtifact) continue;
 
-    const bareName = stripAgentPrefix(path);
+    const bareName = stripAgentPrefix(variable.templatePath);
     if (!bareName || seen.has(bareName)) continue;
     seen.add(bareName);
     options.push({ value: bareName, label: bareName });

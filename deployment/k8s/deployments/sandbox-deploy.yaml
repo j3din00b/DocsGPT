@@ -34,6 +34,10 @@ spec:
       # runtimeClassName: gvisor
       securityContext:
         runAsNonRoot: true
+        # Numeric UID the kubelet can verify as non-root; MUST match the sandbox
+        # image's `USER` (deployment/sandbox/Dockerfile). Without it the pod
+        # fails to start with CreateContainerConfigError.
+        runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:

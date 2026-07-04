@@ -723,25 +723,34 @@ function WorkflowBuilderInner() {
   }, [isPublishing]);
 
   useEffect(() => {
+    // A keystroke targeting a text field / editable popover (the Code / JSON
+    // schema textareas, the Output Variable input) must edit the field, never
+    // fire a canvas shortcut.
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const el = target as HTMLElement | null;
+      return (
+        el?.tagName === 'INPUT' ||
+        el?.tagName === 'TEXTAREA' ||
+        el?.isContentEditable === true
+      );
+    };
+    // Shared guard for both canvas shortcuts (Delete/Backspace to remove the
+    // selected node, Escape to close the config panel): ignore the keystroke
+    // while typing in a field, while the Preview Sheet is open (its own inputs
+    // own the keys — a stray Delete there must not delete the node behind it),
+    // or once another handler has already consumed the event. Kept in one place
+    // so the two branches can't drift apart.
+    const shouldIgnoreShortcut = (e: KeyboardEvent): boolean =>
+      e.defaultPrevented || showPreview || isEditableTarget(e.target);
+
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Delete' && selectedNode) {
+      if (shouldIgnoreShortcut(e)) return;
+
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNode) {
         handleDeleteNode();
+        return;
       }
       if (e.key === 'Escape') {
-        // While the Preview Sheet is open, leave Escape to its own dismissal
-        // (popovers, the Sheet itself) so a reflexive Escape can't tear down
-        // the node-config panel and lose the run/attachments/typed prompt.
-        if (showPreview) return;
-        // Ignore Escape originating from text fields / editable popovers so it
-        // dismisses the field rather than the whole config panel.
-        const target = e.target as HTMLElement | null;
-        if (
-          target?.tagName === 'INPUT' ||
-          target?.tagName === 'TEXTAREA' ||
-          target?.isContentEditable
-        ) {
-          return;
-        }
         setShowNodeConfig(false);
         setSelectedNode(null);
       }

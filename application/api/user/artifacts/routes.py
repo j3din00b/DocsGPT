@@ -384,6 +384,15 @@ class DownloadArtifact(Resource):
                         ),
                         500,
                     )
+                # A 302 to a cross-origin S3 URL can't be read by the app's authed
+                # fetch (the bucket has no CORS grant for the app origin). When the
+                # client opts in via ?disposition=url (or Accept: application/json)
+                # hand the presigned URL back as JSON so it can navigate to it
+                # top-level (no CORS). Default stays a 302 so nothing else breaks.
+                if request.args.get("disposition") == "url" or (
+                    "application/json" in request.headers.get("Accept", "")
+                ):
+                    return make_response(jsonify({"success": True, "url": url}), 200)
                 return redirect(url, code=302)
 
             # Stream the bytes in chunks instead of buffering the whole object in

@@ -114,10 +114,17 @@ const endpoints = {
       `/api/artifacts/${artifactId}`,
     LIST_WORKFLOW_RUN_ARTIFACTS: (workflowRunId: string) =>
       `/api/artifacts?workflow_run_id=${encodeURIComponent(workflowRunId)}`,
-    DOWNLOAD_ARTIFACT: (artifactId: string, version?: number) =>
-      version != null
-        ? `/api/artifacts/${artifactId}/download?version=${version}`
-        : `/api/artifacts/${artifactId}/download`,
+    DOWNLOAD_ARTIFACT: (
+      artifactId: string,
+      version?: number,
+      disposition?: string,
+    ) => {
+      const params = new URLSearchParams();
+      if (version != null) params.set('version', String(version));
+      if (disposition) params.set('disposition', disposition);
+      const qs = params.toString();
+      return `/api/artifacts/${artifactId}/download${qs ? `?${qs}` : ''}`;
+    },
     RESTORE_ARTIFACT: (artifactId: string) =>
       `/api/artifacts/${artifactId}/restore`,
     WORKFLOWS: '/api/workflows',

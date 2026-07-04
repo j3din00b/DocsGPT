@@ -14,6 +14,12 @@ export interface WorkflowVariable {
   label: string;
   templatePath: string;
   section: string;
+  // True when the variable resolves to artifact reference(s) at run time
+  // (uploaded input_documents, code-node outputs) rather than plain LLM/state
+  // TEXT. Only artifact-bearing variables may be picked as node Documents;
+  // selecting a text output there makes the engine append the literal variable
+  // name and the node hard-fails. Heuristic keyed on the producing node type.
+  producesArtifact?: boolean;
 }
 
 const GLOBAL_CONTEXT_VARIABLES: WorkflowVariable[] = [
@@ -118,41 +124,54 @@ export function extractUpstreamVariables(
       label: 'agent.input_documents',
       templatePath: 'agent.input_documents',
       section: 'Workflow input',
+      // Uploaded documents are artifact references.
+      producesArtifact: true,
     },
     ...GLOBAL_CONTEXT_VARIABLES,
   ];
   const seen = new Set(variables.map((variable) => variable.templatePath));
   const upstreamIds = getUpstreamNodeIds(selectedNodeId, edges);
 
+  const pushNodeOutput = (
+    node: Node,
+    outputName: string,
+    sectionFallback: string,
+    producesArtifact: boolean,
+  ) => {
+    const templatePath = toAgentTemplatePath(outputName);
+    if (seen.has(templatePath)) return;
+    seen.add(templatePath);
+    variables.push({
+      label: templatePath,
+      templatePath,
+      section: node.data.title || node.data.label || sectionFallback,
+      producesArtifact,
+    });
+  };
+
   for (const node of nodes) {
     if (!upstreamIds.has(node.id)) continue;
 
-    if (node.type === 'agent') {
-      const defaultOutputTemplatePath = toAgentTemplatePath(
+    if (node.type === 'agent' || node.type === 'code') {
+      // Agent and code nodes both expose `node_<id>_output` and an optional
+      // `output_variable`, but only code-node outputs resolve to artifact
+      // references in the engine — agent outputs are LLM TEXT. So both feed the
+      // prompt-variable popover, while only code outputs are offered as
+      // Documents (see toDocumentVariableOptions / producesArtifact).
+      const producesArtifact = node.type === 'code';
+      const sectionFallback = node.type === 'code' ? 'Code' : 'Agent';
+      pushNodeOutput(
+        node,
         `node_${node.id}_output`,
+        sectionFallback,
+        producesArtifact,
       );
-      if (!seen.has(defaultOutputTemplatePath)) {
-        seen.add(defaultOutputTemplatePath);
-        variables.push({
-          label: defaultOutputTemplatePath,
-          templatePath: defaultOutputTemplatePath,
-          section: node.data.title || node.data.label || 'Agent',
-        });
-      }
 
       const outputVariable = String(
         node.data?.config?.output_variable || '',
       ).trim();
       if (outputVariable) {
-        const templatePath = toAgentTemplatePath(outputVariable);
-        if (!seen.has(templatePath)) {
-          seen.add(templatePath);
-          variables.push({
-            label: templatePath,
-            templatePath,
-            section: node.data.title || node.data.label || 'Agent',
-          });
-        }
+        pushNodeOutput(node, outputVariable, sectionFallback, producesArtifact);
       }
     }
 

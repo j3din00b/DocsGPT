@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildPreviewDocument,
@@ -12,7 +12,9 @@ import {
   PREVIEW_CSP,
   PREVIEW_CSP_MERMAID,
   previewModeForKind,
+  readPresignedUrlEnvelope,
   sortVersionsDesc,
+  triggerResponseDownload,
   type ArtifactVersion,
 } from './artifactViewUtils';
 
@@ -231,6 +233,104 @@ describe('buildPreviewDocument', () => {
     expect(PREVIEW_CSP_MERMAID).toContain("default-src 'none'");
     expect(PREVIEW_CSP_MERMAID).not.toContain('allow-same-origin');
     expect(PREVIEW_CSP_MERMAID).not.toContain('allow-scripts');
+  });
+});
+
+describe('readPresignedUrlEnvelope', () => {
+  const json = (body: unknown, contentType = 'application/json') =>
+    new Response(JSON.stringify(body), {
+      headers: { 'Content-Type': contentType },
+    });
+
+  it('extracts the presigned url from the s3 JSON envelope', async () => {
+    const url = await readPresignedUrlEnvelope(
+      json({ success: true, url: 'https://signed.example/x?sig=1' }),
+    );
+    expect(url).toBe('https://signed.example/x?sig=1');
+  });
+
+  it('returns null for a byte stream and leaves the body readable', async () => {
+    const res = new Response('<p>hi</p>', {
+      headers: { 'Content-Type': 'text/html' },
+    });
+    expect(await readPresignedUrlEnvelope(res)).toBeNull();
+    expect(await res.text()).toBe('<p>hi</p>');
+  });
+
+  it('returns null for a JSON artifact whose bytes are not the envelope', async () => {
+    const res = json({ foo: 1 });
+    expect(await readPresignedUrlEnvelope(res)).toBeNull();
+    // clone() was used to peek, so the original body is still consumable.
+    expect(await res.json()).toEqual({ foo: 1 });
+  });
+
+  it('rejects a non-http(s) url in the envelope', async () => {
+    expect(
+      await readPresignedUrlEnvelope(
+        json({ success: true, url: 'javascript:alert(1)' }),
+      ),
+    ).toBeNull();
+    expect(
+      await readPresignedUrlEnvelope(json({ success: true, url: '' })),
+    ).toBeNull();
+  });
+});
+
+describe('triggerResponseDownload', () => {
+  let anchors: HTMLAnchorElement[];
+
+  beforeEach(() => {
+    anchors = [];
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const orig = document.createElement.bind(document);
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string) => {
+      const el = orig(tag);
+      if (String(tag).toLowerCase() === 'a') {
+        vi.spyOn(el as HTMLAnchorElement, 'click').mockImplementation(
+          () => undefined,
+        );
+        anchors.push(el as HTMLAnchorElement);
+      }
+      return el;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('returns false for a non-OK response', async () => {
+    const res = new Response('', { status: 500 });
+    expect(await triggerResponseDownload(res, 'f.bin')).toBe(false);
+  });
+
+  it('navigates top-level to the presigned url for the s3 envelope', async () => {
+    const res = new Response(
+      JSON.stringify({ success: true, url: 'https://signed.example/x' }),
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+    expect(await triggerResponseDownload(res, 'f.bin')).toBe(true);
+    // No blob path for the presigned envelope.
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    const anchor = anchors.at(-1)!;
+    expect(anchor.href).toBe('https://signed.example/x');
+    expect(anchor.target).toBe('_blank');
+    expect(anchor.click).toHaveBeenCalled();
+  });
+
+  it('saves streamed bytes via a blob url for the backend strategy', async () => {
+    const res = new Response('BINARY', {
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': 'attachment; filename="deck.pptx"',
+      },
+    });
+    expect(await triggerResponseDownload(res, 'fallback.bin')).toBe(true);
+    expect(URL.createObjectURL).toHaveBeenCalled();
+    const anchor = anchors.at(-1)!;
+    expect(anchor.download).toBe('deck.pptx');
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:mock');
   });
 });
 

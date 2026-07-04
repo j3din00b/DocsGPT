@@ -13,7 +13,8 @@ import hashlib
 import io
 import logging
 import mimetypes
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import text
 
@@ -61,6 +62,25 @@ _KIND_BY_MIME_PREFIX: Dict[str, str] = {
     "application/msword": "document",
     "application/pdf": "document",
 }
+
+
+def unique_input_path(rel_path: str, used: Set[str]) -> str:
+    """Return ``rel_path`` (reserving it) or a ``-2``/``-3``... suffixed variant when already staged.
+
+    Two inputs whose current versions share a filename would otherwise clobber each other at the
+    same ``inputs/{name}`` path; the numeric suffix is inserted before the extension. Mutates
+    ``used`` to record the returned path.
+    """
+    if rel_path not in used:
+        used.add(rel_path)
+        return rel_path
+    base, ext = os.path.splitext(rel_path)
+    n = 2
+    while f"{base}-{n}{ext}" in used:
+        n += 1
+    unique = f"{base}-{n}{ext}"
+    used.add(unique)
+    return unique
 
 
 def infer_mime(filename: str) -> str:
@@ -271,16 +291,36 @@ def _enforce_user_quota(repo: ArtifactsRepository, user_id: str, added_bytes: in
         raise QuotaExceeded(f"artifact storage quota reached ({max_total} bytes); delete artifacts to free space")
 
 
+def _ref_from_metadata(metadata: Any) -> Optional[str]:
+    """Return the short ref (``A{ref_seq}``) from a stored metadata dict, or None when absent/non-numeric."""
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        seq = int(metadata.get("ref_seq"))
+    except (TypeError, ValueError):
+        return None
+    return make_ref(seq) if seq >= 1 else None
+
+
 def _ref_for(
     repo: ArtifactsRepository,
     artifact_id: str,
     *,
     conversation_id: Optional[str],
     workflow_run_id: Optional[str],
+    metadata: Any = None,
 ) -> Optional[str]:
-    """Compute the short ref (``A{n}``) for an artifact from its position in its parent; None on failure."""
+    """Compute the short ref for an artifact: its STABLE stored ``ref_seq``, else positional fallback.
+
+    The ref_seq is assigned at creation and kept in ``metadata`` so it survives deletions of
+    earlier artifacts. Legacy rows created before ref_seq existed have none, so they fall back to
+    the (mutable) position-in-parent; ``resolve_artifact_id`` mirrors this fallback.
+    """
     if conversation_id is None and workflow_run_id is None:
         return None
+    seq_ref = _ref_from_metadata(metadata)
+    if seq_ref is not None:
+        return seq_ref
     try:
         position = repo.position_in_parent(
             artifact_id, conversation_id=conversation_id, workflow_run_id=workflow_run_id
@@ -339,8 +379,13 @@ def persist_new_artifact(
             artifact_id = str(artifact["id"])
             storage_path = _storage_key(user_id, artifact_id, 1, safe_name)
             _set_version_storage_path(conn, artifact_id, 1, storage_path)
+            # The freshly-created row carries the stable ``ref_seq`` in its metadata.
             ref = _ref_for(
-                repo, artifact_id, conversation_id=conversation_id, workflow_run_id=workflow_run_id
+                repo,
+                artifact_id,
+                conversation_id=conversation_id,
+                workflow_run_id=workflow_run_id,
+                metadata=artifact.get("metadata"),
             )
             storage.save_file(io.BytesIO(data), storage_path)
             saved_key = storage_path
@@ -402,8 +447,15 @@ def append_artifact_version(
             version_number = int(version["version"])
             storage_path = _storage_key(user_id, artifact_id, version_number, safe_name)
             _set_version_storage_path(conn, artifact_id, version_number, storage_path)
+            # The identity's stable ``ref_seq`` was assigned at creation; read it so an
+            # edit hands back the SAME ref the model already holds.
+            existing = repo.get_artifact(str(artifact_id))
             ref = _ref_for(
-                repo, str(artifact_id), conversation_id=conversation_id, workflow_run_id=workflow_run_id
+                repo,
+                str(artifact_id),
+                conversation_id=conversation_id,
+                workflow_run_id=workflow_run_id,
+                metadata=(existing or {}).get("metadata"),
             )
             storage.save_file(io.BytesIO(data), storage_path)
             saved_key = storage_path

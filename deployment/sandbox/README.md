@@ -228,11 +228,20 @@ The hardened container runs **without `NET_ADMIN`**, so it cannot self-apply
   [`deployment/optional/docker-compose.optional.sandbox-egress.yaml`](../optional/docker-compose.optional.sandbox-egress.yaml),
   which flips `sandbox-egress` to `internal: true` (removing the runner's direct
   internet/RFC1918/metadata route entirely) and forces egress through a
-  deny-private **egress-gateway proxy** sidecar; for belt-and-suspenders on
-  untrusted/multi-tenant hosts also add a **host/cloud firewall rule** (drop the
-  four private ranges on the sandbox container's interface), since a forward
-  proxy only filters code that honors `HTTP(S)_PROXY` — the `internal` flip is
-  what contains raw sockets. Note the broker/DB published ports are bound to
+  deny-private **egress-gateway proxy** sidecar. That `internal` flip is what
+  contains **raw sockets to the internet/host/RFC1918/metadata** (a forward proxy
+  only filters code that honors `HTTP(S)_PROXY`).
+
+  **What compose canNOT contain:** the runner stays on `sandbox-net` with the
+  backend and worker — that is its control path, and a shared Docker network is
+  bidirectional, so Compose cannot sever it one-directionally. Sandbox code can
+  therefore still open sockets to `backend:7091` and the worker. This is a real
+  gap the Kubernetes NetworkPolicy closes (via its RFC1918 egress carve-out) but
+  compose cannot. **Mitigate it** when enabling the sandbox: run the backend with
+  real authentication (`AUTH_TYPE` != none / a real auth provider) so a reachable
+  API rejects unauthenticated requests — **required** — and/or add a host-firewall
+  `DROP` for runner→backend/worker on `sandbox-net` (see approach (1) in the
+  overlay file's header comment). Note the broker/DB published ports are bound to
   `127.0.0.1` so the runner cannot reach them via the host gateway either.
 
 ## Other hardening (deployment-level)

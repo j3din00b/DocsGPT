@@ -4,6 +4,7 @@ import userService from '../api/services/userService';
 import {
   type BytesPreviewMode,
   MAX_INLINE_TEXT_BYTES,
+  readPresignedUrlEnvelope,
 } from './artifactViewUtils';
 
 type BytesState =
@@ -49,12 +50,22 @@ export function useArtifactBytes(
     };
 
     userService
-      .downloadArtifact(artifactId, token, version)
+      .downloadArtifact(artifactId, token, version, 'url')
       .then(async (response: Response) => {
         if (!response.ok) throw new Error('download failed');
 
+        // Under URL_STRATEGY=s3 the endpoint returns a presigned URL; fetch the
+        // bytes directly from it (a bucket without a CORS grant for the app
+        // origin blocks this read → caught below → download-card fallback). The
+        // backend strategy streams the bytes here, so this is a no-op for it.
+        const presignedUrl = await readPresignedUrlEnvelope(response);
+        const bytesResponse = presignedUrl
+          ? await fetch(presignedUrl)
+          : response;
+        if (!bytesResponse.ok) throw new Error('bytes fetch failed');
+
         if (mode === 'image') {
-          const blob = await response.blob();
+          const blob = await bytesResponse.blob();
           if (cancelled) return;
           revoke();
           const url = URL.createObjectURL(blob);
@@ -64,7 +75,7 @@ export function useArtifactBytes(
         }
 
         // html / svg / text families render as a (bounded) string.
-        const blob = await response.blob();
+        const blob = await bytesResponse.blob();
         if (cancelled) return;
         if (blob.size > MAX_INLINE_TEXT_BYTES) throw new Error('too large');
         const text = await blob.text();

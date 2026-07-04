@@ -57,7 +57,21 @@ class ArtifactsRepository:
         preview_text: Optional[str] = None,
         produced_by: Any = None,
     ) -> dict:
-        """Create the identity row and its version 1 atomically; return the artifact dict."""
+        """Create the identity row and its version 1 atomically; return the artifact dict.
+
+        When a parent is given, a STABLE per-parent ``ref_seq`` (max existing + 1) is
+        computed BEFORE the insert and stored into ``metadata`` so the short ``A{n}`` ref
+        the model receives survives later deletions. See ``next_ref_seq`` for the (benign)
+        concurrent-create dup caveat.
+        """
+        metadata_payload = metadata
+        if conversation_id is not None or workflow_run_id is not None:
+            ref_seq = self.next_ref_seq(
+                conversation_id=conversation_id, workflow_run_id=workflow_run_id
+            )
+            merged = dict(metadata) if isinstance(metadata, dict) else {}
+            merged["ref_seq"] = ref_seq
+            metadata_payload = merged
         artifact = self._conn.execute(
             text(
                 """
@@ -84,7 +98,7 @@ class ArtifactsRepository:
                 "message_id": message_id,
                 "kind": kind,
                 "title": title,
-                "metadata": json.dumps(metadata) if metadata is not None else None,
+                "metadata": json.dumps(metadata_payload) if metadata_payload is not None else None,
             },
         ).fetchone()
         artifact_dict = _artifact_to_dict(artifact)
@@ -268,6 +282,61 @@ class ArtifactsRepository:
             text(
                 f"SELECT id FROM artifacts WHERE {' AND '.join(clauses)} "
                 f"ORDER BY created_at ASC, id ASC OFFSET :offset LIMIT 1"
+            ),
+            params,
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def next_ref_seq(
+        self,
+        *,
+        conversation_id: Optional[str] = None,
+        workflow_run_id: Optional[str] = None,
+    ) -> int:
+        """Return the next stable ``ref_seq`` for a parent (max stored + 1; 1 when empty).
+
+        Caveat: two concurrent creates in one parent can read the same MAX and get a
+        duplicate ``ref_seq`` (creates within a parent are normally serial from one agent
+        turn); a dup resolves to the earliest — acceptable, and strictly better than the
+        re-point bug. A DB unique index is a possible future hardening (no migration here).
+        """
+        if conversation_id is None and workflow_run_id is None:
+            raise ValueError("next_ref_seq requires conversation_id or workflow_run_id")
+        clauses, params = self._parent_clauses(conversation_id, workflow_run_id)
+        # Guard the cast: legacy rows have no ``ref_seq`` (NULL, ignored), and the regex
+        # match keeps any non-numeric value from erroring the cast.
+        row = self._conn.execute(
+            text(
+                "SELECT COALESCE(MAX(CASE WHEN metadata ->> 'ref_seq' ~ '^[0-9]+$' "
+                "THEN (metadata ->> 'ref_seq')::int END), 0) + 1 "
+                f"FROM artifacts WHERE {' AND '.join(clauses)}"
+            ),
+            params,
+        ).fetchone()
+        return int(row[0]) if row is not None else 1
+
+    def resolve_id_by_ref_seq(
+        self,
+        seq: int,
+        *,
+        conversation_id: Optional[str] = None,
+        workflow_run_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the id of the artifact whose stored ``ref_seq`` == ``seq`` in a parent, or None.
+
+        Earliest ``created_at`` wins on the rare concurrent-create tie (see ``next_ref_seq``).
+        """
+        if conversation_id is None and workflow_run_id is None:
+            raise ValueError("resolve_id_by_ref_seq requires conversation_id or workflow_run_id")
+        if not isinstance(seq, int) or seq < 1:
+            return None
+        clauses, params = self._parent_clauses(conversation_id, workflow_run_id)
+        params["seq"] = str(seq)
+        row = self._conn.execute(
+            text(
+                f"SELECT id FROM artifacts WHERE {' AND '.join(clauses)} "
+                "AND metadata ->> 'ref_seq' = :seq "
+                "ORDER BY created_at ASC, id ASC LIMIT 1"
             ),
             params,
         ).fetchone()

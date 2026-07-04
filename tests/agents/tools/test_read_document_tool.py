@@ -302,3 +302,55 @@ def test_malformed_json_schema_rejected_before_enqueue(monkeypatch):
     )
     out = _tool().execute_action("read_document", input=_ART_ID, json_schema={"properties": {}}, persist=False)
     assert out["status"] == "error" and "invalid json_schema" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# Worker-context: parse INLINE inside a Celery worker; dispatch from the web
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+def test_dispatch_inline_when_in_worker(monkeypatch):
+    _stub_repo(monkeypatch, found=True, conv="conv-1", run=None)
+    # Inside a worker current_task is truthy -> parse inline, never enqueue (else the
+    # parsing queue self-deadlocks the worker that also serves it).
+    monkeypatch.setattr(rd, "current_task", object())
+
+    import application.api.user.tasks as tasks
+    monkeypatch.setattr(
+        tasks.parse_document, "apply_async",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not enqueue inside a worker")),
+    )
+
+    import application.worker as worker
+    called: Dict[str, Any] = {}
+
+    def _fake_run(artifact_id, parent, user_id, options):
+        called["args"] = (artifact_id, parent, user_id)
+        called["options"] = options
+        return {"status": "ok", "content": "inline", "truncated": False}
+
+    monkeypatch.setattr(worker, "run_parse_document", _fake_run)
+
+    out = _tool().execute_action("read_document", input=_ART_ID, persist=False)
+    assert out["status"] == "ok" and out["content"] == "inline"
+    # Same auth re-resolution + parent shape as the dispatch path.
+    assert called["args"] == (_ART_ID, {"conversation_id": "conv-1"}, "u-1")
+    assert called["options"]["persist"] is False
+
+
+@pytest.mark.unit
+def test_dispatch_enqueues_when_not_in_worker(monkeypatch):
+    _stub_repo(monkeypatch, found=True, conv="conv-1", run=None)
+    # Web process: current_task falsy -> dispatch to the parsing queue, never inline.
+    monkeypatch.setattr(rd, "current_task", None)
+    captured = _patch_task(monkeypatch, payload={"status": "ok", "content": "queued", "truncated": False})
+
+    import application.worker as worker
+    monkeypatch.setattr(
+        worker, "run_parse_document",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("web path must dispatch, not inline")),
+    )
+
+    out = _tool().execute_action("read_document", input=_ART_ID, persist=False)
+    assert out["status"] == "ok" and out["content"] == "queued"
+    assert captured["args"][0] == _ART_ID
+    assert captured["args"][1] == {"conversation_id": "conv-1"}

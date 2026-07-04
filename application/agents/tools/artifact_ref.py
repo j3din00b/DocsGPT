@@ -1,8 +1,11 @@
 """Virtual short artifact handles (``A1``, ``A2``, ...) the model can type to reference an artifact.
 
-A ref is NOT persisted: ``A{n}`` is the n-th artifact (1-based, created_at asc) within the
-caller's parent (``conversation_id`` or ``workflow_run_id``). Refs resolve only inside that
-parent, never cross-tenant; resolution still goes through the parent-scoped authz gate.
+A ref is NOT a stored column: ``A{n}`` is the artifact's STABLE per-parent ``ref_seq``, assigned at
+creation and kept in the artifact's ``metadata``, so deleting an earlier artifact no longer
+re-points a later ref the model already holds. Artifacts created before ``ref_seq`` existed have
+none, so resolution falls back to the legacy positional (n-th by created_at) lookup. Refs resolve
+only inside the caller's parent (``conversation_id`` or ``workflow_run_id``), never cross-tenant;
+resolution still goes through the parent-scoped authz gate.
 """
 
 from __future__ import annotations
@@ -41,6 +44,19 @@ def resolve_artifact_id(
     """Resolve a short ref or a uuid to an artifact id, scoped to the caller's parent; None otherwise."""
     position = parse_ref(raw)
     if position is not None:
+        # A ref is the artifact's stable per-parent ``ref_seq``: resolve by it first so a
+        # deletion of an earlier artifact never re-points this ref. Legacy rows (created
+        # before ref_seq) and repos without the newer method fall back to the positional
+        # (n-th by created_at) lookup.
+        by_seq = getattr(repo, "resolve_id_by_ref_seq", None)
+        if callable(by_seq):
+            resolved = by_seq(
+                position,
+                conversation_id=conversation_id,
+                workflow_run_id=workflow_run_id,
+            )
+            if resolved is not None:
+                return resolved
         return repo.artifact_id_at_position(
             position,
             conversation_id=conversation_id,

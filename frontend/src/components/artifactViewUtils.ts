@@ -258,14 +258,71 @@ export function filenameFromContentDisposition(
 }
 
 /**
- * Turn a fetched download Response into a browser file-save, honoring
- * `Content-Disposition` when present. Returns false if the response is not OK.
+ * Detect the `URL_STRATEGY=s3` presigned-URL envelope and return its `url`, or
+ * null when the response is a byte stream (`URL_STRATEGY=backend`). The download
+ * endpoint returns `{ success: true, url }` as JSON only when asked via
+ * `?disposition=url`; a plain byte stream (even a JSON artifact's own bytes)
+ * carries the file's own content-type and never this exact shape. The response
+ * is `clone()`d before reading so the caller can still consume the original body
+ * as bytes when this is not the envelope. The `url` must be an absolute http(s)
+ * URL to further guard against a JSON artifact coincidentally matching.
+ */
+export async function readPresignedUrlEnvelope(
+  response: Response,
+): Promise<string | null> {
+  const contentType = response.headers.get('Content-Type') ?? '';
+  if (!contentType.toLowerCase().includes('application/json')) return null;
+  const data = await response
+    .clone()
+    .json()
+    .catch(() => null);
+  if (
+    data &&
+    typeof data === 'object' &&
+    (data as { success?: unknown }).success === true &&
+    typeof (data as { url?: unknown }).url === 'string' &&
+    /^https?:\/\//i.test((data as { url: string }).url)
+  ) {
+    return (data as { url: string }).url;
+  }
+  return null;
+}
+
+/** Trigger a top-level browser navigation to `url` (opens a new tab). */
+function triggerUrlNavigation(url: string, fallbackName: string): void {
+  const link = document.createElement('a');
+  link.href = url;
+  // `download` is ignored for cross-origin URLs, so the object's own
+  // Content-Disposition drives the save; open a new tab so the app isn't
+  // navigated away if the object renders inline.
+  link.download = fallbackName;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+/**
+ * Turn a fetched download Response into a browser file-save. Supports both URL
+ * strategies from a single call: the s3 strategy returns a presigned-URL JSON
+ * envelope (fetching its bytes cross-origin would be CORS-blocked, so navigate
+ * to it top-level), while the backend strategy streams the bytes (saved via a
+ * blob URL, honoring `Content-Disposition`). Returns false if the response is
+ * not OK, or is a malformed JSON envelope with no usable url.
  */
 export async function triggerResponseDownload(
   response: Response,
   fallbackName: string,
 ): Promise<boolean> {
   if (!response.ok) return false;
+
+  const presignedUrl = await readPresignedUrlEnvelope(response);
+  if (presignedUrl) {
+    triggerUrlNavigation(presignedUrl, fallbackName);
+    return true;
+  }
+
   const name =
     filenameFromContentDisposition(
       response.headers.get('Content-Disposition'),

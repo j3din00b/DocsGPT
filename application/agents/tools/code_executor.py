@@ -20,6 +20,7 @@ from application.sandbox.artifacts_capture import (
     infer_mime as _infer_mime,
     kind_for_mime as _kind_for_mime,
     snapshot_signatures,
+    unique_input_path,
 )
 from application.sandbox.base import ExecResult
 from application.sandbox.sandbox_creator import SandboxCreator
@@ -224,6 +225,9 @@ class CodeExecutorTool(Tool):
         if not inputs:
             return {"loaded": loaded}
         storage = StorageCreator.get_storage()
+        # Two inputs whose current versions share a filename would clobber each other at
+        # the same ``inputs/{name}`` path; track used paths and disambiguate deterministically.
+        used_paths: set = set()
         for raw_id in inputs:
             raw = str(raw_id).strip()
             if not raw:
@@ -295,12 +299,13 @@ class CodeExecutorTool(Tool):
                 return {"error": f"failed to read input artifact {artifact_id}."}
             if max_bytes and len(data) > max_bytes:
                 return {"error": f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."}
+            rel_path = unique_input_path(f"inputs/{filename}", used_paths)
             try:
-                manager.put_file(session_id, f"inputs/{filename}", data)
+                manager.put_file(session_id, rel_path, data)
             except Exception:
                 logger.exception("code_executor: put_file failed for input artifact")
                 return {"error": f"failed to stage input artifact {artifact_id} into the workspace."}
-            loaded.append(f"inputs/{filename}")
+            loaded.append(rel_path)
         return {"loaded": loaded}
 
     def _bridge_chat_attachment(self, raw: str) -> Any:

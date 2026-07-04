@@ -345,6 +345,16 @@ class WorkflowEngine:
         has_structured_response = False
         first_chunk = True
         for event in node_agent.gen(formatted_prompt):
+            # A tool that pauses for approval makes the LLM handler yield
+            # ``tool_calls_pending`` and end. An ephemeral node agent has no resume path,
+            # so silently continuing would leave the node with empty output (or a confusing
+            # "Structured output was expected" when it has a json_schema). Fail visibly.
+            if event.get("type") == "tool_calls_pending":
+                raise ValueError(
+                    f'Node "{node.title}" uses a tool that requires approval, which is not '
+                    "supported inside a workflow. Disable require_approval for tools used in "
+                    "workflow nodes."
+                )
             if "answer" in event:
                 chunk = str(event["answer"])
                 full_response_parts.append(chunk)
@@ -496,6 +506,7 @@ class WorkflowEngine:
         """Stage referenced input artifacts (run-scoped, never cross-tenant) into the workspace."""
         from application.agents.tools.artifact_ref import resolve_artifact_id
         from application.core.settings import settings
+        from application.sandbox.artifacts_capture import unique_input_path
         from application.storage.db.repositories.artifacts import ArtifactsRepository
         from application.storage.db.session import db_readonly
         from application.storage.storage_creator import StorageCreator
@@ -507,6 +518,9 @@ class WorkflowEngine:
             return loaded
         max_bytes = int(getattr(settings, "SANDBOX_MAX_INPUT_BYTES", 0) or 0)
         storage = StorageCreator.get_storage()
+        # Two inputs whose current versions share a filename would clobber each other at the
+        # same ``inputs/{name}`` path; track used paths and disambiguate deterministically.
+        used_paths: set = set()
         for raw in raw_ids:
             with db_readonly() as conn:
                 repo = ArtifactsRepository(conn)
@@ -541,8 +555,9 @@ class WorkflowEngine:
                 raise ValueError(
                     f"input artifact {artifact_id} exceeds the {max_bytes}-byte sandbox input limit."
                 )
-            manager.put_file(session_id, f"inputs/{filename}", data)
-            loaded.append(f"inputs/{filename}")
+            rel_path = unique_input_path(f"inputs/{filename}", used_paths)
+            manager.put_file(session_id, rel_path, data)
+            loaded.append(rel_path)
         return loaded
 
     def _materialize_node_attachments(

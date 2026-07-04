@@ -40,8 +40,25 @@ spec:
   egress:
     # DNS to cluster resolvers (kube-dns). Restricted to UDP/TCP 53 so the
     # broad-egress rule below does not need to whitelist the resolver IP.
+    # Kept for clusters WITHOUT NodeLocal DNSCache, where the resolver is a pod.
     - to:
         - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # NodeLocal DNSCache: on clusters running it, the stub resolver is a
+    # link-local IP (commonly 169.254.20.10), NOT a pod, and it sits inside the
+    # 169.254.0.0/16 range carved out of the broad-egress rule below -- so
+    # without this explicit allow ALL DNS is dropped and every hostname lookup
+    # (pip install, public APIs) times out. NetworkPolicy rules are
+    # additive-allow, so this narrowly re-permits port 53 to that one IP.
+    # Operators whose NodeLocal DNSCache uses a different link-local IP must
+    # adjust this cidr.
+    - to:
+        - ipBlock:
+            cidr: 169.254.20.10/32   # NodeLocal DNSCache link-local resolver
       ports:
         - protocol: UDP
           port: 53

@@ -88,27 +88,33 @@ describe('stripAgentPrefix', () => {
 });
 
 describe('toDocumentVariableOptions', () => {
-  const make = (templatePath: string): WorkflowVariable => ({
+  const make = (
+    templatePath: string,
+    producesArtifact = false,
+  ): WorkflowVariable => ({
     label: templatePath,
     templatePath,
     section: 'x',
+    producesArtifact,
   });
 
-  it('keeps input_documents and upstream outputs as bare names', () => {
+  it('offers only artifact-producing variables (input_documents, code outputs)', () => {
     const options = toDocumentVariableOptions([
-      make('agent.input_documents'),
-      make('agent.wire_doc'),
-      make("agent['weird name']"),
+      make('agent.input_documents', true),
+      make('agent.node_code1_output', true),
+      make("agent['weird name']", true),
     ]);
     expect(options).toEqual([
       { value: 'input_documents', label: 'input_documents' },
-      { value: 'wire_doc', label: 'wire_doc' },
+      { value: 'node_code1_output', label: 'node_code1_output' },
       { value: 'weird name', label: 'weird name' },
     ]);
   });
 
-  it('excludes query, chat_history and global context variables', () => {
+  it('excludes plain agent/state TEXT outputs that are not artifact refs', () => {
     const options = toDocumentVariableOptions([
+      make('agent.node_agent1_output'),
+      make('agent.some_state_var'),
       make('agent.query'),
       make('agent.chat_history'),
       make('source.content'),
@@ -120,8 +126,8 @@ describe('toDocumentVariableOptions', () => {
 
   it('deduplicates by bare name', () => {
     const options = toDocumentVariableOptions([
-      make('agent.wire_doc'),
-      make('agent.wire_doc'),
+      make('agent.wire_doc', true),
+      make('agent.wire_doc', true),
     ]);
     expect(options).toEqual([{ value: 'wire_doc', label: 'wire_doc' }]);
   });

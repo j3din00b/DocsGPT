@@ -279,6 +279,7 @@ export default function DocumentArtifactView({
         artifact.id,
         token,
         selectedVersion,
+        'url',
       );
       const ok = await triggerResponseDownload(response, filename);
       if (!ok && isMountedRef.current) setActionError('Download failed');

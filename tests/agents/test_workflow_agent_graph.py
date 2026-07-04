@@ -7,7 +7,10 @@ against the ephemeral ``pg_conn`` fixture. Agent construction is bypassed via
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 
@@ -334,3 +337,48 @@ class TestGen:
         assert results == [
             {"type": "error", "error": "Failed to load workflow configuration."}
         ]
+
+
+class TestAgentNodeApprovalPause:
+    """A node agent whose tool pauses for approval must fail the node visibly, not emit empty output."""
+
+    def test_tool_calls_pending_raises_clear_error(self, monkeypatch):
+        from application.agents.workflows import workflow_engine as we
+        from application.agents.workflows.schemas import (
+            NodeType,
+            Workflow,
+            WorkflowGraph,
+            WorkflowNode,
+        )
+        from application.agents.workflows.workflow_engine import WorkflowEngine
+
+        # An ephemeral node agent whose LLM handler yields the pause signal and ends,
+        # emitting no "answer". Previously the engine dropped it and the node completed
+        # with empty output (or raised a confusing "Structured output was expected").
+        class _PendingAgent:
+            attachments = None
+
+            def gen(self, prompt):
+                yield {"type": "tool_calls_pending", "data": {"pending_tool_calls": [{"id": "x"}]}}
+
+        monkeypatch.setattr(
+            we.WorkflowNodeAgentFactory, "create", lambda **kw: _PendingAgent()
+        )
+
+        graph = WorkflowGraph(workflow=Workflow(name="Approval Pause"), nodes=[], edges=[])
+        agent = SimpleNamespace(
+            endpoint="stream", llm_name="openai", model_id="gpt-4o-mini", api_key="k",
+            chat_history=[], user="u", decoded_token={"sub": "u"},
+        )
+        engine = WorkflowEngine(
+            graph, agent, workflow_run_id="22222222-2222-2222-2222-222222222222"
+        )
+
+        node = WorkflowNode(
+            id="agent_1", workflow_id="wf-1", type=NodeType.AGENT, title="Extractor",
+            position={"x": 0, "y": 0},
+            config={"llm_name": "openai", "system_prompt": "s", "tools": ["t"]},
+        )
+
+        with pytest.raises(ValueError, match="requires approval"):
+            list(engine._execute_agent_node(node))

@@ -206,3 +206,61 @@ def test_result_payload_chunks_are_bounded(monkeypatch):
     assert out["total_chunks"] == dr._MAX_CHUNKS_RETURNED * 3
     assert all("...[truncated" in c for c in out["chunks"])
     assert all(len(c) < len(huge_chunk) for c in out["chunks"])
+
+
+def _capture_persist(monkeypatch):
+    """Patch persist_new_artifact to record what would be stored; return the capture dict."""
+    import application.sandbox.artifacts_capture as ac
+
+    captured: Dict[str, Any] = {}
+
+    def _fake_persist(**kwargs):
+        captured.update(kwargs)
+        return {"artifact_id": "new-art", "version": 1, "filename": "x.json",
+                "mime_type": "application/json", "size": len(kwargs.get("data", b""))}
+
+    monkeypatch.setattr(ac, "persist_new_artifact", _fake_persist)
+    return captured
+
+
+@pytest.mark.unit
+def test_persist_keeps_full_content_while_view_is_bounded(monkeypatch):
+    # A >8000-byte doc: the persisted artifact must keep the FULL text, while the returned
+    # (Redis/LLM) view is head+tail windowed.
+    import json
+
+    _patch_repo(monkeypatch, found=True, run="run-1")
+    big = "Z" * 12000
+    _patch_parse(monkeypatch, {"output": "markdown", "content": big, "truncated": False})
+    captured = _capture_persist(monkeypatch)
+
+    out = worker.parse_document_worker(
+        None, _ART_ID, {"workflow_run_id": "run-1"}, "u-1", {"output": "markdown", "persist": True}
+    )
+
+    persisted = json.loads(captured["data"].decode("utf-8"))
+    assert persisted["content"] == big  # FULL parse persisted
+    assert len(persisted["content"]) == 12000
+    assert len(out["content"]) < len(big)  # bounded view
+    assert "...[truncated" in out["content"]
+    assert out["truncated"] is True
+
+
+@pytest.mark.unit
+def test_persist_full_but_view_respects_max_chars(monkeypatch):
+    # max_chars bounds only the returned view; the persisted artifact stays full.
+    import json
+
+    _patch_repo(monkeypatch, found=True, run="run-1")
+    big = "Z" * 5000
+    _patch_parse(monkeypatch, {"output": "markdown", "content": big, "truncated": False})
+    captured = _capture_persist(monkeypatch)
+
+    out = worker.parse_document_worker(
+        None, _ART_ID, {"workflow_run_id": "run-1"}, "u-1",
+        {"output": "markdown", "persist": True, "max_chars": 100},
+    )
+
+    assert json.loads(captured["data"].decode("utf-8"))["content"] == big  # full persisted
+    assert len(out["content"]) == 100  # view capped by max_chars
+    assert out["truncated"] is True

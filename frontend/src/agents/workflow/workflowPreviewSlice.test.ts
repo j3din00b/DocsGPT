@@ -4,9 +4,12 @@ import { Attachment } from '../../upload/uploadSlice';
 import reducer, {
   addQuery,
   collectCompletedAttachmentIds,
+  collectRunAttachmentIds,
+  previewSendBlockReason,
   resetWorkflowPreview,
   setPreviewOpen,
   setWorkflowRunId,
+  UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
 } from './workflowPreviewSlice';
 
 const seedState = () => reducer(undefined, { type: '@@INIT' });
@@ -36,6 +39,40 @@ describe('collectCompletedAttachmentIds', () => {
       collectCompletedAttachmentIds([att({ id: '', status: 'completed' })]),
     ).toEqual([]);
     expect(collectCompletedAttachmentIds([])).toEqual([]);
+  });
+});
+
+describe('collectRunAttachmentIds', () => {
+  const completed = [att({ id: 'done', status: 'completed' })];
+
+  it('returns completed ids for a saved workflow', () => {
+    expect(collectRunAttachmentIds(completed, 'wf-1')).toEqual(['done']);
+  });
+
+  it('returns [] for an unsaved draft so uploads are neither sent nor cleared', () => {
+    expect(collectRunAttachmentIds(completed, null)).toEqual([]);
+    expect(collectRunAttachmentIds(completed, undefined)).toEqual([]);
+    expect(collectRunAttachmentIds(completed, '')).toEqual([]);
+  });
+});
+
+describe('previewSendBlockReason', () => {
+  it('blocks an unsaved draft that has completed attachments', () => {
+    expect(previewSendBlockReason(null, true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+    expect(previewSendBlockReason(undefined, true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+    expect(previewSendBlockReason('', true)).toBe(
+      UNSAVED_DRAFT_ATTACHMENTS_MESSAGE,
+    );
+  });
+
+  it('allows a saved workflow, or an unsaved draft with no attachments', () => {
+    expect(previewSendBlockReason('wf-1', true)).toBeNull();
+    expect(previewSendBlockReason('wf-1', false)).toBeNull();
+    expect(previewSendBlockReason(null, false)).toBeNull();
   });
 });
 

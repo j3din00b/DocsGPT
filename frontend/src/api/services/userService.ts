@@ -339,8 +339,16 @@ const userService = {
     artifactId: string,
     token: string | null,
     version?: number,
+    disposition?: 'url',
   ): Promise<Response> =>
-    apiClient.get(endpoints.USER.DOWNLOAD_ARTIFACT(artifactId, version), token),
+    apiClient.get(
+      endpoints.USER.DOWNLOAD_ARTIFACT(artifactId, version, disposition),
+      token,
+      // ?disposition=url asks the s3 strategy to return the presigned URL as
+      // JSON (for a top-level navigation) instead of a CORS-blocked 302; the
+      // Accept header is the same opt-in via content negotiation.
+      disposition === 'url' ? { Accept: 'application/json' } : {},
+    ),
   restoreArtifactVersion: (
     artifactId: string,
     version: number,

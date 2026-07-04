@@ -58,7 +58,10 @@ COPY kernel-launch.sh /opt/docsgpt/kernel-launch.sh
 RUN chmod 0555 /opt/docsgpt/kernel-launch.sh
 COPY kernels/docsgpt-python/kernel.json /usr/local/share/jupyter/kernels/docsgpt-python/kernel.json
 
-USER sandbox
+# Numeric UID (not the name) so a kubelet with `runAsNonRoot: true` can verify
+# the user is non-root without resolving /etc/passwd. This uid MUST match
+# `runAsUser` in deployment/k8s/deployments/sandbox-deploy.yaml.
+USER 10001
 WORKDIR /home/sandbox
 
 EXPOSE 8888
