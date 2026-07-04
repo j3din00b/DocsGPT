@@ -93,6 +93,14 @@ class SandboxManager:
             now = time.monotonic()
             if session is not None and session.ready:
                 session.last_access = now
+                # Reuse must honor an explicit longer keep-alive: a run_code
+                # persist/ttl on a session first opened by another tool (e.g.
+                # artifact_generator at the 60s exec timeout) would otherwise be
+                # dropped, and the kernel + its background state reaped early.
+                # Extend only (never shrink) so a default reuse can't cut short a
+                # session another caller kept alive.
+                if ttl is not None:
+                    session.ttl = max(session.ttl, self._clamp_ttl(ttl))
                 return session.handle
             reaped = self._reap_locked(now)
             if session is None:

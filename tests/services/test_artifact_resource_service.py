@@ -32,6 +32,9 @@ ART_BIN = "22222222-2222-4222-8222-222222222222"
 ART_FOREIGN = "33333333-3333-4333-8333-333333333333"
 # Owned by OWNER but produced by a DIFFERENT agent — must be invisible to owner-key.
 ART_OTHER_AGENT = "44444444-4444-4444-8444-444444444444"
+# In the owner's agent scope but from a shared-usage (widget/visitor) conversation
+# — must be invisible to the public MCP key (owner-only scope).
+ART_SHARED = "55555555-5555-4555-8555-555555555555"
 
 
 @contextmanager
@@ -63,16 +66,23 @@ class _FakeArtifacts:
     def __init__(self, conn):
         pass
 
-    def list_artifacts_for_agent(self, agent_id, user_id):
+    def list_artifacts_for_agent(self, agent_id, user_id, conversation_id=None, owner_only=False):
         return [
             a
             for a in self.artifacts.values()
-            if a.get("agent_id") == agent_id and a["user_id"] == user_id
+            if a.get("agent_id") == agent_id
+            and a["user_id"] == user_id
+            and (conversation_id is None or a.get("conversation_id") == conversation_id)
+            and not (owner_only and a.get("is_shared_usage"))
         ]
 
-    def artifact_in_agent_scope(self, artifact_id, agent_id):
+    def artifact_in_agent_scope(self, artifact_id, agent_id, owner_only=False):
         art = self.artifacts.get(artifact_id)
-        return art is not None and art.get("agent_id") == agent_id
+        return (
+            art is not None
+            and art.get("agent_id") == agent_id
+            and not (owner_only and art.get("is_shared_usage"))
+        )
 
     def get_artifact(self, artifact_id):
         return self.artifacts.get(artifact_id)
@@ -112,12 +122,22 @@ def _wire(monkeypatch):
             "title": "other-agent",
             "current_version": 1,
         },
+        ART_SHARED: {
+            "id": ART_SHARED,
+            "user_id": OWNER,
+            "agent_id": "agent-owner",
+            "kind": "data",
+            "title": "visitor-doc",
+            "current_version": 1,
+            "is_shared_usage": True,
+        },
     }
     _FakeArtifacts.versions = {
         (ART_TEXT, 2): {"mime_type": "text/csv", "storage_path": "k/text.csv", "preview_text": None},
         (ART_BIN, 1): {"mime_type": "image/png", "storage_path": "k/chart.png", "preview_text": None},
         (ART_FOREIGN, 1): {"mime_type": "text/plain", "storage_path": "k/secret.txt", "preview_text": None},
         (ART_OTHER_AGENT, 1): {"mime_type": "text/plain", "storage_path": "k/other.txt", "preview_text": None},
+        (ART_SHARED, 1): {"mime_type": "text/plain", "storage_path": "k/visitor.txt", "preview_text": None},
     }
     monkeypatch.setattr(svc, "db_readonly", _fake_conn)
     monkeypatch.setattr(svc, "AgentsRepository", _FakeAgents)
@@ -132,6 +152,13 @@ class TestListArtifactResources:
         uris = {str(r.uri) for r in out}
         assert uris == {f"artifact://{ART_TEXT}/v2", f"artifact://{ART_BIN}/v1"}
         assert f"artifact://{ART_FOREIGN}/v1" not in uris
+
+    def test_excludes_shared_usage_visitor_artifacts(self):
+        # The MCP Bearer key is embedded publicly in the widget and has no
+        # per-visitor conversation context, so shared-usage (visitor) artifacts
+        # must never be enumerated — only the owner's own-chat artifacts.
+        uris = {str(r.uri) for r in svc.list_artifact_resources("owner-key")}
+        assert f"artifact://{ART_SHARED}/v1" not in uris
 
     def test_unresolved_principal_is_empty(self):
         assert svc.list_artifact_resources("bogus-key") == []
@@ -184,6 +211,12 @@ class TestReadArtifactResource:
         # is scoped like its search and must NOT read the owner's other-agent corpus.
         with pytest.raises(svc.ResourceDenied):
             svc.read_artifact_resource("owner-key", f"artifact://{ART_OTHER_AGENT}/v1")
+
+    def test_read_denies_shared_usage_visitor_artifact(self):
+        # In the owner's agent scope but produced in a shared-usage (widget/visitor)
+        # conversation: the public MCP key must not read another visitor's artifact.
+        with pytest.raises(svc.ResourceDenied):
+            svc.read_artifact_resource("owner-key", f"artifact://{ART_SHARED}/v1")
 
     def test_foreign_owner_is_denied(self):
         with pytest.raises(svc.ResourceDenied):

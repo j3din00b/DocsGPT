@@ -120,6 +120,22 @@ def test_ttl_honored_when_below_max(backend):
     assert mgr.ttl_for("conv-1") == 120
 
 
+def test_reuse_extends_ttl_but_never_shrinks(backend):
+    # A tool (e.g. artifact_generator) may open the shared session at the short
+    # exec timeout; a later run_code(persist, ttl=...) reuses it and must be able
+    # to extend the keep-alive, or the kernel + background state are reaped early.
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1", ttl=60)
+    assert mgr.ttl_for("conv-1") == 60
+    mgr.open("conv-1", ttl=600)  # reuse: explicit longer ttl extends
+    assert mgr.ttl_for("conv-1") == 600
+    mgr.open("conv-1", ttl=120)  # reuse: shorter ttl must not shrink
+    assert mgr.ttl_for("conv-1") == 600
+    mgr.open("conv-1")  # reuse: default (ttl=None) leaves it untouched
+    assert mgr.ttl_for("conv-1") == 600
+    assert backend.open_calls == ["conv-1"]  # still opened only once
+
+
 def test_ttl_default_used_for_nonpositive(backend):
     mgr = SandboxManager(backend, max_ttl=300, default_ttl=200)
     mgr.open("conv-1", ttl=0)

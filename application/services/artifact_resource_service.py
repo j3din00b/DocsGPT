@@ -3,11 +3,13 @@
 The MCP server (``application/mcp_server.py``) authenticates a request with
 ``Authorization: Bearer <agent-api-key>``; that key resolves to the owning
 ``user_id`` via ``AgentsRepository.find_by_key`` (the same api_key->owner path
-as the HTTP artifact routes). Resources are scoped strictly to that principal:
-``resources/list`` returns only the principal's owned artifacts, and
-``resources/read`` re-checks ownership before serving any bytes. An
-unresolvable principal yields an empty list / a denied read -- never another
-principal's artifact.
+as the HTTP artifact routes). Resources are scoped strictly to that principal
+AND to the owner's own conversations: because the api_key is embedded publicly
+in the widget and MCP carries no per-visitor conversation context, shared-usage
+(widget/visitor) conversations are excluded. ``resources/list`` returns only the
+owner's own-chat artifacts, and ``resources/read`` re-checks ownership + owner
+scope before serving any bytes. An unresolvable principal yields an empty list /
+a denied read -- never another principal's or another visitor's artifact.
 
 ``resources/list`` returns FastMCP ``Resource`` objects so they pass straight
 through the server's list/dedupe/wire pipeline; ``resources/read`` is served by
@@ -133,13 +135,12 @@ def list_artifact_resources(api_key: Optional[str]) -> List[Resource]:
         return []
     try:
         with db_readonly() as conn:
-            # Known residual enumeration gap (tracked separately): unlike the HTTP
-            # artifact list route, MCP-over-key has no per-visitor conversation
-            # context, so this lists every artifact across the agent's
-            # conversations. Whether MCP-over-key should enumerate at all is a
-            # separate product decision; do not "fix" it by neutering the feature.
+            # MCP-over-key has no per-visitor conversation context, and the api_key
+            # is embedded publicly in the widget, so scope to the owner's OWN
+            # (non-shared-usage) conversations only. Without this, the key would
+            # enumerate artifacts from every visitor's conversation with the agent.
             rows = ArtifactsRepository(conn).list_artifacts_for_agent(
-                str(agent["id"]), str(agent["user_id"])
+                str(agent["id"]), str(agent["user_id"]), owner_only=True
             )
     except Exception:
         logger.exception("artifact resource: list failed")
@@ -209,7 +210,10 @@ def read_artifact_resource(api_key: Optional[str], uri: str) -> ArtifactReadResu
                 raise ResourceDenied("forbidden")
             # Agent scope is the second: a per-agent key only reads artifacts from
             # its own conversations, not the owner's other agents / workflow runs.
-            if not repo.artifact_in_agent_scope(artifact_id, agent_id):
+            # ``owner_only`` further excludes shared-usage (widget/visitor)
+            # conversations: the public key reads the owner's own chats only, never
+            # another visitor's artifact (parity with the HTTP route's confinement).
+            if not repo.artifact_in_agent_scope(artifact_id, agent_id, owner_only=True):
                 raise ResourceDenied("forbidden")
             version_row = repo.get_version(artifact_id, version)
     except (DataError, DBAPIError) as exc:

@@ -13,11 +13,14 @@ only metadata + the ``BaseStorage`` key are stored here, never binary bytes.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from sqlalchemy import Connection, text
 
 from application.storage.db.base_repository import row_to_dict
+
+logger = logging.getLogger(__name__)
 
 
 def _artifact_to_dict(row: Any) -> dict:
@@ -199,20 +202,29 @@ class ArtifactsRepository:
         return [_artifact_to_dict(r) for r in result.fetchall()]
 
     def list_artifacts_for_agent(
-        self, agent_id: str, user_id: str, conversation_id: Optional[str] = None
+        self,
+        agent_id: str,
+        user_id: str,
+        conversation_id: Optional[str] = None,
+        owner_only: bool = False,
     ) -> list[dict]:
         """List an agent's artifacts (owner-scoped), optionally narrowed to one conversation.
 
         Scopes a per-agent api-key's artifact visibility to the conversations that
         agent produced, so the key cannot enumerate the owner's whole corpus. When
         ``conversation_id`` is given, the SQL narrows to that single conversation
-        (the per-visitor bearer capability for a public widget key).
+        (the per-visitor bearer capability for a public widget key). When
+        ``owner_only`` is set, shared-usage (widget/visitor) conversations are
+        excluded so a credential with no per-visitor conversation context (the MCP
+        Bearer key) sees only the owner's own chats, never other visitors' artifacts.
         """
         clauses = ["c.agent_id = CAST(:agent_id AS uuid)", "a.user_id = :user_id"]
         params: dict[str, Any] = {"agent_id": str(agent_id), "user_id": user_id}
         if conversation_id is not None:
             clauses.append("a.conversation_id = CAST(:conversation_id AS uuid)")
             params["conversation_id"] = conversation_id
+        if owner_only:
+            clauses.append("c.is_shared_usage = false")
         result = self._conn.execute(
             text(
                 "SELECT a.* FROM artifacts a "
@@ -224,13 +236,26 @@ class ArtifactsRepository:
         )
         return [_artifact_to_dict(r) for r in result.fetchall()]
 
-    def artifact_in_agent_scope(self, artifact_id: str, agent_id: str) -> bool:
-        """True if ``artifact_id``'s parent conversation belongs to ``agent_id``."""
+    def artifact_in_agent_scope(
+        self, artifact_id: str, agent_id: str, owner_only: bool = False
+    ) -> bool:
+        """True if ``artifact_id``'s parent conversation belongs to ``agent_id``.
+
+        With ``owner_only`` set, shared-usage (widget/visitor) conversations are
+        excluded so a per-visitor-less credential (the MCP Bearer key) can only
+        confirm scope for the owner's own chats, never another visitor's artifact.
+        """
+        clauses = [
+            "a.id = CAST(:id AS uuid)",
+            "c.agent_id = CAST(:agent_id AS uuid)",
+        ]
+        if owner_only:
+            clauses.append("c.is_shared_usage = false")
         result = self._conn.execute(
             text(
                 "SELECT 1 FROM artifacts a "
                 "JOIN conversations c ON a.conversation_id = c.id "
-                "WHERE a.id = CAST(:id AS uuid) AND c.agent_id = CAST(:agent_id AS uuid) "
+                f"WHERE {' AND '.join(clauses)} "
                 "LIMIT 1"
             ),
             {"id": artifact_id, "agent_id": str(agent_id)},
@@ -444,6 +469,55 @@ class ArtifactsRepository:
             {"user_id": user_id},
         )
         return result.rowcount
+
+    def storage_paths_for_workflow(self, workflow_id: str) -> list[str]:
+        """Return every stored version path for artifacts under a workflow's runs (for byte cleanup)."""
+        result = self._conn.execute(
+            text(
+                "SELECT v.storage_path FROM artifact_versions v "
+                "JOIN artifacts a ON a.id = v.artifact_id "
+                "JOIN workflow_runs r ON r.id = a.workflow_run_id "
+                "WHERE r.workflow_id = CAST(:wid AS uuid) "
+                "AND v.storage_path IS NOT NULL"
+            ),
+            {"wid": workflow_id},
+        )
+        return [r[0] for r in result.fetchall()]
+
+    def delete_for_workflow(self, workflow_id: str) -> int:
+        """Delete all artifacts (+ versions, via cascade) parented to a workflow's runs.
+
+        ``artifacts.workflow_run_id`` is a bare uuid column (no FK), so deleting the
+        workflow (which cascade-deletes its ``workflow_runs``) does NOT reap these
+        rows -- callers invoke this to reclaim the rows + their quota. Must run
+        BEFORE the workflow delete, while the run rows still resolve the subquery.
+        """
+        result = self._conn.execute(
+            text(
+                "DELETE FROM artifacts WHERE workflow_run_id IN "
+                "(SELECT id FROM workflow_runs WHERE workflow_id = CAST(:wid AS uuid))"
+            ),
+            {"wid": workflow_id},
+        )
+        return result.rowcount
+
+    @staticmethod
+    def reap_storage(paths: list) -> None:
+        """Best-effort delete a batch of artifact byte objects; never raises."""
+        if not paths:
+            return
+        try:
+            from application.storage.storage_creator import StorageCreator
+
+            storage = StorageCreator.get_storage()
+        except Exception:
+            logger.warning("artifact cleanup: storage unavailable", exc_info=True)
+            return
+        for path in paths:
+            try:
+                storage.delete_file(path)
+            except Exception:
+                logger.warning("artifact cleanup: failed to delete bytes %s", path, exc_info=True)
 
     def get_version(self, artifact_id: str, version: int) -> Optional[dict]:
         """Fetch a single version row by artifact id and version number."""
