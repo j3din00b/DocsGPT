@@ -582,30 +582,49 @@ function WorkflowBuilderInner() {
     [],
   );
 
+  const deleteNodesAndEdges = useCallback(
+    (nodesToDelete: Node[], edgesToDelete: Edge[]) => {
+      const removableIds = new Set(
+        nodesToDelete.filter((n) => n.type !== 'start').map((n) => n.id),
+      );
+      const edgeIdsToDelete = new Set(edgesToDelete.map((e) => e.id));
+      if (removableIds.size === 0 && edgeIdsToDelete.size === 0) return;
+
+      takeSnapshot();
+      setNodes((nds) => nds.filter((n) => !removableIds.has(n.id)));
+      setEdges((eds) =>
+        eds.filter(
+          (e) =>
+            !edgeIdsToDelete.has(e.id) &&
+            !removableIds.has(e.source) &&
+            !removableIds.has(e.target),
+        ),
+      );
+      const dropRemoved = <T,>(prev: Record<string, T>): Record<string, T> => {
+        const next = { ...prev };
+        let changed = false;
+        removableIds.forEach((id) => {
+          if (id in next) {
+            delete next[id];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      };
+      setAgentJsonSchemaDrafts(dropRemoved);
+      setAgentJsonSchemaErrors(dropRemoved);
+      if (selectedNode && removableIds.has(selectedNode.id)) {
+        setSelectedNode(null);
+        setShowNodeConfig(false);
+      }
+    },
+    [selectedNode, takeSnapshot],
+  );
+
   const handleDeleteNode = useCallback(() => {
-    if (!selectedNode || selectedNode.type === 'start') return;
-    takeSnapshot();
-    setNodes((nds) => nds.filter((n) => n.id !== selectedNode.id));
-    setEdges((eds) =>
-      eds.filter(
-        (e) => e.source !== selectedNode.id && e.target !== selectedNode.id,
-      ),
-    );
-    setAgentJsonSchemaDrafts((prev) => {
-      if (!(selectedNode.id in prev)) return prev;
-      const next = { ...prev };
-      delete next[selectedNode.id];
-      return next;
-    });
-    setAgentJsonSchemaErrors((prev) => {
-      if (!(selectedNode.id in prev)) return prev;
-      const next = { ...prev };
-      delete next[selectedNode.id];
-      return next;
-    });
-    setSelectedNode(null);
-    setShowNodeConfig(false);
-  }, [selectedNode, takeSnapshot]);
+    if (!selectedNode) return;
+    deleteNodesAndEdges([selectedNode], []);
+  }, [selectedNode, deleteNodesAndEdges]);
 
   const handleUpdateNodeData = useCallback(
     (data: Record<string, unknown>, options?: { snapshot?: boolean }) => {
@@ -741,8 +760,12 @@ function WorkflowBuilderInner() {
           return;
         }
       }
-      if (e.key === 'Delete' && selectedNode && !isEditable) {
-        handleDeleteNode();
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !isEditable) {
+        e.preventDefault();
+        deleteNodesAndEdges(
+          nodes.filter((n) => n.selected || n.id === selectedNode?.id),
+          edges.filter((edge) => edge.selected),
+        );
       }
       if (e.key === 'Escape') {
         setShowNodeConfig(false);
@@ -751,7 +774,7 @@ function WorkflowBuilderInner() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedNode, handleDeleteNode, undo, redo]);
+  }, [nodes, edges, selectedNode, deleteNodesAndEdges, undo, redo]);
 
   const handlePanelBackdropClick = useCallback(() => {
     setShowNodeConfig(false);
@@ -1817,11 +1840,9 @@ function WorkflowBuilderInner() {
               onNodeClick={handleNodeClick}
               onNodeDragStart={snapshotBeforeCanvasChange}
               onSelectionDragStart={snapshotBeforeCanvasChange}
-              onNodesDelete={snapshotBeforeCanvasChange}
-              onEdgesDelete={snapshotBeforeCanvasChange}
               nodeTypes={nodeTypes}
               nodeDragThreshold={1}
-              deleteKeyCode={['Backspace', 'Delete']}
+              deleteKeyCode={null}
               fitView
             >
               <Background />
