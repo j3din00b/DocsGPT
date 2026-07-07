@@ -11,8 +11,10 @@ import {
   Pencil,
   Play,
   Plus,
+  Redo2,
   StickyNote,
   Trash2,
+  Undo2,
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -31,6 +33,7 @@ import ReactFlow, {
   Node,
   NodeChange,
   NodeTypes,
+  Panel,
   ReactFlowProvider,
   useReactFlow,
 } from 'reactflow';
@@ -66,6 +69,7 @@ import { Agent } from '../types';
 import { ConditionCase, WorkflowNode } from '../types/workflow';
 import MobileBlocker from './components/MobileBlocker';
 import PromptTextArea from './components/PromptTextArea';
+import { useUndoRedo, WorkflowSnapshot } from './hooks/useUndoRedo';
 import {
   AgentNode,
   ConditionNode,
@@ -114,6 +118,13 @@ function validateJsonSchemaConfig(schema: unknown): string | null {
   }
 
   return null;
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
 }
 
 function createEmptyWorkflowAgent(): Agent {
@@ -390,6 +401,36 @@ function WorkflowBuilderInner() {
   const [nodes, setNodes] = useState<Node[]>(initialNodes);
   const [edges, setEdges] = useState<Edge[]>([]);
 
+  const handleHistoryRestore = useCallback(
+    (snapshot: WorkflowSnapshot) => {
+      setAgentJsonSchemaDrafts({});
+      setAgentJsonSchemaErrors({});
+      if (!selectedNode) return;
+      const restoredNode = snapshot.nodes.find((n) => n.id === selectedNode.id);
+      if (restoredNode) {
+        setSelectedNode(restoredNode);
+      } else {
+        setSelectedNode(null);
+        setShowNodeConfig(false);
+      }
+    },
+    [selectedNode],
+  );
+
+  const { takeSnapshot, undo, redo, clearHistory, canUndo, canRedo } =
+    useUndoRedo({
+      nodes,
+      edges,
+      setNodes,
+      setEdges,
+      onRestore: handleHistoryRestore,
+    });
+
+  const snapshotBeforeCanvasChange = useCallback(
+    () => takeSnapshot(),
+    [takeSnapshot],
+  );
+
   const onNodesChange = useCallback(
     (changes: NodeChange[]) =>
       setNodes((nds) => applyNodeChanges(changes, nds)),
@@ -404,19 +445,21 @@ function WorkflowBuilderInner() {
 
   const onConnect = useCallback(
     (params: Connection) => {
+      const exists = edges.some(
+        (e) =>
+          e.source === params.source &&
+          e.sourceHandle === params.sourceHandle &&
+          e.target === params.target &&
+          e.targetHandle === params.targetHandle,
+      );
+      if (exists) return;
+
+      takeSnapshot();
+
+      const targetNode = nodes.find((n) => n.id === params.target);
+      const isEndNode = targetNode?.type === 'end';
+
       setEdges((eds) => {
-        const exists = eds.some(
-          (e) =>
-            e.source === params.source &&
-            e.sourceHandle === params.sourceHandle &&
-            e.target === params.target &&
-            e.targetHandle === params.targetHandle,
-        );
-        if (exists) return eds;
-
-        const targetNode = nodes.find((n) => n.id === params.target);
-        const isEndNode = targetNode?.type === 'end';
-
         const filtered = eds.filter(
           (e) =>
             !(
@@ -433,12 +476,16 @@ function WorkflowBuilderInner() {
         return addEdge(params, filtered);
       });
     },
-    [nodes],
+    [nodes, edges, takeSnapshot],
   );
 
-  const onEdgeClick = useCallback((_event: React.MouseEvent, edge: Edge) => {
-    setEdges((eds) => eds.filter((e) => e.id !== edge.id));
-  }, []);
+  const onEdgeClick = useCallback(
+    (_event: React.MouseEvent, edge: Edge) => {
+      takeSnapshot();
+      setEdges((eds) => eds.filter((e) => e.id !== edge.id));
+    },
+    [takeSnapshot],
+  );
 
   const handleNodeDragStart = useCallback(
     (e: React.DragEvent, nodeType: string) => {
@@ -473,6 +520,8 @@ function WorkflowBuilderInner() {
 
       const type = event.dataTransfer.getData('application/reactflow');
       if (!type) return;
+
+      takeSnapshot();
 
       const position = reactFlowInstance.screenToFlowPosition({
         x: event.clientX,
@@ -522,7 +571,7 @@ function WorkflowBuilderInner() {
 
       setNodes((nds) => nds.concat(baseNode));
     },
-    [reactFlowInstance, availableModels, defaultAgentModelId],
+    [reactFlowInstance, availableModels, defaultAgentModelId, takeSnapshot],
   );
 
   const handleNodeClick = useCallback(
@@ -533,33 +582,57 @@ function WorkflowBuilderInner() {
     [],
   );
 
+  const deleteNodesAndEdges = useCallback(
+    (nodesToDelete: Node[], edgesToDelete: Edge[]) => {
+      const removableIds = new Set(
+        nodesToDelete.filter((n) => n.type !== 'start').map((n) => n.id),
+      );
+      const edgeIdsToDelete = new Set(edgesToDelete.map((e) => e.id));
+      if (removableIds.size === 0 && edgeIdsToDelete.size === 0) return;
+
+      takeSnapshot();
+      setNodes((nds) => nds.filter((n) => !removableIds.has(n.id)));
+      setEdges((eds) =>
+        eds.filter(
+          (e) =>
+            !edgeIdsToDelete.has(e.id) &&
+            !removableIds.has(e.source) &&
+            !removableIds.has(e.target),
+        ),
+      );
+      const dropRemoved = <T,>(prev: Record<string, T>): Record<string, T> => {
+        const next = { ...prev };
+        let changed = false;
+        removableIds.forEach((id) => {
+          if (id in next) {
+            delete next[id];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      };
+      setAgentJsonSchemaDrafts(dropRemoved);
+      setAgentJsonSchemaErrors(dropRemoved);
+      if (selectedNode && removableIds.has(selectedNode.id)) {
+        setSelectedNode(null);
+        setShowNodeConfig(false);
+      }
+    },
+    [selectedNode, takeSnapshot],
+  );
+
   const handleDeleteNode = useCallback(() => {
-    if (!selectedNode || selectedNode.type === 'start') return;
-    setNodes((nds) => nds.filter((n) => n.id !== selectedNode.id));
-    setEdges((eds) =>
-      eds.filter(
-        (e) => e.source !== selectedNode.id && e.target !== selectedNode.id,
-      ),
-    );
-    setAgentJsonSchemaDrafts((prev) => {
-      if (!(selectedNode.id in prev)) return prev;
-      const next = { ...prev };
-      delete next[selectedNode.id];
-      return next;
-    });
-    setAgentJsonSchemaErrors((prev) => {
-      if (!(selectedNode.id in prev)) return prev;
-      const next = { ...prev };
-      delete next[selectedNode.id];
-      return next;
-    });
-    setSelectedNode(null);
-    setShowNodeConfig(false);
-  }, [selectedNode]);
+    if (!selectedNode) return;
+    deleteNodesAndEdges([selectedNode], []);
+  }, [selectedNode, deleteNodesAndEdges]);
 
   const handleUpdateNodeData = useCallback(
-    (data: Record<string, unknown>) => {
+    (data: Record<string, unknown>, options?: { snapshot?: boolean }) => {
       if (!selectedNode) return;
+      if (options?.snapshot !== false) {
+        // Group per node so a burst of keystrokes becomes one undo step
+        takeSnapshot(`node-data:${selectedNode.id}`);
+      }
       setNodes((nds) =>
         nds.map((n) =>
           n.id === selectedNode.id ? { ...n, data: { ...n.data, ...data } } : n,
@@ -569,7 +642,7 @@ function WorkflowBuilderInner() {
         prev ? { ...prev, data: { ...prev.data, ...data } } : null,
       );
     },
-    [selectedNode],
+    [selectedNode, takeSnapshot],
   );
 
   const handleAgentJsonSchemaChange = useCallback(
@@ -672,8 +745,27 @@ function WorkflowBuilderInner() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Delete' && selectedNode) {
-        handleDeleteNode();
+      const isEditable = isEditableTarget(e.target);
+      if ((e.ctrlKey || e.metaKey) && !isEditable) {
+        const key = e.key.toLowerCase();
+        if (key === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) redo();
+          else undo();
+          return;
+        }
+        if (key === 'y') {
+          e.preventDefault();
+          redo();
+          return;
+        }
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !isEditable) {
+        e.preventDefault();
+        deleteNodesAndEdges(
+          nodes.filter((n) => n.selected || n.id === selectedNode?.id),
+          edges.filter((edge) => edge.selected),
+        );
       }
       if (e.key === 'Escape') {
         setShowNodeConfig(false);
@@ -682,7 +774,7 @@ function WorkflowBuilderInner() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedNode, handleDeleteNode]);
+  }, [nodes, edges, selectedNode, deleteNodesAndEdges, undo, redo]);
 
   const handlePanelBackdropClick = useCallback(() => {
     setShowNodeConfig(false);
@@ -741,15 +833,18 @@ function WorkflowBuilderInner() {
     if (!defaultAgentModelId) return;
     if (selectedNode.data.config?.model_id) return;
 
-    handleUpdateNodeData({
-      config: {
-        ...(selectedNode.data.config || {}),
-        model_id: defaultAgentModelId,
-        llm_name:
-          availableModels.find((model) => model.id === defaultAgentModelId)
-            ?.provider || '',
+    handleUpdateNodeData(
+      {
+        config: {
+          ...(selectedNode.data.config || {}),
+          model_id: defaultAgentModelId,
+          llm_name:
+            availableModels.find((model) => model.id === defaultAgentModelId)
+              ?.provider || '',
+        },
       },
-    });
+      { snapshot: false },
+    );
   }, [
     selectedNode,
     defaultAgentModelId,
@@ -865,6 +960,7 @@ function WorkflowBuilderInner() {
         setAgentJsonSchemaErrors({});
         setNodes(mappedNodes);
         setEdges(mappedEdges);
+        clearHistory();
         setSavedWorkflowSignature(
           JSON.stringify(
             createWorkflowPayload(
@@ -887,7 +983,7 @@ function WorkflowBuilderInner() {
       }
     };
     loadWorkflow();
-  }, [workflowId, reactFlowInstance, token]);
+  }, [workflowId, reactFlowInstance, token, clearHistory]);
 
   const validateWorkflow = useCallback((): string[] => {
     const errors: string[] = [];
@@ -1742,12 +1838,41 @@ function WorkflowBuilderInner() {
               onDrop={onDrop}
               onDragOver={onDragOver}
               onNodeClick={handleNodeClick}
+              onNodeDragStart={snapshotBeforeCanvasChange}
+              onSelectionDragStart={snapshotBeforeCanvasChange}
               nodeTypes={nodeTypes}
-              deleteKeyCode={['Backspace', 'Delete']}
+              nodeDragThreshold={1}
+              deleteKeyCode={null}
               fitView
             >
               <Background />
               <Controls />
+              <Panel position="top-left" className="flex gap-1.5">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  onClick={undo}
+                  disabled={!canUndo}
+                  title="Undo (Ctrl+Z)"
+                  aria-label="Undo"
+                  className="bg-card"
+                >
+                  <Undo2 size={16} />
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon-sm"
+                  onClick={redo}
+                  disabled={!canRedo}
+                  title="Redo (Ctrl+Shift+Z)"
+                  aria-label="Redo"
+                  className="bg-card"
+                >
+                  <Redo2 size={16} />
+                </Button>
+              </Panel>
             </ReactFlow>
 
             {showNodeConfig && selectedNode && (
