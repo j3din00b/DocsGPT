@@ -272,6 +272,13 @@ class Settings(BaseSettings):
     # --graceful-timeout). Keep below the gunicorn --timeout (180) watchdog.
     # Used by gunicorn_worker.BoundedDrainUvicornWorker.
     GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: int = 30
+    # a2wsgi thread-pool size per worker process — the hard ceiling on
+    # concurrent Flask requests (SSE holders + in-flight chats included).
+    # Threads parked on idle SSE reads are nearly free; exhaustion is
+    # not (every Flask request on that worker queues behind LLM
+    # generations). Sized so saturation needs hundreds of concurrent
+    # holders per worker, not 32.
+    WSGI_THREADPOOL_WORKERS: int = 96
     # SSE keepalive comment cadence. Must sit under Cloudflare's 100s idle
     # close and iOS Safari's ~60s — 15s gives generous headroom.
     SSE_KEEPALIVE_SECONDS: int = 15
@@ -288,6 +295,12 @@ class Settings(BaseSettings):
     # connection cap above and the windowed budget below, total
     # enumeration throughput is bounded.
     EVENTS_REPLAY_MAX_PER_REQUEST: int = 200
+    # Age ceiling on snapshot replay. MAXLEN caps the stream by COUNT,
+    # so a low-traffic user's window can reach weeks back — replaying
+    # month-old ingest ticks on reconnect helps no one. Entries older
+    # than this never replay (the client gets ``backlog.truncated`` and
+    # refetches state instead). 0 disables the floor.
+    EVENTS_REPLAY_MAX_AGE_HOURS: int = 48
     # Sliding-window cap on snapshot replays per user. Once the budget
     # is exhausted the route returns HTTP 429 with the cursor pinned;
     # the client backs off and retries after the window rolls over.
