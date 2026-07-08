@@ -551,7 +551,9 @@ class ArtifactGeneratorTool(Tool):
         if loaded.get("error"):
             return {"status": "error", "error": loaded["error"]}
         new_spec = merge_patch(loaded["spec"], spec_patch)
-        return self._reversion(loaded["artifact_id"], loaded["kind"], new_spec, "edit_artifact")
+        return self._reversion(
+            loaded["artifact_id"], loaded["kind"], new_spec, "edit_artifact", loaded.get("title")
+        )
 
     def _rewrite(self, **kwargs: Any) -> Dict[str, Any]:
         """Replace the spec wholesale, re-render, and append a version."""
@@ -559,9 +561,13 @@ class ArtifactGeneratorTool(Tool):
         loaded = self._load_current(kwargs.get("id"))
         if loaded.get("error"):
             return {"status": "error", "error": loaded["error"]}
-        return self._reversion(loaded["artifact_id"], loaded["kind"], spec, "rewrite_artifact")
+        return self._reversion(
+            loaded["artifact_id"], loaded["kind"], spec, "rewrite_artifact", loaded.get("title")
+        )
 
-    def _reversion(self, artifact_id: str, kind: str, spec: Any, action: str) -> Dict[str, Any]:
+    def _reversion(
+        self, artifact_id: str, kind: str, spec: Any, action: str, title: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Validate the new spec, re-render, and append the next version of an existing artifact."""
         valid = self._validate(kind, spec)
         if valid is not None:
@@ -570,7 +576,9 @@ class ArtifactGeneratorTool(Tool):
         if rendered.get("error"):
             return {"status": "error", "error": rendered["error"]}
         info = _KIND_INFO[kind]
-        filename = self._filename(None, kind)
+        # Keep the original artifact's download name across versions (v2 of "Q3 Deck"
+        # must stay "Q3 Deck.pptx", not a generic "artifact.pptx").
+        filename = self._filename(title, kind)
         try:
             ref = append_artifact_version(
                 user_id=self.user_id,
@@ -637,7 +645,12 @@ class ArtifactGeneratorTool(Tool):
         kind = self._kind_for(artifact, version)
         if kind is None:
             return {"error": f"artifact {raw_id} is not a spec-rendered document."}
-        return {"artifact_id": artifact_id, "kind": kind, "spec": version["spec"]}
+        return {
+            "artifact_id": artifact_id,
+            "kind": kind,
+            "spec": version["spec"],
+            "title": artifact.get("title"),
+        }
 
     @staticmethod
     def _kind_for(artifact: Dict[str, Any], version: Dict[str, Any]) -> Optional[str]:

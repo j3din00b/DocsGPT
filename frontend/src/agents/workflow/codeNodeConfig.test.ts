@@ -81,7 +81,6 @@ describe('createDefaultCodeConfig', () => {
   it('returns python defaults with empty code and inputs', () => {
     expect(createDefaultCodeConfig()).toEqual({
       code: '',
-      language: 'python',
       inputs: [],
     });
   });
@@ -91,13 +90,11 @@ describe('serializeCodeConfig', () => {
   it('omits optional fields when empty', () => {
     const serialized = serializeCodeConfig({
       code: 'print(1)',
-      language: 'python',
       inputs: ['', '  '],
       output_variable: '   ',
     });
     expect(serialized).toEqual({
       code: 'print(1)',
-      language: 'python',
       inputs: [],
     });
     expect('output_variable' in serialized).toBe(false);
@@ -108,7 +105,6 @@ describe('serializeCodeConfig', () => {
   it('keeps all CodeNodeConfig fields when present', () => {
     const serialized = serializeCodeConfig({
       code: 'print(1)',
-      language: 'python',
       inputs: ['A1', 'state_var'],
       output_variable: 'result',
       timeout: 30,
@@ -116,7 +112,6 @@ describe('serializeCodeConfig', () => {
     });
     expect(serialized).toEqual({
       code: 'print(1)',
-      language: 'python',
       inputs: ['A1', 'state_var'],
       output_variable: 'result',
       timeout: 30,
@@ -127,7 +122,6 @@ describe('serializeCodeConfig', () => {
   it('falls back to python defaults for an undefined config', () => {
     expect(serializeCodeConfig(undefined)).toEqual({
       code: '',
-      language: 'python',
       inputs: [],
     });
   });
@@ -137,7 +131,6 @@ describe('normalizeCodeConfig', () => {
   it('tolerates a missing/empty payload', () => {
     expect(normalizeCodeConfig(undefined)).toEqual({
       code: '',
-      language: 'python',
       inputs: [],
     });
   });
@@ -145,7 +138,6 @@ describe('normalizeCodeConfig', () => {
   it('coerces bad field types without throwing', () => {
     const config = normalizeCodeConfig({
       code: 42,
-      language: '',
       inputs: ['A1', 5, 'B2'],
       output_variable: '',
       timeout: 'soon',
@@ -153,7 +145,6 @@ describe('normalizeCodeConfig', () => {
     } as unknown as Record<string, unknown>);
     expect(config).toEqual({
       code: '',
-      language: 'python',
       inputs: ['A1', 'B2'],
     });
   });
@@ -161,7 +152,6 @@ describe('normalizeCodeConfig', () => {
   it('preserves a fully populated saved config (round-trip with serialize)', () => {
     const saved = {
       code: 'print(1)',
-      language: 'python',
       inputs: ['A1'],
       output_variable: 'result',
       timeout: 30,

@@ -81,6 +81,7 @@ class WorkflowAgent(BaseAgent):
             self._bridge_error = str(exc)
             yield {
                 "type": "error",
+                "user_facing": True,
                 "error": (
                     "This run's input documents exceed your artifact storage quota. "
                     "Delete some artifacts and try again."
@@ -92,7 +93,7 @@ class WorkflowAgent(BaseAgent):
         # Non-fatal: some attachments were dropped (oversize / unreadable). Tell the
         # user which, then still run with the documents that did bridge.
         if dropped:
-            yield {"type": "error", "error": " ".join(dropped)}
+            yield {"type": "error", "user_facing": True, "error": " ".join(dropped)}
 
         self._engine.run_persisted = self._run_persisted
         interrupted = True

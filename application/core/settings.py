@@ -334,7 +334,11 @@ class Settings(BaseSettings):
     # URL of the Jupyter Kernel Gateway runner (the docsgpt-sandbox service).
     SANDBOX_GATEWAY_URL: str = "http://localhost:8888"
     SANDBOX_GATEWAY_AUTH_TOKEN: Optional[str] = None  # gateway auth token, if set
-    SANDBOX_KERNEL_NAME: str = "python3"  # kernelspec name to launch per session
+    # Kernelspec launched per session. Defaults to the env-scrubbing "docsgpt-python"
+    # spec (shipped by the docsgpt-sandbox runner) so kernel code cannot read the
+    # gateway auth token or operator secrets from os.environ. The stock "python3"
+    # spec inherits the gateway env verbatim and must not be used with untrusted code.
+    SANDBOX_KERNEL_NAME: str = "docsgpt-python"
     SANDBOX_MAX_TTL: int = 1200  # hard cap (s) on agent-selectable keep-alive TTL
     # Per-process/worker cap on concurrent live sandbox sessions. Backend-agnostic
     # (complements DAYTONA_MAX_SANDBOXES); when reached, an LRU-idle session is

@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from typing import Dict, List, Optional
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import websocket
@@ -102,11 +102,12 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         return headers
 
     def _ws_url(self, kernel_id: str) -> str:
+        # The token is sent only via the Authorization header (_ws_headers); keeping it
+        # out of the URL query avoids leaking it into gateway/proxy access logs.
         parsed = urlparse(self._base_url)
         scheme = "wss" if parsed.scheme == "https" else "ws"
         path = f"/api/kernels/{kernel_id}/channels"
-        query = urlencode({"token": self._auth_token}) if self._auth_token else ""
-        return urlunparse((scheme, parsed.netloc, path, "", query, ""))
+        return urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
     def _get_kernel(self, session_id: str) -> _Kernel:
         with self._lock:

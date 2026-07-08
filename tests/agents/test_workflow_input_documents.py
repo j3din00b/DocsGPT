@@ -378,9 +378,11 @@ def test_quota_exceeded_fails_run_and_does_not_execute(pg_engine, tmp_path, monk
     events = list(agent._gen_inner("summarize", log_context=None))
     engine = _RecordingEngine.instances[-1]
 
-    # A fatal error was surfaced on the stream.
+    # A fatal error was surfaced on the stream, flagged user_facing so the route's
+    # sanitize_api_error does not rewrite the "quota" wording into a rate-limit message.
     errors = [e for e in events if e.get("type") == "error"]
     assert errors and "quota" in errors[0]["error"].lower()
+    assert errors[0].get("user_facing") is True
     # The engine never executed (execute was not reached -> no captured inputs).
     assert engine.captured_inputs is None
     # The pre-created RUNNING row was finalized FAILED (not left dangling), and no
@@ -413,9 +415,11 @@ def test_oversize_declared_attachment_skipped_with_notice(pg_engine, tmp_path, m
     # The oversize doc was dropped -> no input documents bridged, but the run ran.
     assert engine.captured_inputs is not None
     assert engine.captured_inputs["input_documents"] == []
-    # A non-fatal notice naming the dropped document was surfaced.
+    # A non-fatal notice naming the dropped document was surfaced, flagged user_facing
+    # so the route emits the filename verbatim instead of a generic sanitized message.
     errors = [e for e in events if e.get("type") == "error"]
     assert errors and "big.txt" in errors[0]["error"]
+    assert errors[0].get("user_facing") is True
     # Nothing was persisted for the oversize doc.
     with pg_engine.connect() as conn:
         n = conn.execute(

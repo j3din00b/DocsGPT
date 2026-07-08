@@ -543,14 +543,15 @@ class BaseAnswerResource:
                         paused = True
                         yield _emit(line)
                     elif line.get("type") == "error":
-                        yield _emit(
-                            {
-                                "type": "error",
-                                "error": sanitize_api_error(
-                                    line.get("error", "An error occurred")
-                                ),
-                            }
-                        )
+                        # An event flagged ``user_facing`` already carries a curated,
+                        # actionable message (e.g. an artifact-quota notice). Passing it
+                        # through sanitize_api_error would substring-match words like
+                        # "quota" and rewrite it into a misleading rate-limit message, so
+                        # emit it verbatim; sanitize only raw/technical errors.
+                        error_text = line.get("error", "An error occurred")
+                        if not line.get("user_facing"):
+                            error_text = sanitize_api_error(error_text)
+                        yield _emit({"type": "error", "error": error_text})
                     else:
                         yield _emit(line)
             if is_structured and structured_chunks:

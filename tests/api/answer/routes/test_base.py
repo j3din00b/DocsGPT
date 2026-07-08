@@ -203,6 +203,71 @@ class TestCompleteStreamMethod:
 
             assert any('"type": "error"' in s for s in stream)
 
+    def test_user_facing_error_is_not_sanitized(self, mock_mongo_db, flask_app):
+        """A user_facing error (e.g. an artifact-quota notice) streams verbatim.
+
+        Without the flag, sanitize_api_error substring-matches "quota" and rewrites the
+        message into a misleading rate-limit notice.
+        """
+        from application.api.answer.routes.base import BaseAnswerResource
+
+        with flask_app.app_context():
+            resource = BaseAnswerResource()
+
+            mock_agent = MagicMock()
+            mock_agent.gen.return_value = iter(
+                [
+                    {
+                        "type": "error",
+                        "user_facing": True,
+                        "error": "This run's input documents exceed your artifact storage quota.",
+                    }
+                ]
+            )
+
+            stream = list(
+                resource.complete_stream(
+                    question="Test?",
+                    agent=mock_agent,
+                    conversation_id=None,
+                    user_api_key=None,
+                    decoded_token={"sub": "user123"},
+                    should_persist=False,
+                )
+            )
+
+            error_chunks = [s for s in stream if '"type": "error"' in s]
+            assert error_chunks
+            assert "artifact storage quota" in error_chunks[0]
+            assert "Rate limit exceeded" not in error_chunks[0]
+
+    def test_non_user_facing_error_is_sanitized(self, mock_mongo_db, flask_app):
+        """A raw error without the flag is still routed through sanitize_api_error."""
+        from application.api.answer.routes.base import BaseAnswerResource
+
+        with flask_app.app_context():
+            resource = BaseAnswerResource()
+
+            mock_agent = MagicMock()
+            mock_agent.gen.return_value = iter(
+                [{"type": "error", "error": "OpenAI 429: quota exceeded for this key"}]
+            )
+
+            stream = list(
+                resource.complete_stream(
+                    question="Test?",
+                    agent=mock_agent,
+                    conversation_id=None,
+                    user_api_key=None,
+                    decoded_token={"sub": "user123"},
+                    should_persist=False,
+                )
+            )
+
+            error_chunks = [s for s in stream if '"type": "error"' in s]
+            assert error_chunks
+            assert "Rate limit exceeded" in error_chunks[0]
+
     def test_saves_conversation_when_enabled(self, mock_mongo_db, flask_app):
         from application.api.answer.routes.base import BaseAnswerResource
 

@@ -63,9 +63,7 @@ class AgentNodeConfig(BaseModel):
 class CodeNodeConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
     code: str = ""
-    language: str = "python"
     inputs: List[str] = Field(default_factory=list)
-    libraries: List[str] = Field(default_factory=list)
     output_variable: Optional[str] = None
     timeout: Optional[int] = None
     json_schema: Optional[Dict[str, Any]] = None

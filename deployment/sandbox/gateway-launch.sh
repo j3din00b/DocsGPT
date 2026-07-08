@@ -9,9 +9,14 @@
 # fail closed if it is missing -- an unauthenticated gateway must never start.
 #
 # The token is shared with the app via SANDBOX_GATEWAY_AUTH_TOKEN (the app sends
-# it as `Authorization: token <...>`). Kernel code cannot read it: kernel-launch.sh
-# re-execs ipykernel under a scrubbed `env -i` allowlist that excludes the token,
-# so it is present for the gateway process only.
+# it as `Authorization: token <...>`). kernel-launch.sh re-execs ipykernel under a
+# scrubbed `env -i` allowlist that excludes the token, so it is NOT in kernel code's
+# os.environ. NOTE: this is not a hard secret boundary -- the gateway and kernels
+# share one container and uid, so kernel code can still read the gateway's env via
+# /proc/<gateway_pid>/environ. The token limits the blast radius (an outside caller
+# cannot drive the gateway), but the Jupyter runner is a single trust domain: for
+# real isolation against untrusted code use the Daytona backend or run under gVisor
+# (see deployment/sandbox/README.md).
 set -eu
 
 TOKEN="${SANDBOX_GATEWAY_AUTH_TOKEN:-}"

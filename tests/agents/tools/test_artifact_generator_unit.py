@@ -53,6 +53,49 @@ def test_validate_rejects_unknown_key():
     assert err["status"] == "error"
 
 
+# ---------------------------------------------------------------------------
+# Reversion download filename
+# ---------------------------------------------------------------------------
+
+
+def _patch_reversion(monkeypatch, tool):
+    """Stub render + persist so _reversion runs without a sandbox or DB; capture kwargs."""
+    import application.agents.tools.artifact_generator as ag
+
+    captured: dict = {}
+
+    def _fake_append(**kwargs):
+        captured.update(kwargs)
+        return {"artifact_id": kwargs["artifact_id"], "version": 2, "id": "v2"}
+
+    monkeypatch.setattr(ag, "append_artifact_version", _fake_append)
+    monkeypatch.setattr(tool, "_render", lambda kind, spec: {"data": b"x"})
+    return captured
+
+
+def test_reversion_preserves_title_in_filename(monkeypatch):
+    """An edited/rewritten version keeps the original artifact's download name."""
+    tool = _tool()
+    captured = _patch_reversion(monkeypatch, tool)
+
+    result = tool._reversion(
+        "art-1", "presentation", {"slides": [{"title": "x"}]}, "edit_artifact", "Q3 Deck"
+    )
+
+    assert result["status"] == "ok"
+    assert captured["filename"] == "Q3 Deck.pptx"
+
+
+def test_reversion_without_title_falls_back_to_generic(monkeypatch):
+    """A missing title still yields a valid generic filename (never crashes)."""
+    tool = _tool()
+    captured = _patch_reversion(monkeypatch, tool)
+
+    tool._reversion("art-1", "presentation", {"slides": [{"title": "x"}]}, "rewrite_artifact", None)
+
+    assert captured["filename"] == "artifact.pptx"
+
+
 def test_validate_rejects_wrong_type():
     err = _tool()._validate("spreadsheet", {"sheets": "not-a-list"})
     assert err["status"] == "error"

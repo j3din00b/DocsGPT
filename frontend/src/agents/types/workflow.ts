@@ -9,7 +9,6 @@ export type NodeType =
 
 export interface CodeNodeConfig {
   code: string;
-  language: string;
   inputs: string[];
   output_variable?: string;
   timeout?: number;

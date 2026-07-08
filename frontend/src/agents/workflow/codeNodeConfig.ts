@@ -1,7 +1,5 @@
 import type { CodeNodeConfig } from '../types/workflow';
 
-const DEFAULT_LANGUAGE = 'python';
-
 /**
  * Validate a parsed JSON schema object the same way the agent node does:
  * it must be a non-array object that declares a "type" or "schema" field.
@@ -60,7 +58,6 @@ export function stringifyCodeInputs(inputs: string[] | undefined): string {
 export function createDefaultCodeConfig(): CodeNodeConfig {
   return {
     code: '',
-    language: DEFAULT_LANGUAGE,
     inputs: [],
   };
 }
@@ -75,10 +72,6 @@ export function normalizeCodeConfig(
   const source = raw || {};
   const config: CodeNodeConfig = {
     code: typeof source.code === 'string' ? source.code : '',
-    language:
-      typeof source.language === 'string' && source.language.trim() !== ''
-        ? source.language
-        : DEFAULT_LANGUAGE,
     inputs: Array.isArray(source.inputs)
       ? source.inputs.filter(
           (entry): entry is string => typeof entry === 'string',
@@ -111,7 +104,6 @@ export function serializeCodeConfig(
   const source = config || createDefaultCodeConfig();
   const serialized: CodeNodeConfig = {
     code: source.code || '',
-    language: source.language || DEFAULT_LANGUAGE,
     inputs: (source.inputs || []).filter(
       (entry) => typeof entry === 'string' && entry.trim() !== '',
     ),
