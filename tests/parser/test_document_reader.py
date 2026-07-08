@@ -28,6 +28,44 @@ def test_unknown_extension_is_rejected():
     assert "error" in out and "unsupported file type" in out["error"]
 
 
+def _make_zip(entries: Dict[str, bytes]) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+@pytest.mark.unit
+def test_zip_bomb_declared_size_over_cap_is_rejected(monkeypatch):
+    # A tiny highly-compressible archive whose decompressed size exceeds the cap
+    # must be rejected before any parser reads it (guards a zip-bomb OOM).
+    monkeypatch.setattr(dr.settings, "DOCUMENT_MAX_DECOMPRESSED_BYTES", 1000, raising=False)
+    data = _make_zip({"word/document.xml": b"A" * 50_000})
+    assert len(data) < 1000  # the on-disk archive is well under the byte cap
+    out = parse_document_bytes(data, "bomb.docx")
+    assert "error" in out and "too much data" in out["error"]
+
+
+@pytest.mark.unit
+def test_zip_too_many_entries_is_rejected(monkeypatch):
+    monkeypatch.setattr(dr.settings, "DOCUMENT_MAX_ARCHIVE_ENTRIES", 3, raising=False)
+    data = _make_zip({f"f{i}.xml": b"x" for i in range(10)})
+    out = parse_document_bytes(data, "many.xlsx")
+    assert "error" in out and "too many entries" in out["error"]
+
+
+@pytest.mark.unit
+def test_reject_zip_bomb_ignores_non_zip_formats():
+    # A non-zip extension (or a non-zip payload named .docx) is not gated here;
+    # the format parser surfaces its own error downstream.
+    assert dr._reject_zip_bomb(b"plain text", ".txt") is None
+    assert dr._reject_zip_bomb(b"not a zip", ".docx") is None
+
+
 @pytest.mark.unit
 def test_size_cap_rejects_oversize(monkeypatch):
     monkeypatch.setattr(dr.settings, "DOCUMENT_PARSE_MAX_BYTES", 8, raising=False)

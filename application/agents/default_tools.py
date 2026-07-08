@@ -31,11 +31,16 @@ _HEADLESS_EXCLUDED_TOOLS = frozenset({"scheduler"})
 # default tools. Names may overlap with DEFAULT_CHAT_TOOLS (e.g. ``scheduler``)
 # — both registries share ``_DEFAULT_TOOL_NAMESPACE`` so the same uuid5
 # resolves either way (the dual-flag row carries ``default`` AND ``builtin``).
-# ``code_executor`` is builtin-only (not default-on): it needs a running sandbox
-# runner so it is opt-in per agent, but staying registered keeps its synthetic id
-# resolvable (an agent that enabled it never silently loses it) and keeps it in the
-# agent picker.
-BUILTIN_AGENT_TOOLS: tuple = ("scheduler", "read_document", "code_executor")
+# ``code_executor`` and ``artifact_generator`` are builtin-only (not default-on):
+# both render/execute through a running sandbox runner, so they are opt-in per
+# agent, but staying registered keeps their synthetic ids resolvable (an agent
+# that enabled one never silently loses it) and keeps them in the agent picker.
+BUILTIN_AGENT_TOOLS: tuple = (
+    "scheduler",
+    "read_document",
+    "code_executor",
+    "artifact_generator",
+)
 
 # Builtins shown only in the workflow-node tool picker, never the classic
 # agent picker. The synthesized row carries ``workflow_only`` so the frontend

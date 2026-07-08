@@ -7,28 +7,34 @@ never a child container; the Docker socket is **not** mounted.
 
 ## Enabling code execution (opt-in)
 
-The runner is **opt-in**. `code_executor` is no longer a default chat tool (it
-was removed from `DEFAULT_CHAT_TOOLS`), so a plain `docker compose up` does
-**not** start `docsgpt-sandbox`. Start it explicitly with the `sandbox`
-profile:
+The runner is **opt-in**. Neither `code_executor` nor `artifact_generator` is a
+default chat tool (both were removed from `DEFAULT_CHAT_TOOLS`), and the runner
+is **not** part of the base compose stack — a plain `docker compose up` does
+**not** start `docsgpt-sandbox`. Enable it by layering the sandbox overlay and
+setting a shared gateway token:
 
 ```bash
-docker compose -f deployment/docker-compose.yaml --profile sandbox up
+export SANDBOX_GATEWAY_AUTH_TOKEN=$(openssl rand -hex 32)
+docker compose \
+  -f deployment/docker-compose.yaml \
+  -f deployment/optional/docker-compose.optional.sandbox.yaml up
 ```
 
-With the egress-firewall overlay (see *Network egress / SSRF* below):
+The token is **required** — the gateway fails closed if it is unset (see
+*Gateway authentication* below). Add the egress-firewall overlay for SSRF
+containment (see *Network egress / SSRF*):
 
 ```bash
 docker compose \
   -f deployment/docker-compose.yaml \
-  -f deployment/optional/docker-compose.optional.sandbox-egress.yaml \
-  --profile sandbox up
+  -f deployment/optional/docker-compose.optional.sandbox.yaml \
+  -f deployment/optional/docker-compose.optional.sandbox-egress.yaml up
 ```
 
-Then enable `code_executor` **per-agent** in the agent tool picker — it is not a
-default chat tool. Agents without it never call the runner, and the
-backend/worker degrade gracefully when the runner is absent. The `-hub` and
-`-azure` compose variants gate the runner behind the same `sandbox` profile.
+Then enable `code_executor` / `artifact_generator` **per-agent** in the agent
+tool picker. Agents without them never call the runner, and the backend/worker
+degrade gracefully when the runner is absent. The `-hub` and `-azure` compose
+variants take the same sandbox overlay.
 
 ## Isolation model
 
@@ -70,6 +76,10 @@ Residual gaps (treat all sessions in one runner as mutually trusting):
 - **In-memory / cross-kernel.** Kernels are child processes of one gateway under
   one uid; OS-level process isolation is the only boundary, and it is not a
   sandbox boundary against a determined escape. No gVisor in the base posture.
+  (The gateway's HTTP/WebSocket control API is reachable from kernel code over
+  loopback, but it is **authenticated** — see *Gateway authentication* — and the
+  token is scrubbed from the kernel env, so kernel code cannot drive it to
+  enumerate/kill sibling kernels or spawn kernels past the session cap.)
 - **Egress.** Outbound is broad by design (so code can `pip install` / call
   public APIs). Private/link-local/metadata ranges are blocked **only** by the
   network layer — the k8s NetworkPolicy or a host/cloud firewall (see *Network
@@ -88,15 +98,19 @@ Build and run the runner on its own, then point the app at it:
 
 ```bash
 docker build -t docsgpt-sandbox deployment/sandbox
-docker run --rm -p 8888:8888 docsgpt-sandbox
+docker run --rm -p 8888:8888 -e SANDBOX_GATEWAY_AUTH_TOKEN=devtoken docsgpt-sandbox
 # in the app's .env:  SANDBOX_GATEWAY_URL=http://localhost:8888
+#                     SANDBOX_GATEWAY_AUTH_TOKEN=devtoken
 ```
 
-Without Docker (matches the test harness) you can run the gateway directly from
-a venv that has `jupyter-kernel-gateway` installed:
+The token is required — the image's entrypoint refuses to start without it (see
+*Gateway authentication*). Without Docker (matches the test harness) you can run
+the gateway directly from a venv that has `jupyter-kernel-gateway` installed; set
+a matching `--KernelGatewayApp.auth_token`:
 
 ```bash
 jupyter kernelgateway --KernelGatewayApp.ip=0.0.0.0 --KernelGatewayApp.port=8888 \
+  --KernelGatewayApp.auth_token=devtoken \
   --ZMQChannelsWebsocketConnection.limit_rate=False
 ```
 
@@ -115,26 +129,35 @@ copy `kernels/docsgpt-python/kernel.json` (pointing `argv` at a local copy of
 `kernel-launch.sh`) into a Jupyter data dir on the kernelspec search path and
 set `SANDBOX_KERNEL_NAME=docsgpt-python` before launching.
 
-## Exposing the port requires auth
+## Gateway authentication
 
-The image does **not** set `--KernelGatewayApp.allow_origin=*`. If you publish
-port 8888 (e.g. `docker run -p 8888:8888`), set `SANDBOX_GATEWAY_AUTH_TOKEN`
-and launch the gateway with a matching `--KernelGatewayApp.auth_token` so the
-runner is not an open arbitrary-code-execution endpoint. In compose the runner
-stays on the internal-only network with no published port, so no token is
-required there.
+The gateway **requires** an auth token and **fails closed** if it is unset — the
+image's entrypoint (`gateway-launch.sh`) refuses to start an unauthenticated
+gateway. This matters even on an internal-only network: the gateway and every
+session kernel share one container, so kernel code can reach the gateway's
+control API over **loopback** (`http://localhost:8888`). Without auth, that
+control API would let kernel code enumerate/attach/kill sibling sessions'
+kernels and spawn kernels without bound (bypassing the app-side session cap).
+
+Set the same token on the runner and the app via `SANDBOX_GATEWAY_AUTH_TOKEN`
+(the app sends it as `Authorization: token <...>`; the runner's gateway
+validates it on every HTTP + WebSocket request). Kernel code cannot read it: the
+kernelspec launcher scrubs it from the kernel env (see *Isolation model*), so it
+is present for the gateway process only. The image also does **not** set
+`--KernelGatewayApp.allow_origin=*`.
 
 ## In docker-compose
 
-The `docsgpt-sandbox` service is defined in `deployment/docker-compose.yaml` on
-an internal-only network and is gated behind the `sandbox` Compose profile
-(opt-in — start it with `docker compose --profile sandbox up`; see *Enabling
-code execution (opt-in)* above). The backend and worker reach it at
-`http://docsgpt-sandbox:8888` and select the scrubbing kernel by setting
-`SANDBOX_KERNEL_NAME=docsgpt-python` (the runner only ships the kernelspec; the
-app chooses it). The same applies to k8s: `SANDBOX_KERNEL_NAME=docsgpt-python`
-is set on the `docsgpt-api` and `docsgpt-worker` deployments in
-`deployment/k8s/deployments/docsgpt-deploy.yaml`.
+The `docsgpt-sandbox` service lives in the opt-in overlay
+`deployment/optional/docker-compose.optional.sandbox.yaml` (layered on the base
+stack; see *Enabling code execution (opt-in)*) on an internal-only network with
+no published host port. The overlay puts the backend and worker on `sandbox-net`
+to reach the runner at `http://docsgpt-sandbox:8888`, and sets
+`SANDBOX_KERNEL_NAME=docsgpt-python` on them (the runner only ships the
+kernelspec; the app chooses it) plus the shared `SANDBOX_GATEWAY_AUTH_TOKEN`. In
+k8s these are added to the `docsgpt-api` and `docsgpt-worker` deployments when
+enabling the opt-in `sandbox-deploy.yaml` (the default `docsgpt-deploy.yaml`
+omits them); see that manifest's header for the exact env and the token Secret.
 
 ## Artifact rendering on Daytona (snapshot)
 
@@ -221,7 +244,7 @@ The hardened container runs **without `NET_ADMIN`**, so it cannot self-apply
   ```
 
 - **docker-compose** — compose cannot express L3 egress filtering natively. The
-  base stack reaches the runner over an `internal: true` control network
+  sandbox overlay reaches the runner over an `internal: true` control network
   (`sandbox-net`, no host port) and gives it internet egress on a dedicated
   `sandbox-egress` bridge — but that bridge does not by itself block the metadata
   IP or RFC1918. Apply
@@ -241,16 +264,20 @@ The hardened container runs **without `NET_ADMIN`**, so it cannot self-apply
   real authentication (`AUTH_TYPE` != none / a real auth provider) so a reachable
   API rejects unauthenticated requests — **required** — and/or add a host-firewall
   `DROP` for runner→backend/worker on `sandbox-net` (see approach (1) in the
-  overlay file's header comment). Note the broker/DB published ports are bound to
-  `127.0.0.1` so the runner cannot reach them via the host gateway either.
+  overlay file's header comment). The runner is not on the `default` network, so
+  it has no Docker-DNS route to redis/postgres; if the broker/DB publish host
+  ports on a cloud VM, also apply the egress overlay (its `internal` flip removes
+  the runner's route to the host gateway / RFC1918) or bind those ports to
+  `127.0.0.1`.
 
 ## Other hardening (deployment-level)
 
 The gVisor `runsc` runtime (kernel isolation for untrusted code), seccomp
 profile, read-only root FS, non-root, and cgroup CPU/mem/PID caps (wired from
 `SANDBOX_MEMORY` / `SANDBOX_CPUS`) are deployment-level concerns. The compose
-service in `deployment/docker-compose.yaml` already sets `read_only`,
-`mem_limit`, `cpus`, and `pids_limit`; the k8s `sandbox-deploy.yaml` sets the
+service in `deployment/optional/docker-compose.optional.sandbox.yaml` already
+sets `read_only`, `mem_limit`, `cpus`, and `pids_limit`; the k8s
+`sandbox-deploy.yaml` sets the
 equivalent `securityContext` + resource limits and has a commented
 `runtimeClassName: gvisor` to enable on nodes with the `runsc` RuntimeClass
 installed. These complement — they do not replace — the network egress policy

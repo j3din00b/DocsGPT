@@ -18,21 +18,8 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - POSTGRES_URI=postgresql://docsgpt:docsgpt@postgres:5432/docsgpt
-      # Code-execution runner reached over HTTP + WebSocket (no docker socket).
-      - SANDBOX_GATEWAY_URL=http://docsgpt-sandbox:8888
-      # Env-scrubbing kernelspec the docsgpt-sandbox image installs.
-      - SANDBOX_KERNEL_NAME=docsgpt-python
     ports:
       - "7091:7091"
-    networks:
-      # `default` reaches the internet (LLM APIs) + frontend/host; `data-net`
-      # reaches redis/postgres; `sandbox-net` reaches the code-exec runner over an
-      # internal-only net (so the runner needs no shared internet bridge to be
-      # reachable, and the egress overlay can cut its internet without severing
-      # this control path).
-      - default
-      - data-net
-      - sandbox-net
     volumes:
       - ../application/indexes:/app/application/indexes
       - ../application/inputs:/app/application/inputs
@@ -55,75 +42,32 @@ services:
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - API_URL=http://backend:7091
       - POSTGRES_URI=postgresql://docsgpt:docsgpt@postgres:5432/docsgpt
-      - SANDBOX_GATEWAY_URL=http://docsgpt-sandbox:8888
-      - SANDBOX_KERNEL_NAME=docsgpt-python
-    networks:
-      # See backend: control-plane access to the code-exec runner over sandbox-net
-      # (workflow code nodes run in the worker).
-      - default
-      - data-net
-      - sandbox-net
     depends_on:
       redis:
         condition: service_started
       postgres:
         condition: service_healthy
 
-  # Opt-in code-execution runner (Jupyter Kernel Gateway). Started ONLY with
-  # `docker compose --profile sandbox up`: the `code_executor` tool is off by
-  # default (removed from DEFAULT_CHAT_TOOLS) and must be enabled per-agent in
-  # the agent tool picker, so a plain `up` does not start this service.
-  # In-process kernels, no Docker socket, no published host port. On the
-  # internal-only sandbox-net plus `default` (for internet egress); deliberately
-  # NOT on data-net, so sandboxed code cannot reach the unauthenticated redis
-  # broker (Celery task injection -> RCE) or postgres. Do NOT add
-  # `env_file: ../.env` here -- the runner needs no app secrets. For untrusted
-  # multi-tenant workloads use a per-session VM via SANDBOX_BACKEND=daytona
-  # instead.
-  docsgpt-sandbox:
-    build: ./sandbox
-    profiles: ["sandbox"]
-    mem_limit: ${SANDBOX_MEMORY:-1g}
-    cpus: ${SANDBOX_CPUS:-1.0}
-    pids_limit: 256
-    read_only: true
-    environment:
-      # Keep Jupyter's runtime/connection files on the writable tmpfs.
-      - JUPYTER_RUNTIME_DIR=/tmp/jupyter-runtime
-      - JUPYTER_DATA_DIR=/tmp/jupyter-data
-    tmpfs:
-      - /tmp
-    networks:
-      # Reachable by backend/worker over the internal sandbox-net; internet
-      # egress (runtime pip install, etc.) via the dedicated sandbox-egress net.
-      # Deliberately NOT on `default`: the egress overlay cuts internet by
-      # flipping sandbox-egress to internal, without severing the control path.
-      - sandbox-net
-      - sandbox-egress
+  # NOTE: sandboxed code execution (the `code_executor` / `artifact_generator`
+  # tools) is an OPT-IN feature and is intentionally NOT part of this default
+  # stack. To run it, layer the sandbox overlay on top of this file:
+  #   docker compose -f docker-compose-azure.yaml \
+  #     -f optional/docker-compose.optional.sandbox.yaml up
+  # See deployment/sandbox/README.md.
 
   redis:
     image: redis:6-alpine
-    # Data plane only: kept off the sandbox's networks (a reachable, unauthed
-    # broker = Celery task injection -> worker RCE).
-    networks:
-      - data-net
     ports:
-      # Loopback only: the published port must NOT be reachable from the sandbox
-      # via the host/bridge gateway. Host-local dev tools still use localhost.
-      - 127.0.0.1:6379:6379
+      - 6379:6379
 
   postgres:
     image: postgres:16-alpine
-    # Data plane only (see redis): kept off the sandbox's networks.
-    networks:
-      - data-net
     environment:
       - POSTGRES_USER=docsgpt
       - POSTGRES_PASSWORD=docsgpt
       - POSTGRES_DB=docsgpt
     ports:
-      # Loopback only (see redis): not reachable from the sandbox via the gateway.
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -131,22 +75,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
-networks:
-  # Control plane between backend/worker and the code-exec runner. internal:true
-  # => no internet route on this net; the runner egresses via sandbox-egress.
-  sandbox-net:
-    internal: true
-  # The runner's outbound internet route (runtime pip install, etc.). Kept
-  # internet-facing so the base stack works out of the box;
-  # deployment/optional/docker-compose.optional.sandbox-egress.yaml flips it to
-  # internal:true and forces egress through a deny-private proxy for full SSRF
-  # containment (blocking RFC1918 / link-local / cloud-metadata).
-  sandbox-egress: {}
-  # Internal data plane: redis/postgres + backend/worker. The sandbox is NOT
-  # attached, so sandboxed code cannot reach the broker or database.
-  data-net:
-    internal: true
 
 volumes:
   postgres_data:

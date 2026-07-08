@@ -17,10 +17,14 @@ from application.core.settings import settings
 from application.sandbox.artifacts_capture import (
     MAX_CAPTURED_FILES,
     capture_artifacts,
-    infer_mime as _infer_mime,
-    kind_for_mime as _kind_for_mime,
     snapshot_signatures,
     unique_input_path,
+)
+from application.sandbox.artifacts_capture import (
+    infer_mime as _infer_mime,
+)
+from application.sandbox.artifacts_capture import (
+    kind_for_mime as _kind_for_mime,
 )
 from application.sandbox.base import ExecResult
 from application.sandbox.sandbox_creator import SandboxCreator
@@ -65,6 +69,7 @@ class CodeExecutorTool(Tool):
         self.tool_id: Optional[str] = self.config.get("tool_id")
         self.conversation_id: Optional[str] = self.config.get("conversation_id")
         self.workflow_run_id: Optional[str] = self.config.get("workflow_run_id")
+        self.message_id: Optional[str] = self.config.get("message_id")
         # Static, deployment-level approval gate (mirrors the action metadata flag).
         self._require_approval: bool = bool(self.config.get("require_approval", False))
         self._last_artifact_id: Optional[str] = None
@@ -264,9 +269,7 @@ class CodeExecutorTool(Tool):
                         if bridged_id is None:
                             return {"error": f"input artifact {raw} not found in this conversation/run."}
                         artifact_id = bridged_id
-                        artifact = repo.get_artifact_in_parent(
-                            artifact_id, conversation_id=self.conversation_id
-                        )
+                        artifact = repo.get_artifact_in_parent(artifact_id, conversation_id=self.conversation_id)
                         if artifact is None:
                             return {"error": f"input artifact {raw} not found in this conversation/run."}
                     version = repo.get_version(artifact_id, artifact["current_version"])
@@ -316,9 +319,7 @@ class CodeExecutorTool(Tool):
         if attachment is None:
             return None
         try:
-            return bridge_attachment(
-                attachment, user_id=self.user_id, conversation_id=self.conversation_id
-            )
+            return bridge_attachment(attachment, user_id=self.user_id, conversation_id=self.conversation_id)
         except AttachmentBridgeError as exc:
             return {"error": f"failed to attach {raw}: {exc}"}
 
@@ -359,6 +360,7 @@ class CodeExecutorTool(Tool):
             user_id=self.user_id,
             conversation_id=self.conversation_id,
             workflow_run_id=self.workflow_run_id,
+            message_id=self.message_id,
             produced_by={
                 "tool": "code_executor",
                 "action": "run_code",

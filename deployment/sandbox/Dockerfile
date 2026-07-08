@@ -56,6 +56,8 @@ RUN if [ "$INSTALL_DOCLING" = "true" ]; then \
 # runner image itself should stay free of app secrets it has no use for.
 COPY kernel-launch.sh /opt/docsgpt/kernel-launch.sh
 RUN chmod 0555 /opt/docsgpt/kernel-launch.sh
+COPY gateway-launch.sh /opt/docsgpt/gateway-launch.sh
+RUN chmod 0555 /opt/docsgpt/gateway-launch.sh
 COPY kernels/docsgpt-python/kernel.json /usr/local/share/jupyter/kernels/docsgpt-python/kernel.json
 
 # Numeric UID (not the name) so a kubelet with `runAsNonRoot: true` can verify
@@ -66,12 +68,8 @@ WORKDIR /home/sandbox
 
 EXPOSE 8888
 
-# ip=0.0.0.0 so the backend can reach it over the internal compose network.
-# allow_origin is intentionally NOT set to "*" — publishing port 8888 requires
-# setting SANDBOX_GATEWAY_AUTH_TOKEN (see README). limit_rate=False raises the
-# iopub data-rate cap so large get_file base64 payloads are not truncated; the
-# get_file integrity check still guards against truncation if this is ever off.
-CMD ["jupyter", "kernelgateway", \
-     "--KernelGatewayApp.ip=0.0.0.0", \
-     "--KernelGatewayApp.port=8888", \
-     "--ZMQChannelsWebsocketConnection.limit_rate=False"]
+# The launcher REQUIRES SANDBOX_GATEWAY_AUTH_TOKEN and fails closed if it is
+# unset: the gateway control API is reachable from kernel code over loopback, so
+# it must never run unauthenticated (see gateway-launch.sh). The token is shared
+# with the app and is scrubbed from the kernel env by kernel-launch.sh.
+CMD ["/opt/docsgpt/gateway-launch.sh"]

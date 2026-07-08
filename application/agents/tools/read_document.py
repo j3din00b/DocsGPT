@@ -56,6 +56,7 @@ class ReadDocumentTool(Tool):
         self.tool_id: Optional[str] = self.config.get("tool_id")
         self.conversation_id: Optional[str] = self.config.get("conversation_id")
         self.workflow_run_id: Optional[str] = self.config.get("workflow_run_id")
+        self.message_id: Optional[str] = self.config.get("message_id")
         self._last_artifact_id: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -222,9 +223,7 @@ class ReadDocumentTool(Tool):
         timeout = float(getattr(settings, "DOCUMENT_PARSE_TIMEOUT", 120))
         queue = getattr(settings, "DOCUMENT_PARSE_QUEUE", "parsing")
         try:
-            async_result = parse_document.apply_async(
-                args=[artifact_id, parent, self.user_id, options], queue=queue
-            )
+            async_result = parse_document.apply_async(args=[artifact_id, parent, self.user_id, options], queue=queue)
             # The web process (not a worker) awaits here; ``disable_sync_subtasks=False`` keeps
             # the call correct if invoked from a non-prefork (eventlet/gevent) worker where the
             # inline branch above still ran but the blanket guard would otherwise raise.
@@ -283,16 +282,17 @@ class ReadDocumentTool(Tool):
         if attachment is None:
             return None
         try:
-            return bridge_attachment(
-                attachment, user_id=self.user_id, conversation_id=self.conversation_id
-            )
+            return bridge_attachment(attachment, user_id=self.user_id, conversation_id=self.conversation_id)
         except AttachmentBridgeError as exc:
             return {"status": "error", "error": f"failed to attach {raw_id}: {exc}"}
 
     def _parent(self) -> Dict[str, Any]:
         """Build the run-scoped parent dict passed to the worker for its independent re-resolve."""
         if self.conversation_id is not None:
-            return {"conversation_id": self.conversation_id}
+            parent: Dict[str, Any] = {"conversation_id": self.conversation_id}
+            if self.message_id:
+                parent["message_id"] = self.message_id
+            return parent
         return {"workflow_run_id": self.workflow_run_id}
 
     # ------------------------------------------------------------------

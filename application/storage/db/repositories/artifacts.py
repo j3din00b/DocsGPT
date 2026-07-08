@@ -392,13 +392,29 @@ class ArtifactsRepository:
         return int(row[0]) if row is not None else 0
 
     def total_bytes_for_user(self, user_id: str) -> int:
-        """Return the summed byte size of every version a user owns (quota accounting)."""
+        """Return the stored byte size a user owns (quota accounting).
+
+        Deduplicated by ``storage_path``: ``restore`` appends a version that
+        re-points at an existing version's stored object (same key + size), so
+        summing every version row would charge the same bytes N times and inflate
+        usage without any new bytes being written. Each distinct stored object is
+        counted once; versions with no object yet (``storage_path IS NULL`` --
+        spec-only, whose size is normally NULL too) are counted individually since
+        they share no key to dedupe on.
+        """
         row = self._conn.execute(
             text(
-                "SELECT COALESCE(SUM(v.size), 0) "
-                "FROM artifact_versions v "
-                "JOIN artifacts a ON a.id = v.artifact_id "
-                "WHERE a.user_id = :user_id"
+                "SELECT COALESCE(SUM(t.size), 0) FROM ("
+                "  SELECT DISTINCT v.storage_path, v.size "
+                "  FROM artifact_versions v "
+                "  JOIN artifacts a ON a.id = v.artifact_id "
+                "  WHERE a.user_id = :user_id AND v.storage_path IS NOT NULL "
+                "  UNION ALL "
+                "  SELECT v.storage_path, v.size "
+                "  FROM artifact_versions v "
+                "  JOIN artifacts a ON a.id = v.artifact_id "
+                "  WHERE a.user_id = :user_id AND v.storage_path IS NULL"
+                ") t"
             ),
             {"user_id": user_id},
         ).fetchone()

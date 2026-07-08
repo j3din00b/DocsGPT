@@ -251,18 +251,10 @@ class Settings(BaseSettings):
 
     # Config-free tools on by default in agentless chats. ``scheduler`` is
     # dual-registered (also in ``BUILTIN_AGENT_TOOLS``) so the same synthetic id
-    # resolves whether reached via defaults or the agent picker. ``artifact_generator``
-    # persists artifacts (not a ``user_tools``-FK table); its synthetic-id load is
-    # user- and conversation-scoped like ``scheduler`` and it renders html/markdown/code
-    # without a sandbox runner, so it is safe to default on. ``code_executor`` is NOT
-    # default-on: it needs a running sandbox runner and executes LLM-authored code, so a
-    # fresh deploy without a runner would otherwise surface a tool that hard-fails. Enable
-    # it per-agent instead (opt-in via the agent tool picker).
     DEFAULT_CHAT_TOOLS: list = [
         "memory",
         "read_webpage",
         "scheduler",
-        "artifact_generator",
     ]
 
     # Conversation Compression Settings
@@ -358,6 +350,8 @@ class Settings(BaseSettings):
     DOCUMENT_PARSE_QUEUE: str = "parsing"  # queue the parse_document task is routed to
     DOCUMENT_PARSE_TIMEOUT: int = 120  # seconds the tool awaits the enqueued parse before degrading
     DOCUMENT_PARSE_MAX_BYTES: int = 0  # cap on a parsed document's bytes (0 = reuse SANDBOX_MAX_INPUT_BYTES)
+    DOCUMENT_MAX_DECOMPRESSED_BYTES: int = 300 * 1024 * 1024
+    DOCUMENT_MAX_ARCHIVE_ENTRIES: int = 10000
     # Per-agent-node cap on files passed natively to the node's LLM (vision/doc
     # inputs). Files past the cap are extracted to text or dropped, not attached
     # natively, to bound context/cost. Re-uses SANDBOX_MAX_INPUT_BYTES per file.
@@ -368,6 +362,11 @@ class Settings(BaseSettings):
     # avoid serializing dozens of parses; documents past the cap are skipped with
     # a truncation note instead of extracted.
     WORKFLOW_NODE_EXTRACT_MAX_FILES: int = 5
+    # A workflow run row is pre-created as ``running`` and finalized when its
+    # generator completes; a client disconnect or worker crash can strand it in
+    # ``running`` forever. The beat reaper fails runs still ``running`` past this
+    # many seconds. Generous so a legitimately long run is never cut off.
+    WORKFLOW_RUN_STALE_SECONDS: int = 3600
     # Runner container resource caps — consumed by the docsgpt-sandbox compose
     # service (deployment/sandbox), not by the app client. cgroup CPU/mem caps
     # are part of the untrusted-code security boundary.

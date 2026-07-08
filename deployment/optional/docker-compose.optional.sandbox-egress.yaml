@@ -7,9 +7,10 @@
 # metadata ranges and ALLOWS the public internet.
 #
 # HOW THIS OVERLAY WORKS
-# The base stack puts docsgpt-sandbox on two networks: the internal `sandbox-net`
-# (control plane to backend/worker) and `sandbox-egress` (its internet route).
-# This overlay flips `sandbox-egress` to `internal: true`, which removes the
+# The sandbox overlay (docker-compose.optional.sandbox.yaml) puts docsgpt-sandbox
+# on two networks: the internal `sandbox-net` (control plane to backend/worker)
+# and `sandbox-egress` (its internet route). Layer THIS overlay on top of it to
+# flip `sandbox-egress` to `internal: true`, which removes the
 # runner's direct route to the internet / host / RFC1918 / metadata entirely --
 # so raw sockets in arbitrary sandbox code have no route OFF the host except the
 # deny-private proxy. The proxy is the ONLY container with an internet route
@@ -50,7 +51,7 @@
 #      `{{.NetworkSettings.Networks.docsgpt-oss_sandbox-egress.IPAddress}}` form
 #      never parsed. Both IPs are read on sandbox-net so source+dest match the
 #      shared path:
-#        CF="-f deployment/docker-compose.yaml -f deployment/optional/docker-compose.optional.sandbox-egress.yaml --profile sandbox"
+#        CF="-f deployment/docker-compose.yaml -f deployment/optional/docker-compose.optional.sandbox.yaml -f deployment/optional/docker-compose.optional.sandbox-egress.yaml"
 #        NET=docsgpt-oss_sandbox-net
 #        SBX=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$(docker compose $CF ps -q docsgpt-sandbox)")
 #        BE=$( docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$(docker compose $CF ps -q backend)")
@@ -74,11 +75,10 @@
 #      This does NOT stop runner->backend/worker on sandbox-net -- pair it with
 #      backend auth and/or approach (1).
 #
-# Apply alongside the base stack:
+# Apply on top of the base stack AND the sandbox overlay (order matters):
 #   docker compose -f deployment/docker-compose.yaml \
+#     -f deployment/optional/docker-compose.optional.sandbox.yaml \
 #     -f deployment/optional/docker-compose.optional.sandbox-egress.yaml up -d
-# (also works layered on docker-compose-hub.yaml / docker-compose-azure.yaml,
-# which share the same service/network names).
 #
 # NOTE: because `sandbox-egress` is internal here, non-HTTP raw egress TO THE
 # INTERNET / HOST / RFC1918 / METADATA is blocked at L3 regardless of what the
@@ -102,14 +102,10 @@ services:
       - sandbox-egress-out # the ONLY container with an internet route
 
   docsgpt-sandbox:
-    # Match the base service's profile so this overlay fragment merges onto the
-    # profiled base and the runner still starts only under `--profile sandbox`
-    # (Compose unions service fragments across -f files; keeping the profile
-    # here means a bare `up` never starts the runner via this overlay either).
-    profiles: ["sandbox"]
-    # No `networks:` override here on purpose: the base already attaches the
-    # runner to sandbox-net + sandbox-egress. Flipping sandbox-egress to internal
-    # (below) removes its direct internet route; its only way out is this proxy.
+    # No `networks:` override here on purpose: the sandbox overlay already
+    # attaches the runner to sandbox-net + sandbox-egress. Flipping sandbox-egress
+    # to internal (below) removes its direct internet route; its only way out is
+    # this proxy.
     environment:
       - HTTP_PROXY=http://sandbox-egress-proxy:8080
       - HTTPS_PROXY=http://sandbox-egress-proxy:8080

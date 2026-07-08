@@ -13,7 +13,7 @@ DocsGPT can generate documents, run code, and read files for you during a chat o
 - **Code Executor** runs code in a sandboxed session and turns any files the code writes into downloadable artifacts.
 - **Read Document** parses an uploaded or produced file (PDF, Word, PowerPoint, and more) into text, markdown, or structured data.
 
-The first two are enabled by default for new agents. Read Document is available inside workflows.
+All three are opt-in: enable Artifact and Code Executor per agent in the tool picker (they need a running [sandbox runner](https://github.com/arc53/DocsGPT/tree/main/deployment/sandbox)), and Read Document is available inside workflows. A new agent starts with no tools enabled.
 
 ## Artifacts
 

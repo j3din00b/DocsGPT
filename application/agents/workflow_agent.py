@@ -13,7 +13,7 @@ from application.agents.workflows.schemas import (
 )
 from application.agents.workflows.workflow_engine import WorkflowEngine
 from application.core.settings import settings
-from application.logging import log_activity, LogContext
+from application.logging import LogContext, log_activity
 from application.sandbox.artifacts_capture import QuotaExceeded
 from application.storage.db.base_repository import looks_like_uuid
 from application.storage.db.repositories.workflow_edges import WorkflowEdgesRepository
@@ -51,14 +51,10 @@ class WorkflowAgent(BaseAgent):
         self._bridge_error: Optional[str] = None
 
     @log_activity()
-    def gen(
-        self, query: str, log_context: LogContext = None
-    ) -> Generator[Dict[str, str], None, None]:
+    def gen(self, query: str, log_context: LogContext = None) -> Generator[Dict[str, str], None, None]:
         yield from self._gen_inner(query, log_context)
 
-    def _gen_inner(
-        self, query: str, log_context: LogContext
-    ) -> Generator[Dict[str, str], None, None]:
+    def _gen_inner(self, query: str, log_context: LogContext) -> Generator[Dict[str, str], None, None]:
         graph = self._load_workflow_graph()
         if not graph:
             yield {"type": "error", "error": "Failed to load workflow configuration."}
@@ -73,15 +69,11 @@ class WorkflowAgent(BaseAgent):
         # the outputs of the run they triggered (authz is run.user_id == caller).
         workflow_owner_id = self._resolve_owner_id()
         run_user_id = self._resolve_run_user_id(workflow_owner_id)
-        pg_workflow_id = self._precreate_workflow_run(
-            workflow_owner_id, run_user_id, query
-        )
+        pg_workflow_id = self._precreate_workflow_run(workflow_owner_id, run_user_id, query)
         self._run_persisted = pg_workflow_id is not None
 
         try:
-            input_documents, dropped = self._bridge_attachments(
-                run_user_id, persisted=self._run_persisted
-            )
+            input_documents, dropped = self._bridge_attachments(run_user_id, persisted=self._run_persisted)
         except QuotaExceeded as exc:
             # The run's input documents exceed the uploader's artifact quota. Surface
             # a clean error and finalize the pre-created RUNNING row as FAILED rather
@@ -94,9 +86,7 @@ class WorkflowAgent(BaseAgent):
                     "Delete some artifacts and try again."
                 ),
             }
-            self._finalize_workflow_run(
-                workflow_owner_id, run_user_id, pg_workflow_id, query
-            )
+            self._finalize_workflow_run(workflow_owner_id, run_user_id, pg_workflow_id, query)
             return
 
         # Non-fatal: some attachments were dropped (oversize / unreadable). Tell the
@@ -105,10 +95,18 @@ class WorkflowAgent(BaseAgent):
             yield {"type": "error", "error": " ".join(dropped)}
 
         self._engine.run_persisted = self._run_persisted
-        yield from self._engine.execute({"input_documents": input_documents}, query)
-        self._finalize_workflow_run(
-            workflow_owner_id, run_user_id, pg_workflow_id, query
-        )
+        interrupted = True
+        try:
+            yield from self._engine.execute({"input_documents": input_documents}, query)
+            interrupted = False
+        finally:
+            self._finalize_workflow_run(
+                workflow_owner_id,
+                run_user_id,
+                pg_workflow_id,
+                query,
+                interrupted=interrupted,
+            )
 
     def _load_workflow_graph(self) -> Optional[WorkflowGraph]:
         if self._workflow_data:
@@ -167,9 +165,7 @@ class WorkflowAgent(BaseAgent):
             if not owner_id and isinstance(self.decoded_token, dict):
                 owner_id = self.decoded_token.get("sub")
             if not owner_id:
-                logger.error(
-                    f"Workflow owner not available for workflow load: {self.workflow_id}"
-                )
+                logger.error(f"Workflow owner not available for workflow load: {self.workflow_id}")
                 return None
 
             with db_readonly() as conn:
@@ -179,10 +175,7 @@ class WorkflowAgent(BaseAgent):
                 else:
                     workflow_row = wf_repo.get_by_legacy_id(self.workflow_id, owner_id)
                 if workflow_row is None:
-                    logger.error(
-                        f"Workflow {self.workflow_id} not found or inaccessible "
-                        f"for user {owner_id}"
-                    )
+                    logger.error(f"Workflow {self.workflow_id} not found or inaccessible for user {owner_id}")
                     return None
                 pg_workflow_id = str(workflow_row["id"])
                 graph_version = workflow_row.get("current_graph_version", 1)
@@ -194,10 +187,12 @@ class WorkflowAgent(BaseAgent):
                     graph_version = 1
 
                 node_rows = WorkflowNodesRepository(conn).find_by_version(
-                    pg_workflow_id, graph_version,
+                    pg_workflow_id,
+                    graph_version,
                 )
                 edge_rows = WorkflowEdgesRepository(conn).find_by_version(
-                    pg_workflow_id, graph_version,
+                    pg_workflow_id,
+                    graph_version,
                 )
 
             workflow = Workflow(
@@ -250,9 +245,7 @@ class WorkflowAgent(BaseAgent):
         """
         return getattr(self, "initial_user_id", None) or getattr(self, "user", None) or workflow_owner_id
 
-    def _resolve_owned_workflow_pg_id(
-        self, conn: Any, owner_id: Optional[str]
-    ) -> Optional[str]:
+    def _resolve_owned_workflow_pg_id(self, conn: Any, owner_id: Optional[str]) -> Optional[str]:
         """Return the owned workflow's PG id, or None for an unowned/draft id."""
         if not self.workflow_id or not owner_id:
             return None
@@ -278,9 +271,7 @@ class WorkflowAgent(BaseAgent):
             return None
         try:
             with db_session() as conn:
-                pg_workflow_id = self._resolve_owned_workflow_pg_id(
-                    conn, workflow_owner_id
-                )
+                pg_workflow_id = self._resolve_owned_workflow_pg_id(conn, workflow_owner_id)
                 if pg_workflow_id is None:
                     return None
                 WorkflowRunsRepository(conn).create(
@@ -404,19 +395,24 @@ class WorkflowAgent(BaseAgent):
         run_user_id: Optional[str],
         pg_workflow_id: Optional[str],
         query: str,
+        interrupted: bool = False,
     ) -> None:
         """Write the run's terminal status/result; upsert the row if pre-creation was skipped.
 
         The run is owned by the *runner* (so it stays readable to the caller and
         matches the pre-created row); the workflow row is resolved by its *owner*.
+        When ``interrupted`` is set (client disconnect / mid-run error), the run is
+        recorded as FAILED regardless of the per-node log, so a partial run is never
+        left looking complete.
         """
         if not self._engine:
             return
         try:
+            status = ExecutionStatus.FAILED if interrupted else self._determine_run_status()
             run = WorkflowRun(
                 workflow_id=self.workflow_id or "unknown",
                 user=run_user_id,
-                status=self._determine_run_status(),
+                status=status,
                 inputs={"query": query},
                 outputs=self._serialize_state(self._engine.state),
                 steps=self._engine.get_execution_summary(),
@@ -429,9 +425,7 @@ class WorkflowAgent(BaseAgent):
                 return
             with db_session() as conn:
                 if pg_workflow_id is None:
-                    pg_workflow_id = self._resolve_owned_workflow_pg_id(
-                        conn, workflow_owner_id
-                    )
+                    pg_workflow_id = self._resolve_owned_workflow_pg_id(conn, workflow_owner_id)
                     if pg_workflow_id is None:
                         return
                 runs_repo = WorkflowRunsRepository(conn)
@@ -486,10 +480,7 @@ class WorkflowAgent(BaseAgent):
 
     def _serialize_state_value(self, value: Any) -> Any:
         if isinstance(value, dict):
-            return {
-                str(dict_key): self._serialize_state_value(dict_value)
-                for dict_key, dict_value in value.items()
-            }
+            return {str(dict_key): self._serialize_state_value(dict_value) for dict_key, dict_value in value.items()}
         if isinstance(value, list):
             return [self._serialize_state_value(item) for item in value]
         if isinstance(value, tuple):

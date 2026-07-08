@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  ARTIFACT_URL_ENVELOPE_MIME,
   buildPreviewDocument,
   bytesPreviewModeForMime,
   displayFilename,
@@ -237,14 +238,14 @@ describe('buildPreviewDocument', () => {
 });
 
 describe('readPresignedUrlEnvelope', () => {
-  const json = (body: unknown, contentType = 'application/json') =>
+  const envelope = (body: unknown, contentType = ARTIFACT_URL_ENVELOPE_MIME) =>
     new Response(JSON.stringify(body), {
       headers: { 'Content-Type': contentType },
     });
 
   it('extracts the presigned url from the s3 JSON envelope', async () => {
     const url = await readPresignedUrlEnvelope(
-      json({ success: true, url: 'https://signed.example/x?sig=1' }),
+      envelope({ success: true, url: 'https://signed.example/x?sig=1' }),
     );
     expect(url).toBe('https://signed.example/x?sig=1');
   });
@@ -258,20 +259,36 @@ describe('readPresignedUrlEnvelope', () => {
   });
 
   it('returns null for a JSON artifact whose bytes are not the envelope', async () => {
-    const res = json({ foo: 1 });
+    const res = envelope({ foo: 1 }, 'application/json');
     expect(await readPresignedUrlEnvelope(res)).toBeNull();
     // clone() was used to peek, so the original body is still consumable.
     expect(await res.json()).toEqual({ foo: 1 });
   });
 
+  it('ignores an attacker JSON artifact that mimics the envelope body', async () => {
+    // Under URL_STRATEGY=backend a `data` artifact is streamed with its own
+    // application/json content-type; even with the exact envelope shape it must
+    // NOT be treated as a redirect (open-redirect gadget) — only the vendor
+    // media type marks a real envelope.
+    const res = envelope(
+      { success: true, url: 'https://attacker.example/phish' },
+      'application/json',
+    );
+    expect(await readPresignedUrlEnvelope(res)).toBeNull();
+    expect(await res.json()).toEqual({
+      success: true,
+      url: 'https://attacker.example/phish',
+    });
+  });
+
   it('rejects a non-http(s) url in the envelope', async () => {
     expect(
       await readPresignedUrlEnvelope(
-        json({ success: true, url: 'javascript:alert(1)' }),
+        envelope({ success: true, url: 'javascript:alert(1)' }),
       ),
     ).toBeNull();
     expect(
-      await readPresignedUrlEnvelope(json({ success: true, url: '' })),
+      await readPresignedUrlEnvelope(envelope({ success: true, url: '' })),
     ).toBeNull();
   });
 });
@@ -308,7 +325,7 @@ describe('triggerResponseDownload', () => {
   it('navigates top-level to the presigned url for the s3 envelope', async () => {
     const res = new Response(
       JSON.stringify({ success: true, url: 'https://signed.example/x' }),
-      { headers: { 'Content-Type': 'application/json' } },
+      { headers: { 'Content-Type': ARTIFACT_URL_ENVELOPE_MIME } },
     );
     expect(await triggerResponseDownload(res, 'f.bin')).toBe(true);
     // No blob path for the presigned envelope.

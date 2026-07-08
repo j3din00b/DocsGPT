@@ -9,9 +9,11 @@ temp cleanup — so a hostile filename or document is treated as inert data.
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -98,6 +100,31 @@ def _max_input_bytes() -> int:
     return int(getattr(settings, "SANDBOX_MAX_INPUT_BYTES", 25 * 1024 * 1024))
 
 
+_ZIP_CONTAINER_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx", ".epub"})
+
+
+def _reject_zip_bomb(data: bytes, suffix: str) -> Optional[str]:
+    """Return an error string if a zip-based document declares an implausible expansion, else None."""
+    if suffix not in _ZIP_CONTAINER_EXTENSIONS:
+        return None
+    max_entries = int(getattr(settings, "DOCUMENT_MAX_ARCHIVE_ENTRIES", 10000))
+    cap = int(getattr(settings, "DOCUMENT_MAX_DECOMPRESSED_BYTES", 300 * 1024 * 1024))
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            infos = zf.infolist()
+            if len(infos) > max_entries:
+                return f"document archive has too many entries ({len(infos)} > {max_entries})."
+            total = 0
+            for info in infos:
+                total += info.file_size
+                if total > cap:
+                    return f"document decompresses to too much data: exceeds the {cap}-byte cap."
+    except zipfile.BadZipFile:
+        # Not a readable zip; the format-specific parser will surface a clean error.
+        return None
+    return None
+
+
 def _resolve_ocr_enabled(ocr: str) -> bool:
     """Resolve the OCR flag from the ``ocr`` arg and the deployment setting."""
     if ocr == "on":
@@ -178,9 +205,7 @@ def _compact_table(table: Dict[str, Any]) -> Dict[str, Any]:
     return compact
 
 
-def _docling_structured(
-    path: Path, *, ocr_enabled: bool, include_tables: bool, parser: Any = None
-) -> Dict[str, Any]:
+def _docling_structured(path: Path, *, ocr_enabled: bool, include_tables: bool, parser: Any = None) -> Dict[str, Any]:
     """Convert a document with Docling and return markdown + structured dict + bounded tables.
 
     When ``parser`` is the configured ``DoclingParser`` (the collapse-the-double-convert
@@ -307,6 +332,10 @@ def parse_document_bytes(
     if len(data) > cap:
         return {"error": f"input document is too large: {len(data)} bytes exceeds the {cap}-byte cap."}
 
+    bomb = _reject_zip_bomb(data, suffix)
+    if bomb is not None:
+        return {"error": bomb}
+
     ocr_enabled = _resolve_ocr_enabled(ocr)
     tmp_dir = tempfile.mkdtemp(prefix="docparse-")
     tmp_path = Path(tmp_dir) / safe_name
@@ -364,9 +393,7 @@ def _shape(
     # (Docling/torch conversion dominates the cost, so a re-convert ~doubles latency).
     if wants_tables and _is_docling_parser(parser):
         try:
-            extracted = _docling_structured(
-                path, ocr_enabled=ocr_enabled, include_tables=True, parser=parser
-            )
+            extracted = _docling_structured(path, ocr_enabled=ocr_enabled, include_tables=True, parser=parser)
             text = extracted["markdown"]
             tables: List[Dict[str, Any]] = [_compact_table(t) for t in extracted["tables"]]
         except Exception:
@@ -392,8 +419,10 @@ def _shape(
     tables: List[Dict[str, Any]] = []
     if wants_tables:
         try:
-            tables = [_compact_table(t) for t in _docling_structured(
-                path, ocr_enabled=ocr_enabled, include_tables=True)["tables"]]
+            tables = [
+                _compact_table(t)
+                for t in _docling_structured(path, ocr_enabled=ocr_enabled, include_tables=True)["tables"]
+            ]
         except Exception:
             tables = []
     bounded, truncated = _bounded(text)

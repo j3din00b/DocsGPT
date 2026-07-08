@@ -149,6 +149,7 @@ def capture_artifacts(
     user_id: str,
     conversation_id: Optional[str] = None,
     workflow_run_id: Optional[str] = None,
+    message_id: Optional[str] = None,
     produced_by: Optional[Dict[str, Any]] = None,
     outputs: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -198,6 +199,7 @@ def capture_artifacts(
                 user_id=user_id,
                 conversation_id=conversation_id,
                 workflow_run_id=workflow_run_id,
+                message_id=message_id,
                 produced_by=produced_by,
             )
         except QuotaExceeded:
@@ -217,6 +219,7 @@ def persist_artifact(
     user_id: str,
     conversation_id: Optional[str] = None,
     workflow_run_id: Optional[str] = None,
+    message_id: Optional[str] = None,
     produced_by: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Store a captured workspace file as a new artifact (kind/mime inferred from its name)."""
@@ -234,6 +237,7 @@ def persist_artifact(
         title=display_name,
         conversation_id=conversation_id,
         workflow_run_id=workflow_run_id,
+        message_id=message_id,
         produced_by=produced_by,
     )
 
@@ -341,6 +345,7 @@ def persist_new_artifact(
     title: Optional[str] = None,
     conversation_id: Optional[str] = None,
     workflow_run_id: Optional[str] = None,
+    message_id: Optional[str] = None,
     spec: Any = None,
     preview_text: Optional[str] = None,
     produced_by: Any = None,
@@ -366,6 +371,7 @@ def persist_new_artifact(
                 kind,
                 conversation_id=conversation_id,
                 workflow_run_id=workflow_run_id,
+                message_id=message_id,
                 title=title or safe_name,
                 mime_type=mime_type,
                 filename=safe_name,

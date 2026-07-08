@@ -1,7 +1,25 @@
-# docsgpt-sandbox runner (Jupyter Kernel Gateway). Sessions are in-process
-# kernels, never child containers; the Docker socket is NOT mounted. Network
-# egress is constrained by the NetworkPolicy under
-# deployment/k8s/network-policies/sandbox-egress-policy.yaml -- apply both.
+# docsgpt-sandbox runner (Jupyter Kernel Gateway). OPT-IN: this manifest and its
+# NetworkPolicy are NOT in kustomization.yaml; apply them only when enabling
+# code execution. Sessions are in-process kernels, never child containers; the
+# Docker socket is NOT mounted. Network egress is constrained by the NetworkPolicy
+# under deployment/k8s/network-policies/sandbox-egress-policy.yaml -- apply both.
+#
+# REQUIRED before enabling: create the shared gateway-token Secret and add the
+# runner env to the app pods (docsgpt-api / docsgpt-worker), which the default
+# docsgpt-deploy.yaml intentionally omits (sandbox is off by default):
+#   kubectl create secret generic docsgpt-sandbox-gateway \
+#     --from-literal=token="$(openssl rand -hex 32)"
+#   # on docsgpt-api and docsgpt-worker containers, add:
+#   #   - name: SANDBOX_GATEWAY_URL
+#   #     value: "http://docsgpt-sandbox:8888"
+#   #   - name: SANDBOX_KERNEL_NAME
+#   #     value: "docsgpt-python"
+#   #   - name: SANDBOX_GATEWAY_AUTH_TOKEN
+#   #     valueFrom: { secretKeyRef: { name: docsgpt-sandbox-gateway, key: token } }
+# The gateway authenticates every HTTP + WebSocket request with the token, so
+# kernel code cannot reach the gateway control API over loopback (enumerate/kill
+# sibling kernels or bypass the session cap). The gateway fails closed if the
+# token is unset.
 #
 # On Linux prod, schedule this onto a gVisor `runsc` RuntimeClass for kernel
 # isolation (uncomment `runtimeClassName` once the node has it installed).
@@ -52,6 +70,13 @@ spec:
               drop:
                 - ALL
           env:
+            # Shared gateway token; the launcher fails closed if it is unset.
+            # Must match SANDBOX_GATEWAY_AUTH_TOKEN on the app pods.
+            - name: SANDBOX_GATEWAY_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: docsgpt-sandbox-gateway
+                  key: token
             - name: JUPYTER_RUNTIME_DIR
               value: /tmp/jupyter-runtime
             - name: JUPYTER_DATA_DIR

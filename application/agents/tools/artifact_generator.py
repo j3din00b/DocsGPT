@@ -275,7 +275,7 @@ _RENDERERS: Dict[str, str] = {
         "    if c is None:\n"
         "        return ''\n"
         "    if isinstance(c, str) and c[:1] in ('=', '+', '-', '@', chr(9), chr(13), chr(10)):\n"
-        "        return \"'\" + c\n"
+        '        return "\'" + c\n'
         "    return c\n"
         "wb = Workbook()\n"
         "wb.remove(wb.active)\n"
@@ -359,8 +359,8 @@ _RENDERERS: Dict[str, str] = {
         "    'code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}'\n"
         ")\n"
         "doc = (\n"
-        "    '<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">'\n"
-        "    '<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">'\n"
+        '    \'<!doctype html><html lang="en"><head><meta charset="utf-8">\'\n'
+        '    \'<meta name="viewport" content="width=device-width,initial-scale=1">\'\n'
         "    '<title>' + esc(title or 'Report') + '</title>'\n"
         "    '<style>' + css + '</style></head><body>'\n"
         "    + ''.join(parts) + '</body></html>'\n"
@@ -397,6 +397,7 @@ class ArtifactGeneratorTool(Tool):
         self.tool_id: Optional[str] = self.config.get("tool_id")
         self.conversation_id: Optional[str] = self.config.get("conversation_id")
         self.workflow_run_id: Optional[str] = self.config.get("workflow_run_id")
+        self.message_id: Optional[str] = self.config.get("message_id")
         self._last_artifact_id: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -530,6 +531,7 @@ class ArtifactGeneratorTool(Tool):
                 title=title,
                 conversation_id=self.conversation_id,
                 workflow_run_id=self.workflow_run_id,
+                message_id=self.message_id,
                 spec=spec,
                 produced_by=self._produced_by("create_artifact", kind),
             )

@@ -395,6 +395,33 @@ def reap_sandbox_sessions(self):
     return {"reaped": len(reaped)}
 
 
+@celery.task(bind=True, acks_late=False)
+def reap_stale_workflow_runs(self):
+    """Fail workflow runs stranded in ``running`` past the stale deadline.
+
+    A run row is pre-created as ``running`` and finalized when its generator
+    finishes; a client disconnect or worker crash can leave it ``running``
+    forever. This closes those rows out so the UI/API stop showing a run that
+    will never complete.
+    """
+    from datetime import datetime, timezone
+
+    from application.core.settings import settings
+    from application.storage.db.engine import get_engine
+    from application.storage.db.repositories.workflow_runs import WorkflowRunsRepository
+
+    try:
+        stale_seconds = max(60, int(settings.WORKFLOW_RUN_STALE_SECONDS))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
+        engine = get_engine()
+        with engine.begin() as conn:
+            reaped = WorkflowRunsRepository(conn).mark_stale_running_failed(cutoff)
+    except Exception:  # noqa: BLE001 - housekeeping must never crash the beat loop
+        logging.getLogger(__name__).exception("reap_stale_workflow_runs failed")
+        return {"reaped": 0, "error": True}
+    return {"reaped": reaped}
+
+
 @celery.on_after_configure.connect
 def setup_periodic_tasks(sender, **kwargs):
     from application.core.settings import settings
@@ -467,6 +494,13 @@ def setup_periodic_tasks(sender, **kwargs):
         timedelta(seconds=60),
         reap_sandbox_sessions.s(),
         name="reap-sandbox-sessions",
+    )
+    # Fail workflow runs stranded in ``running`` (client disconnect / crash) so
+    # they don't linger forever. Every few minutes is plenty; the cutoff is hours.
+    sender.add_periodic_task(
+        timedelta(seconds=300),
+        reap_stale_workflow_runs.s(),
+        name="reap-stale-workflow-runs",
     )
 
 

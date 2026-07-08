@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from application.storage.db.base_repository import row_to_dict
@@ -86,6 +86,28 @@ class WorkflowRunsRepository:
         )
         res = self._conn.execute(stmt)
         return res.rowcount > 0
+
+    def mark_stale_running_failed(self, older_than: datetime) -> int:
+        """Fail runs left in ``running`` (no ``ended_at``) since before ``older_than``.
+
+        The run row is pre-created as ``running`` and finalized when its generator
+        finishes; a client disconnect or a worker crash can strand it in ``running``
+        forever, since nothing else finalizes it. This closes those rows out so they
+        don't linger. Returns the number of rows updated.
+        """
+        stmt = (
+            workflow_runs_table.update()
+            .where(workflow_runs_table.c.status == "running")
+            .where(workflow_runs_table.c.ended_at.is_(None))
+            .where(workflow_runs_table.c.started_at < older_than)
+            .values(
+                status="failed",
+                ended_at=func.now(),
+                result={"error": "Run did not complete (timed out or the client disconnected)."},
+            )
+        )
+        res = self._conn.execute(stmt)
+        return res.rowcount
 
     def get(self, run_id: str) -> Optional[dict]:
         res = self._conn.execute(

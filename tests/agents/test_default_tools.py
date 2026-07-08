@@ -175,21 +175,22 @@ class TestValidation:
         ]
 
     def test_shipped_defaults_validate(self):
-        # The real shipped DEFAULT_CHAT_TOOLS must pass startup validation.
-        # code_executor is NOT shipped default-on (it needs a running sandbox runner);
-        # artifact_generator stays default-on and usable.
+        # The real shipped DEFAULT_CHAT_TOOLS must pass startup validation. Neither
+        # sandbox-backed tool is shipped default-on (both need a running runner).
         usable = default_tools.validate_default_chat_tools()
         assert "code_executor" not in default_tools.settings.DEFAULT_CHAT_TOOLS
-        assert "artifact_generator" in usable
+        assert "artifact_generator" not in default_tools.settings.DEFAULT_CHAT_TOOLS
+        assert usable  # the remaining defaults (memory/read_webpage/scheduler) validate
 
-    def test_code_executor_not_a_shipped_default_but_artifact_generator_is(self):
-        # code_executor is enabled per-agent (needs a sandbox runner); it must not be
-        # advertised on a fresh deploy. artifact_generator stays a shipped default.
+    def test_sandbox_tools_not_shipped_defaults(self):
+        # code_executor and artifact_generator both render/execute through the
+        # sandbox runner, an opt-in service; a fresh deploy without a runner must
+        # not advertise tools that hard-fail on every call. Enable per-agent.
         assert "code_executor" not in default_tools.settings.DEFAULT_CHAT_TOOLS
-        assert "artifact_generator" in default_tools.settings.DEFAULT_CHAT_TOOLS
+        assert "artifact_generator" not in default_tools.settings.DEFAULT_CHAT_TOOLS
         names = {r["name"] for r in default_tools.synthesized_default_tools(None)}
         assert "code_executor" not in names
-        assert "artifact_generator" in names
+        assert "artifact_generator" not in names
 
     def test_tool_with_required_config_is_rejected(self, monkeypatch):
         # ``brave`` needs an API key.
@@ -339,18 +340,20 @@ class TestResolveToolById:
         assert row["builtin"] is True
         assert row["default"] is True
 
-    @pytest.mark.parametrize("name", ["artifact_generator"])
-    def test_sandbox_default_id_resolves_in_memory(self, name):
-        # artifact_generator stays a default chat tool: its synthetic default id ->
-        # name -> in-memory row (loaded user-scoped at execute time, like scheduler).
-        # code_executor is no longer default-on, so its synthetic id no longer
-        # resolves via this path (see open_notes on the per-agent reachability gap).
+    @pytest.mark.parametrize("name", ["code_executor", "artifact_generator"])
+    def test_sandbox_tool_id_resolves_in_memory(self, name):
+        # Both sandbox tools are opt-in per agent (removed from DEFAULT_CHAT_TOOLS)
+        # but stay registered as agent-selectable builtins, so their synthetic id
+        # still resolves to an in-memory row (loaded user-scoped at execute time)
+        # — an agent that enabled one never silently loses it.
+        assert name not in default_tools.settings.DEFAULT_CHAT_TOOLS
+        assert name in default_tools.BUILTIN_AGENT_TOOLS
         tool_id = default_tools.default_tool_id(name)
-        assert default_tools.default_tool_name_for_id(tool_id) == name
         row = default_tools.resolve_tool_by_id(tool_id, "user-x")
         assert row is not None
         assert row["name"] == name
         assert row["id"] == tool_id
+        assert row["builtin"] is True
 
     def test_read_document_builtin_id_resolves_workflow_only(self):
         # read_document is a workflow-only builtin: its synthetic id resolves

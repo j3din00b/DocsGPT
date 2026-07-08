@@ -85,11 +85,7 @@ def _record_proposed(
                 tool_id=tool_id if tool_id and looks_like_uuid(tool_id) else None,
                 message_id=message_id,
                 user_id=user_id,
-                agent_id=(
-                    str(agent_id)
-                    if agent_id and looks_like_uuid(str(agent_id))
-                    else None
-                ),
+                agent_id=(str(agent_id) if agent_id and looks_like_uuid(str(agent_id)) else None),
             )
         if not inserted:
             logger.warning(
@@ -147,11 +143,7 @@ def _mark_executed(
                 message_id=message_id,
                 artifact_id=artifact_id,
                 user_id=user_id,
-                agent_id=(
-                    str(agent_id)
-                    if agent_id and looks_like_uuid(str(agent_id))
-                    else None
-                ),
+                agent_id=(str(agent_id) if agent_id and looks_like_uuid(str(agent_id)) else None),
             )
     except Exception:
         logger.exception("tool_call_attempts executed write failed for %s", call_id)
@@ -160,9 +152,7 @@ def _mark_executed(
 def _mark_failed(call_id: str, error: str, *, user_id: Optional[str] = None) -> None:
     try:
         with db_session() as conn:
-            ToolCallAttemptsRepository(conn).mark_failed(
-                call_id, error, user_id=user_id
-            )
+            ToolCallAttemptsRepository(conn).mark_failed(call_id, error, user_id=user_id)
     except Exception:
         logger.exception("tool_call_attempts failed-write failed for %s", call_id)
 
@@ -191,9 +181,7 @@ class ToolExecutor:
         # so check_pause returns headless_denied sentinels instead.
         self.headless = bool(headless)
         # Tool-instance ids pre-authorized for headless approval-gated execution.
-        self.tool_allowlist: set = (
-            {str(x) for x in tool_allowlist} if tool_allowlist else set()
-        )
+        self.tool_allowlist: set = {str(x) for x in tool_allowlist} if tool_allowlist else set()
         self.tool_calls: List[Dict] = []
         self._loaded_tools: Dict[str, object] = {}
         self.conversation_id: Optional[str] = None
@@ -234,11 +222,7 @@ class ToolExecutor:
         tools plus the synthesized defaults. Used to gate tool-specific prompt
         sections via the ``tools.enabled`` template namespace.
         """
-        return {
-            str(tool["name"])
-            for tool in self.get_tools().values()
-            if isinstance(tool, dict) and tool.get("name")
-        }
+        return {str(tool["name"]) for tool in self.get_tools().values() if isinstance(tool, dict) and tool.get("name")}
 
     def _get_tools_by_api_key(self, api_key: str) -> Dict[str, Dict]:
         """Resolve an agent's toolset — exactly ``agents.tools``, no defaults."""
@@ -249,11 +233,7 @@ class ToolExecutor:
             agent_data = AgentsRepository(conn).find_by_key(api_key)
             tool_ids = agent_data.get("tools", []) if agent_data else []
             tools_repo = UserToolsRepository(conn)
-            owner = (
-                (agent_data.get("user_id") or agent_data.get("user"))
-                if agent_data
-                else None
-            )
+            owner = (agent_data.get("user_id") or agent_data.get("user")) if agent_data else None
             tools: List[Dict] = []
             for tid in tool_ids:
                 row = resolve_tool_by_id(tid, owner, user_tools_repo=tools_repo)
@@ -270,29 +250,23 @@ class ToolExecutor:
         """Resolve an agentless chat's toolset: explicit user tools plus defaults."""
         with db_readonly() as conn:
             user_tools = UserToolsRepository(conn).list_active_for_user(user)
-            user_doc = (
-                UsersRepository(conn).get(user) if self.agent_id is None else None
-            )
+            user_doc = UsersRepository(conn).get(user) if self.agent_id is None else None
         # Headless agentless runs (e.g. scheduled fire) drop chat-only
         # tools (``scheduler``) from explicit user_tools too.
         filtered_user_tools = [
-            t for t in user_tools
-            if not (self.headless and is_headless_excluded_tool(t.get("name")))
+            t for t in user_tools if not (self.headless and is_headless_excluded_tool(t.get("name")))
         ]
         # Index keys (ints) and synthetic uuid5 keys can't collide.
-        tools: Dict[str, Dict] = {
-            str(i): tool for i, tool in enumerate(filtered_user_tools)
-        }
+        tools: Dict[str, Dict] = {str(i): tool for i, tool in enumerate(filtered_user_tools)}
         if self.agent_id is None:
             for default_row in synthesized_default_tools(
-                user_doc, headless=self.headless,
+                user_doc,
+                headless=self.headless,
             ):
                 tools[str(default_row["id"])] = default_row
         return tools
 
-    def merge_client_tools(
-        self, tools_dict: Dict, client_tools: List[Dict]
-    ) -> Dict:
+    def merge_client_tools(self, tools_dict: Dict, client_tools: List[Dict]) -> Dict:
         """Merge client-provided tool definitions into tools_dict.
 
         Client tools use the standard function-calling format::
@@ -358,18 +332,12 @@ class ToolExecutor:
             if not is_api and "actions" not in tool:
                 continue
 
-            actions = (
-                tool["config"]["actions"].values()
-                if is_api
-                else tool["actions"]
-            )
+            actions = tool["config"]["actions"].values() if is_api else tool["actions"]
 
             for action in actions:
                 if not action.get("active", True):
                     continue
-                entries.append(
-                    (tool_id, tool.get("name", ""), action["name"], action, is_client)
-                )
+                entries.append((tool_id, tool.get("name", ""), action["name"], action, is_client))
                 name_counts[action["name"]] += 1
 
         # Pass 2: assign LLM-visible names and build mappings
@@ -379,34 +347,19 @@ class ToolExecutor:
 
         result = []
         for tool_id, tool_name, action_name, action, is_client in entries:
-            if (
-                name_counts[action_name] == 1
-                and len(action_name) <= _MAX_LLM_NAME_LEN
-            ):
+            if name_counts[action_name] == 1 and len(action_name) <= _MAX_LLM_NAME_LEN:
                 llm_name = action_name
             else:
                 # An over-long unique name skips the prefix — it needs
                 # truncation, not disambiguation.
-                prefix = (
-                    _sanitize_tool_prefix(tool_name)
-                    if name_counts[action_name] > 1
-                    else ""
-                )
-                base = (
-                    f"{prefix}_{action_name}"
-                    if prefix and not action_name.startswith(f"{prefix}_")
-                    else action_name
-                )
+                prefix = _sanitize_tool_prefix(tool_name) if name_counts[action_name] > 1 else ""
+                base = f"{prefix}_{action_name}" if prefix and not action_name.startswith(f"{prefix}_") else action_name
                 base = base[:_MAX_LLM_NAME_LEN]
                 # A duplicated bare name stays ambiguous, and a candidate
                 # must not steal a unique action's name or one already taken.
                 candidate = base
                 counter = 1
-                while (
-                    candidate == action_name
-                    or candidate in all_llm_names
-                    or name_counts.get(candidate, 0) == 1
-                ):
+                while candidate == action_name or candidate in all_llm_names or name_counts.get(candidate, 0) == 1:
                     suffix = f"_{counter}"
                     candidate = base[: _MAX_LLM_NAME_LEN - len(suffix)] + suffix
                     counter += 1
@@ -421,14 +374,16 @@ class ToolExecutor:
             else:
                 params = self._build_tool_parameters(action)
 
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": llm_name,
-                    "description": action.get("description", ""),
-                    "parameters": params,
-                },
-            })
+            result.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": llm_name,
+                        "description": action.get("description", ""),
+                        "parameters": params,
+                    },
+                }
+            )
         return result
 
     def _build_tool_parameters(self, action: Dict) -> Dict:
@@ -438,17 +393,13 @@ class ToolExecutor:
                 for k, v in action[param_type]["properties"].items():
                     if v.get("filled_by_llm", True):
                         params["properties"][k] = {
-                            key: value
-                            for key, value in v.items()
-                            if key not in ("filled_by_llm", "value", "required")
+                            key: value for key, value in v.items() if key not in ("filled_by_llm", "value", "required")
                         }
                         if v.get("required", False):
                             params["required"].append(k)
         return params
 
-    def check_pause(
-        self, tools_dict: Dict, call, llm_class_name: str
-    ) -> Optional[Dict]:
+    def check_pause(self, tools_dict: Dict, call, llm_class_name: str) -> Optional[Dict]:
         """Return a pending-action dict (approval / client / headless_denied) or None.
 
         In headless mode the dict's pause_type is ``headless_denied`` so the
@@ -478,9 +429,7 @@ class ToolExecutor:
                     "llm_name": llm_name,
                     "arguments": arguments,
                     "pause_type": "headless_denied",
-                    "deny_reason": (
-                        "Client-side tools cannot run in headless / scheduled runs."
-                    ),
+                    "deny_reason": ("Client-side tools cannot run in headless / scheduled runs."),
                     "error_type": "tool_not_allowed",
                     "thought_signature": getattr(call, "thought_signature", None),
                 }
@@ -498,9 +447,7 @@ class ToolExecutor:
 
         # Approval required
         if tool_data["name"] == "api_tool":
-            action_data = tool_data.get("config", {}).get("actions", {}).get(
-                action_name, {}
-            )
+            action_data = tool_data.get("config", {}).get("actions", {}).get(action_name, {})
         else:
             action_data = next(
                 (a for a in tool_data.get("actions", []) if a["name"] == action_name),
@@ -517,17 +464,22 @@ class ToolExecutor:
         # not reflect later approval-mode changes nor command-level
         # heuristics, so consult the tool directly.
         if tool_data.get("name") == "remote_device":
-            require_approval, denylist_forced = (
-                self._remote_device_requires_approval(
-                    tool_data, action_name, arguments,
-                )
+            require_approval, denylist_forced = self._remote_device_requires_approval(
+                tool_data,
+                action_name,
+                arguments,
             )
         elif tool_data.get("name") == "code_executor":
             # The deployment-level ``config.require_approval`` is authoritative
             # over the cached action snapshot, so consult the tool directly.
-            require_approval = self._code_executor_requires_approval(
-                tool_data, action_name, arguments,
-            ) or require_approval
+            require_approval = (
+                self._code_executor_requires_approval(
+                    tool_data,
+                    action_name,
+                    arguments,
+                )
+                or require_approval
+            )
 
         if require_approval:
             if self.headless:
@@ -548,10 +500,7 @@ class ToolExecutor:
                     "llm_name": llm_name,
                     "arguments": arguments,
                     "pause_type": "headless_denied",
-                    "deny_reason": (
-                        "This tool requires approval and is not in the run's "
-                        "tool_allowlist."
-                    ),
+                    "deny_reason": ("This tool requires approval and is not in the run's tool_allowlist."),
                     "error_type": "tool_not_allowed",
                     "thought_signature": getattr(call, "thought_signature", None),
                 }
@@ -577,7 +526,10 @@ class ToolExecutor:
         return None
 
     def _remote_device_requires_approval(
-        self, tool_data: Dict, action_name: str, arguments: Dict,
+        self,
+        tool_data: Dict,
+        action_name: str,
+        arguments: Dict,
     ) -> tuple[bool, bool]:
         """Live approval decision for a ``remote_device`` invocation.
 
@@ -597,13 +549,15 @@ class ToolExecutor:
             return tool.preview_decision(action_name, arguments)
         except Exception:
             logger.exception(
-                "remote_device preview_decision failed; defaulting to a "
-                "forced prompt",
+                "remote_device preview_decision failed; defaulting to a forced prompt",
             )
             return True, True
 
     def _code_executor_requires_approval(
-        self, tool_data: Dict, action_name: str, arguments: Dict,
+        self,
+        tool_data: Dict,
+        action_name: str,
+        arguments: Dict,
     ) -> bool:
         """Live approval decision for a ``code_executor`` invocation.
 
@@ -662,9 +616,7 @@ class ToolExecutor:
                 user_id=self.user,
                 agent_id=self.agent_id,
             ):
-                _mark_failed(
-                    call_id, tool_call_data["result"], user_id=self.user
-                )
+                _mark_failed(call_id, tool_call_data["result"], user_id=self.user)
             yield {"type": "tool_call", "data": {**tool_call_data, "status": "error"}}
             self.tool_calls.append(tool_call_data)
             return "Failed to parse tool call.", call_id
@@ -738,10 +690,7 @@ class ToolExecutor:
         # event and flip the journal row to ``failed`` instead of
         # killing the stream.
         if not isinstance(call_args, dict):
-            error_message = (
-                f"Tool call arguments must be a JSON object, got "
-                f"{type(call_args).__name__}."
-            )
+            error_message = f"Tool call arguments must be a JSON object, got {type(call_args).__name__}."
             tool_call_data["result"] = error_message
             tool_call_data["arguments"] = {}
             if proposed_ok:
@@ -756,11 +705,7 @@ class ToolExecutor:
         action_data = (
             tool_data["config"]["actions"][action_name]
             if tool_data["name"] == "api_tool"
-            else next(
-                action
-                for action in tool_data["actions"]
-                if action["name"] == action_name
-            )
+            else next(action for action in tool_data["actions"] if action["name"] == action_name)
         )
 
         query_params, headers, body, parameters = {}, {}, {}, {}
@@ -774,29 +719,25 @@ class ToolExecutor:
         for param_type, target_dict in param_types.items():
             if param_type in action_data and action_data[param_type].get("properties"):
                 for param, details in action_data[param_type]["properties"].items():
-                    if (
-                        param not in call_args
-                        and "value" in details
-                        and details["value"]
-                    ):
+                    if param not in call_args and "value" in details and details["value"]:
                         target_dict[param] = details["value"]
         for param, value in call_args.items():
             for param_type, target_dict in param_types.items():
-                if param_type in action_data and param in action_data[param_type].get(
-                    "properties", {}
-                ):
+                if param_type in action_data and param in action_data[param_type].get("properties", {}):
                     target_dict[param] = value
 
         # Load tool (with caching)
         tool = self._get_or_load_tool(
-            tool_data, tool_id, action_name,
-            headers=headers, query_params=query_params,
+            tool_data,
+            tool_id,
+            action_name,
+            headers=headers,
+            query_params=query_params,
         )
 
         if tool is None:
             error_message = (
-                f"Failed to load tool '{tool_data.get('name')}' (tool_id key={tool_id}): "
-                "missing 'id' on tool row."
+                f"Failed to load tool '{tool_data.get('name')}' (tool_id key={tool_id}): missing 'id' on tool row."
             )
             logger.error(
                 "tool_load_failed",
@@ -841,11 +782,7 @@ class ToolExecutor:
                 _mark_failed(call_id, str(exc), user_id=self.user)
             raise
 
-        get_artifact_id = (
-            getattr(tool, "get_artifact_id", None)
-            if tool_data["name"] != "api_tool"
-            else None
-        )
+        get_artifact_id = getattr(tool, "get_artifact_id", None) if tool_data["name"] != "api_tool" else None
 
         artifact_id = None
         if callable(get_artifact_id):
@@ -864,9 +801,7 @@ class ToolExecutor:
         result_full = str(result)
         tool_call_data["resolved_arguments"] = resolved_arguments
         tool_call_data["result_full"] = result_full
-        tool_call_data["result"] = (
-            f"{result_full[:50]}..." if len(result_full) > 50 else result_full
-        )
+        tool_call_data["result"] = f"{result_full[:50]}..." if len(result_full) > 50 else result_full
 
         # Tool side effect has run; flip the journal row so the
         # message-finalize path can later confirm it. If the proposed
@@ -887,9 +822,7 @@ class ToolExecutor:
         )
 
         stream_tool_call_data = {
-            key: value
-            for key, value in tool_call_data.items()
-            if key not in {"result_full", "resolved_arguments"}
+            key: value for key, value in tool_call_data.items() if key not in {"result_full", "resolved_arguments"}
         }
         yield {"type": "tool_call", "data": {**stream_tool_call_data, "status": "completed"}}
         self.tool_calls.append(tool_call_data)
@@ -897,8 +830,12 @@ class ToolExecutor:
         return result, call_id
 
     def _get_or_load_tool(
-        self, tool_data: Dict, tool_id: str, action_name: str,
-        headers: Optional[Dict] = None, query_params: Optional[Dict] = None,
+        self,
+        tool_data: Dict,
+        tool_id: str,
+        action_name: str,
+        headers: Optional[Dict] = None,
+        query_params: Optional[Dict] = None,
     ):
         """Load a tool, using cache when possible."""
         cache_key = f"{tool_data['name']}:{tool_id}:{self.user or ''}"
@@ -924,12 +861,8 @@ class ToolExecutor:
                 "query_params": query_params or {},
             }
             if "body_content_type" in action_config:
-                tool_config["body_content_type"] = action_config.get(
-                    "body_content_type", "application/json"
-                )
-                tool_config["body_encoding_rules"] = action_config.get(
-                    "body_encoding_rules", {}
-                )
+                tool_config["body_content_type"] = action_config.get("body_content_type", "application/json")
+                tool_config["body_encoding_rules"] = action_config.get("body_encoding_rules", {})
         else:
             tool_config = tool_data["config"].copy() if tool_data["config"] else {}
             # Credentials are PBKDF2-bound to the tool OWNER's sub, not the
@@ -955,9 +888,7 @@ class ToolExecutor:
                             "agent_id": self.agent_id,
                         },
                     )
-                decrypted = decrypt_credentials(
-                    tool_config["encrypted_credentials"], tool_owner
-                )
+                decrypted = decrypt_credentials(tool_config["encrypted_credentials"], tool_owner)
                 tool_config.update(decrypted)
                 tool_config["auth_credentials"] = decrypted
                 tool_config.pop("encrypted_credentials", None)
@@ -975,6 +906,8 @@ class ToolExecutor:
             tool_config["tool_id"] = str(row_id)
             if self.conversation_id:
                 tool_config["conversation_id"] = self.conversation_id
+                if self.message_id:
+                    tool_config["message_id"] = self.message_id
                 # Carry the request's own attachments so sandbox tools can
                 # lazily bridge a referenced chat attachment (conversation
                 # scope only; workflow nodes bridge attachments up front).
@@ -988,9 +921,7 @@ class ToolExecutor:
                 # Agent-bound: stamp schedules.agent_id. Agentless: the tool
                 # falls back to ``origin_conversation_id`` as the schedule's
                 # conversation home.
-                tool_config["agent_id"] = (
-                    str(self.agent_id) if self.agent_id else None
-                )
+                tool_config["agent_id"] = str(self.agent_id) if self.agent_id else None
             if tool_data["name"] == "mcp_tool":
                 tool_config["query_mode"] = True
 
@@ -1015,9 +946,7 @@ class ToolExecutor:
                 "arguments": tool_call.get("arguments"),
                 "artifact_id": tool_call.get("artifact_id"),
                 "result": (
-                    f"{str(tool_call['result'])[:50]}..."
-                    if len(str(tool_call["result"])) > 50
-                    else tool_call["result"]
+                    f"{str(tool_call['result'])[:50]}..." if len(str(tool_call["result"])) > 50 else tool_call["result"]
                 ),
                 "status": "completed",
             }

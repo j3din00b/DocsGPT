@@ -259,19 +259,29 @@ export function filenameFromContentDisposition(
 
 /**
  * Detect the `URL_STRATEGY=s3` presigned-URL envelope and return its `url`, or
- * null when the response is a byte stream (`URL_STRATEGY=backend`). The download
- * endpoint returns `{ success: true, url }` as JSON only when asked via
- * `?disposition=url`; a plain byte stream (even a JSON artifact's own bytes)
- * carries the file's own content-type and never this exact shape. The response
- * is `clone()`d before reading so the caller can still consume the original body
- * as bytes when this is not the envelope. The `url` must be an absolute http(s)
- * URL to further guard against a JSON artifact coincidentally matching.
+ * null when the response is a byte stream (`URL_STRATEGY=backend`).
+ *
+ * Detection keys off the server-set envelope media type, NOT the body shape:
+ * under the backend strategy the endpoint streams the artifact's own bytes, so a
+ * `data` artifact whose bytes are literally
+ * `{"success":true,"url":"https://attacker.example"}` would otherwise be read as
+ * a redirect target and navigated to (an open-redirect / phishing gadget). Only
+ * the real envelope carries `ARTIFACT_URL_ENVELOPE_MIME` (a stored artifact's own
+ * mime can never be this vendor value, and Content-Type is CORS-safelisted so it
+ * stays readable cross-origin), so attacker-controlled bytes can never be
+ * mistaken for one. The response is `clone()`d before reading so the caller can
+ * still consume the original body as bytes when this is not the envelope; the
+ * shape/absolute-http(s) checks remain as defense in depth.
  */
+export const ARTIFACT_URL_ENVELOPE_MIME =
+  'application/vnd.docsgpt.artifact-url+json';
+
 export async function readPresignedUrlEnvelope(
   response: Response,
 ): Promise<string | null> {
   const contentType = response.headers.get('Content-Type') ?? '';
-  if (!contentType.toLowerCase().includes('application/json')) return null;
+  if (!contentType.toLowerCase().includes(ARTIFACT_URL_ENVELOPE_MIME))
+    return null;
   const data = await response
     .clone()
     .json()

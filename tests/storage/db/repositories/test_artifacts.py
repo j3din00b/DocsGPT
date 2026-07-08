@@ -56,6 +56,23 @@ class TestCreateArtifact:
         assert v1["sha256"] == "abc"
         assert v1["spec"] == {"slides": []}
 
+    def test_persists_message_id_for_share_link_scope(self, pg_conn):
+        # Share-token artifact access gates on the artifact's message being within
+        # the conversation's shared first_n_queries snapshot, so creation paths
+        # must tag the artifact with the producing message. Without a stored
+        # message_id the share-link inheritance is dead (always denied).
+        repo = _repo(pg_conn)
+        msg_id = str(uuid.uuid4())
+        artifact = repo.create_artifact(
+            "user-1",
+            "document",
+            conversation_id=_conversation_id(),
+            message_id=msg_id,
+            filename="d.md",
+        )
+        assert str(artifact["message_id"]) == msg_id
+        assert str(repo.get_artifact(artifact["id"])["message_id"]) == msg_id
+
     def test_spec_only_version_allows_null_storage_path(self, pg_conn):
         repo = _repo(pg_conn)
         artifact = repo.create_artifact(
@@ -307,6 +324,37 @@ class TestQuotaAccounting:
         repo = _repo(pg_conn)
         repo.create_artifact("alice", "document", conversation_id=_conversation_id())
         assert repo.total_bytes_for_user("alice") == 0
+
+    def test_total_bytes_dedupes_restored_version_by_storage_path(self, pg_conn):
+        # Restore appends a version that re-points at an existing version's stored
+        # object (same storage_path + size). It stores no new bytes, so it must not
+        # inflate the user's usage.
+        repo = _repo(pg_conn)
+        art = repo.create_artifact(
+            "alice",
+            "document",
+            conversation_id=_conversation_id(),
+            storage_path="inputs/alice/artifacts/x/v1/deck.pptx",
+            size=500,
+            filename="deck.pptx",
+        )
+        # A genuine new version stores new bytes at a new key (+300 -> 800).
+        repo.append_version(
+            art["id"],
+            storage_path="inputs/alice/artifacts/x/v2/deck.pptx",
+            size=300,
+            filename="deck.pptx",
+        )
+        assert repo.total_bytes_for_user("alice") == 800
+        # Restoring v1 re-points at v1's object; usage stays 800, not 1300.
+        source = repo.get_version(art["id"], 1)
+        repo.append_version(
+            art["id"],
+            storage_path=source["storage_path"],
+            size=source["size"],
+            filename=source["filename"],
+        )
+        assert repo.total_bytes_for_user("alice") == 800
 
 
 class TestQuotaEnforcement:

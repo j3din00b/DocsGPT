@@ -1718,6 +1718,7 @@ def _persist_parse_result(result, title, user_id, parent, options):
             title=f"{title} (parsed)",
             conversation_id=parent.get("conversation_id"),
             workflow_run_id=parent.get("workflow_run_id"),
+            message_id=parent.get("message_id"),
             produced_by={"tool": "read_document", "action": "read_document", "tool_id": options.get("tool_id")},
         )
     except QuotaExceeded as exc:

@@ -609,6 +609,9 @@ class TestDownloadArtifact:
         assert resp.status_code == 200
         assert resp.json["success"] is True
         assert resp.json["url"].startswith("https://signed.example/")
+        # The envelope carries a distinctive media type so the client keys off
+        # a server signal, not the JSON body shape (open-redirect gadget guard).
+        assert resp.mimetype == "application/vnd.docsgpt.artifact-url+json"
 
     def test_stranger_denied(self, _patch_db, flask_app, monkeypatch):
         from application.api.user.artifacts.routes import DownloadArtifact
