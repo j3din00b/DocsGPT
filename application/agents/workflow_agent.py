@@ -90,10 +90,13 @@ class WorkflowAgent(BaseAgent):
             self._finalize_workflow_run(workflow_owner_id, run_user_id, pg_workflow_id, query)
             return
 
-        # Non-fatal: some attachments were dropped (oversize / unreadable). Tell the
-        # user which, then still run with the documents that did bridge.
+        # Non-fatal: some attachments were dropped (oversize / unreadable). Emit a
+        # ``notice`` -- NOT an ``error`` -- so the client surfaces which were dropped
+        # without marking the turn failed or ending the stream (an ``error`` event is
+        # terminal client-side and disables reconnect). The run then still executes
+        # with the documents that did bridge.
         if dropped:
-            yield {"type": "error", "user_facing": True, "error": " ".join(dropped)}
+            yield {"type": "notice", "notice": " ".join(dropped)}
 
         self._engine.run_persisted = self._run_persisted
         interrupted = True

@@ -552,6 +552,11 @@ class BaseAnswerResource:
                         if not line.get("user_facing"):
                             error_text = sanitize_api_error(error_text)
                         yield _emit({"type": "error", "error": error_text})
+                    elif line.get("type") == "notice":
+                        # Non-fatal, non-terminal notice (e.g. some workflow input
+                        # documents were dropped). Forwarded verbatim so the client can
+                        # surface it without failing the turn; never sanitized as an error.
+                        yield _emit({"type": "notice", "notice": line.get("notice", "")})
                     else:
                         yield _emit(line)
             if is_structured and structured_chunks:

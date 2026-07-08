@@ -415,11 +415,12 @@ def test_oversize_declared_attachment_skipped_with_notice(pg_engine, tmp_path, m
     # The oversize doc was dropped -> no input documents bridged, but the run ran.
     assert engine.captured_inputs is not None
     assert engine.captured_inputs["input_documents"] == []
-    # A non-fatal notice naming the dropped document was surfaced, flagged user_facing
-    # so the route emits the filename verbatim instead of a generic sanitized message.
-    errors = [e for e in events if e.get("type") == "error"]
-    assert errors and "big.txt" in errors[0]["error"]
-    assert errors[0].get("user_facing") is True
+    # A non-fatal notice naming the dropped document was surfaced as a ``notice``
+    # (NOT an ``error``, which is terminal client-side) so the run still completes.
+    notices = [e for e in events if e.get("type") == "notice"]
+    assert notices and "big.txt" in notices[0]["notice"]
+    # It must not be an error event (that would fail the turn and disable reconnect).
+    assert not [e for e in events if e.get("type") == "error"]
     # Nothing was persisted for the oversize doc.
     with pg_engine.connect() as conn:
         n = conn.execute(

@@ -206,25 +206,19 @@ class ArtifactsRepository:
         agent_id: str,
         user_id: str,
         conversation_id: Optional[str] = None,
-        owner_only: bool = False,
     ) -> list[dict]:
         """List an agent's artifacts (owner-scoped), optionally narrowed to one conversation.
 
         Scopes a per-agent api-key's artifact visibility to the conversations that
         agent produced, so the key cannot enumerate the owner's whole corpus. When
         ``conversation_id`` is given, the SQL narrows to that single conversation
-        (the per-visitor bearer capability for a public widget key). When
-        ``owner_only`` is set, shared-usage (widget/visitor) conversations are
-        excluded so a credential with no per-visitor conversation context (the MCP
-        Bearer key) sees only the owner's own chats, never other visitors' artifacts.
+        (the per-visitor bearer capability for a public widget key).
         """
         clauses = ["c.agent_id = CAST(:agent_id AS uuid)", "a.user_id = :user_id"]
         params: dict[str, Any] = {"agent_id": str(agent_id), "user_id": user_id}
         if conversation_id is not None:
             clauses.append("a.conversation_id = CAST(:conversation_id AS uuid)")
             params["conversation_id"] = conversation_id
-        if owner_only:
-            clauses.append("c.is_shared_usage = false")
         result = self._conn.execute(
             text(
                 "SELECT a.* FROM artifacts a "
@@ -236,21 +230,12 @@ class ArtifactsRepository:
         )
         return [_artifact_to_dict(r) for r in result.fetchall()]
 
-    def artifact_in_agent_scope(
-        self, artifact_id: str, agent_id: str, owner_only: bool = False
-    ) -> bool:
-        """True if ``artifact_id``'s parent conversation belongs to ``agent_id``.
-
-        With ``owner_only`` set, shared-usage (widget/visitor) conversations are
-        excluded so a per-visitor-less credential (the MCP Bearer key) can only
-        confirm scope for the owner's own chats, never another visitor's artifact.
-        """
+    def artifact_in_agent_scope(self, artifact_id: str, agent_id: str) -> bool:
+        """True if ``artifact_id``'s parent conversation belongs to ``agent_id``."""
         clauses = [
             "a.id = CAST(:id AS uuid)",
             "c.agent_id = CAST(:agent_id AS uuid)",
         ]
-        if owner_only:
-            clauses.append("c.is_shared_usage = false")
         result = self._conn.execute(
             text(
                 "SELECT 1 FROM artifacts a "

@@ -241,6 +241,40 @@ class TestCompleteStreamMethod:
             assert "artifact storage quota" in error_chunks[0]
             assert "Rate limit exceeded" not in error_chunks[0]
 
+    def test_notice_is_forwarded_verbatim_and_not_an_error(self, mock_mongo_db, flask_app):
+        """A non-fatal ``notice`` streams through as a notice, never as an error.
+
+        A ``notice`` (e.g. some workflow input documents were dropped) must not be
+        emitted as ``type: error`` -- the client treats an error event as terminal and
+        disables reconnect -- and its text must not be run through sanitize_api_error.
+        """
+        from application.api.answer.routes.base import BaseAnswerResource
+
+        with flask_app.app_context():
+            resource = BaseAnswerResource()
+
+            mock_agent = MagicMock()
+            mock_agent.gen.return_value = iter(
+                [{"type": "notice", "notice": "big.txt exceeds the per-file size limit"}]
+            )
+
+            stream = list(
+                resource.complete_stream(
+                    question="Test?",
+                    agent=mock_agent,
+                    conversation_id=None,
+                    user_api_key=None,
+                    decoded_token={"sub": "user123"},
+                    should_persist=False,
+                )
+            )
+
+            notice_chunks = [s for s in stream if '"type": "notice"' in s]
+            assert notice_chunks
+            assert "big.txt exceeds the per-file size limit" in notice_chunks[0]
+            # Crucially, it is not surfaced as an error event.
+            assert not [s for s in stream if '"type": "error"' in s]
+
     def test_non_user_facing_error_is_sanitized(self, mock_mongo_db, flask_app):
         """A raw error without the flag is still routed through sanitize_api_error."""
         from application.api.answer.routes.base import BaseAnswerResource

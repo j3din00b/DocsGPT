@@ -63,6 +63,9 @@ export interface Query {
   sources?: { title: string; text: string; link: string }[];
   tool_calls?: ToolCallsType[];
   error?: string;
+  // Non-fatal notice (e.g. some workflow input documents were dropped). Shown
+  // alongside the answer; unlike ``error`` it does not fail the turn or end the stream.
+  notice?: string;
   attachments?: { id: string; fileName: string }[];
   structured?: boolean;
   schema?: object;

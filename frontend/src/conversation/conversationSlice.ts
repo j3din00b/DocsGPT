@@ -297,6 +297,14 @@ export const fetchAnswer = createAsyncThunk<
               dispatch(
                 conversationSlice.actions.setStatus('awaiting_tool_actions'),
               );
+            } else if (data.type === 'notice') {
+              dispatch(
+                conversationSlice.actions.raiseNotice({
+                  conversationId: currentConversationId,
+                  index: targetIndex,
+                  message: data.notice ?? '',
+                }),
+              );
             } else if (data.type === 'error') {
               dispatch(conversationSlice.actions.setStatus('failed'));
               dispatch(
@@ -440,6 +448,14 @@ export const fetchAnswer = createAsyncThunk<
                 updateResearchProgress({
                   index: targetIndex,
                   progress: data.data,
+                }),
+              );
+            } else if (data.type === 'notice') {
+              dispatch(
+                conversationSlice.actions.raiseNotice({
+                  conversationId: currentConversationId,
+                  index: targetIndex,
+                  message: data.notice ?? '',
                 }),
               );
             } else if (data.type === 'error') {
@@ -703,6 +719,14 @@ export const submitToolActions = createAsyncThunk<
         );
       } else if (data.type === 'tool_calls_pending') {
         dispatch(conversationSlice.actions.setStatus('awaiting_tool_actions'));
+      } else if (data.type === 'notice') {
+        dispatch(
+          conversationSlice.actions.raiseNotice({
+            conversationId,
+            index: targetIndex,
+            message: data.notice ?? '',
+          }),
+        );
       } else if (data.type === 'error') {
         dispatch(conversationSlice.actions.setStatus('failed'));
         dispatch(
@@ -1009,6 +1033,24 @@ export const conversationSlice = createSlice({
       state.queries[index].error = message;
     },
 
+    // Non-fatal counterpart to ``raiseError``: records a notice on the query
+    // (e.g. some workflow input documents were dropped) WITHOUT setting the
+    // 'failed' status, so the turn keeps streaming and can still complete.
+    raiseNotice(
+      state,
+      action: PayloadAction<{
+        conversationId: string | null;
+        index: number;
+        message: string;
+      }>,
+    ) {
+      const { conversationId, index, message } = action.payload;
+      if (state.conversationId !== conversationId) return;
+      if (!state.queries[index]) return;
+
+      state.queries[index].notice = message;
+    },
+
     resetConversation: (state) => {
       state.queries = initialState.queries;
       state.status = initialState.status;
@@ -1054,6 +1096,7 @@ export const {
   setConversationId,
   setStatus,
   raiseError,
+  raiseNotice,
   resetConversation,
   applyMessageTail,
   updateMessageMeta,
