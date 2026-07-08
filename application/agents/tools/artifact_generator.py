@@ -217,6 +217,22 @@ _SCHEMAS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# Compact per-kind spec shapes surfaced in the tool metadata. Without this the
+# model has only the validation errors to reverse-engineer the schema from and
+# brute-forces spec shapes call after call. Keep in sync with ``_SCHEMAS``
+# (guarded by a test that checks every schema key appears here).
+_SPEC_SYNOPSIS = (
+    "Exact spec shape per kind (no other keys are accepted): "
+    'presentation {"title"?, "slides": [{"title"?, "bullets"?: [str], "notes"?}]} · '
+    'document {"title"?, "sections": [{"heading"?, "paragraphs"?: [str]}]} · '
+    'spreadsheet {"sheets": [{"name"?, "rows": [[cell, ...]]}]} · '
+    'pdf {"title"?, "blocks": [{"type": "heading"|"paragraph", "text"}]} · '
+    'html {"title"?, "blocks": [...]} where each block is '
+    '{"type": "heading", "text", "level"?: 1-3} | {"type": "paragraph", "text"} | '
+    '{"type": "list", "items": [str], "ordered"?: bool} | '
+    '{"type": "table", "rows": [[str]], "headers"?: [str]} | {"type": "code", "text"}'
+)
+
 # FIXED renderer programs. Each reads ``spec.json`` from the workspace as DATA
 # and writes ``out.<ext>``. The spec is NEVER string-interpolated into the
 # program; ``{spec_path}``/``{out_path}`` are server-controlled path literals.
@@ -426,7 +442,7 @@ class ArtifactGeneratorTool(Tool):
                             ),
                         },
                         "title": {"type": "string", "description": "Optional artifact title."},
-                        "spec": {"type": "object", "description": "Document spec matching the kind's schema."},
+                        "spec": {"type": "object", "description": _SPEC_SYNOPSIS},
                     },
                     "required": ["kind", "spec"],
                 },
@@ -466,7 +482,7 @@ class ArtifactGeneratorTool(Tool):
                             "description": "Artifact to rewrite; accepts the short ref like `A1` "
                             "returned by a previous artifact action, or the full artifact id.",
                         },
-                        "spec": {"type": "object", "description": "Replacement spec matching the kind's schema."},
+                        "spec": {"type": "object", "description": f"Replacement spec. {_SPEC_SYNOPSIS}"},
                     },
                     "required": ["id", "spec"],
                 },

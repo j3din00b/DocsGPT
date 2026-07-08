@@ -38,6 +38,32 @@ def _sanitize_tool_prefix(tool_name: Optional[str]) -> str:
 # program/secret is never written to logs even at DEBUG level.
 _LOG_VALUE_PREVIEW_LEN = 80
 
+# Longest tool result persisted on the message / streamed to the UI. The LLM
+# and the ``tool_call_attempts`` journal always receive the full result; this
+# only bounds the message JSONB copy. 50 chars hid every real error behind
+# "...", making retry storms undiagnosable from the stored conversation.
+PERSISTED_RESULT_MAX_LEN = 2000
+
+
+def truncate_tool_result(value: Any) -> Any:
+    """Bound a tool result for persistence/streaming; short values pass through unchanged."""
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= PERSISTED_RESULT_MAX_LEN:
+        return value
+    return f"{text[:PERSISTED_RESULT_MAX_LEN]}..."
+
+
+def result_status(result: Any) -> str:
+    """Derive the persisted status from a tool's result payload.
+
+    Tools report failure in-band (``{"status": "error", ...}`` or an ``error``
+    key) while the executor used to stamp every returned result ``completed``,
+    so the stored conversation showed failed calls as successes.
+    """
+    if isinstance(result, dict) and (result.get("status") == "error" or result.get("error")):
+        return "error"
+    return "completed"
+
 
 def _redact_args_for_log(args: Any) -> Any:
     """Truncate long string values so a code/body argument never lands in logs in full."""
@@ -605,6 +631,7 @@ class ToolExecutor:
                 "action_name": llm_name,
                 "arguments": call_args or {},
                 "result": f"Failed to parse tool call. Invalid tool name format: {llm_name}",
+                "status": "error",
             }
             # Journal the malformed call so it still shows up in tool analytics.
             if _record_proposed(
@@ -639,6 +666,7 @@ class ToolExecutor:
                 "action_name": llm_name,
                 "arguments": call_args,
                 "result": f"Tool with ID {tool_id} not found. Available tools: {list(tools_dict.keys())}",
+                "status": "error",
             }
             # Journal the unresolvable call so it still shows up in tool analytics.
             if _record_proposed(
@@ -693,6 +721,7 @@ class ToolExecutor:
             error_message = f"Tool call arguments must be a JSON object, got {type(call_args).__name__}."
             tool_call_data["result"] = error_message
             tool_call_data["arguments"] = {}
+            tool_call_data["status"] = "error"
             if proposed_ok:
                 _mark_failed(call_id, error_message, user_id=self.user)
             yield {
@@ -749,9 +778,10 @@ class ToolExecutor:
                 },
             )
             tool_call_data["result"] = error_message
+            tool_call_data["status"] = "error"
             if proposed_ok:
                 _mark_failed(call_id, error_message, user_id=self.user)
-            yield {"type": "tool_call", "data": {**tool_call_data, "status": "error"}}
+            yield {"type": "tool_call", "data": {**tool_call_data}}
             self.tool_calls.append(tool_call_data)
             return error_message, call_id
 
@@ -801,7 +831,10 @@ class ToolExecutor:
         result_full = str(result)
         tool_call_data["resolved_arguments"] = resolved_arguments
         tool_call_data["result_full"] = result_full
-        tool_call_data["result"] = f"{result_full[:50]}..." if len(result_full) > 50 else result_full
+        tool_call_data["result"] = truncate_tool_result(result_full)
+        # A tool that ran but reported failure in-band persists as ``error``,
+        # not ``completed`` -- the model saw an error and will likely retry.
+        tool_call_data["status"] = result_status(result)
 
         # Tool side effect has run; flip the journal row so the
         # message-finalize path can later confirm it. If the proposed
@@ -824,7 +857,7 @@ class ToolExecutor:
         stream_tool_call_data = {
             key: value for key, value in tool_call_data.items() if key not in {"result_full", "resolved_arguments"}
         }
-        yield {"type": "tool_call", "data": {**stream_tool_call_data, "status": "completed"}}
+        yield {"type": "tool_call", "data": {**stream_tool_call_data}}
         self.tool_calls.append(tool_call_data)
 
         return result, call_id
@@ -945,10 +978,8 @@ class ToolExecutor:
                 "action_name": tool_call.get("action_name"),
                 "arguments": tool_call.get("arguments"),
                 "artifact_id": tool_call.get("artifact_id"),
-                "result": (
-                    f"{str(tool_call['result'])[:50]}..." if len(str(tool_call["result"])) > 50 else tool_call["result"]
-                ),
-                "status": "completed",
+                "result": truncate_tool_result(tool_call.get("result")),
+                "status": tool_call.get("status", "completed"),
             }
             for tool_call in self.tool_calls
         ]

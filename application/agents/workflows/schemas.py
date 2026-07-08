@@ -165,8 +165,13 @@ class NodeExecutionLog(BaseModel):
     status: ExecutionStatus
     started_at: datetime
     completed_at: Optional[datetime] = None
+    duration_ms: Optional[int] = None
     error: Optional[str] = None
+    # The node's state DELTA (keys it added or changed), not the full state:
+    # point-in-time state is the merge of deltas up to this step.
     state_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    # Compact per-node tool-call summary: [{tool_name, action_name, status}].
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkflowRunCreate(BaseModel):

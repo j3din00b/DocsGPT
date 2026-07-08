@@ -77,6 +77,33 @@ class CodeExecutorTool(Tool):
     # ------------------------------------------------------------------
     # Tool ABC
     # ------------------------------------------------------------------
+    @staticmethod
+    def _environment_note() -> str:
+        """Backend-specific note on what the sandbox has preinstalled.
+
+        Without this the model discovers the environment by failing: importing
+        pandas on a bare image, or pip-installing libraries that are already
+        baked in. Keep the package lists in sync with deployment/sandbox/Dockerfile
+        (jupyter) and scripts/build_daytona_snapshot.py (daytona snapshot).
+        """
+        backend = str(getattr(settings, "SANDBOX_BACKEND", "jupyter") or "jupyter").lower()
+        if backend == "daytona":
+            if getattr(settings, "DAYTONA_SNAPSHOT", None):
+                return (
+                    "Preinstalled beyond the stdlib: python-pptx, python-docx, openpyxl, "
+                    "reportlab, lxml, pillow. pip install anything else from within the code "
+                    "before importing it."
+                )
+            return (
+                "Only the Python stdlib is preinstalled. pip install any third-party "
+                "package (pandas, python-docx, ...) from within the code before importing it."
+            )
+        return (
+            "Preinstalled beyond the stdlib: pandas, matplotlib, python-pptx, python-docx, "
+            "openpyxl, reportlab. pip install anything else from within the code before "
+            "importing it."
+        )
+
     def get_actions_metadata(self) -> List[Dict[str, Any]]:
         """Return JSON metadata describing the ``run_code`` action for tool schemas."""
         return [
@@ -88,7 +115,8 @@ class CodeExecutorTool(Tool):
                     "files under `tmp/`, or pass `outputs` to save only specific files); only a compact "
                     "summary (output tail + artifact references) is returned, never raw bytes. "
                     "Each call is capped at ~60s of wall-clock; for longer work, start it in the "
-                    "background and poll with additional run_code calls (use persist=true to keep state)."
+                    "background and poll with additional run_code calls (use persist=true to keep state). "
+                    + self._environment_note()
                 ),
                 "active": True,
                 "require_approval": self._require_approval,
@@ -105,7 +133,9 @@ class CodeExecutorTool(Tool):
                             "items": {"type": "string"},
                             "description": "Files to materialize into the workspace; each accepts the short "
                             "ref like `A1` returned by a previous artifact action, a full artifact id, or "
-                            "the name/id of a file the user attached to this conversation.",
+                            "the name/id of a file the user attached to this conversation. Each is staged "
+                            "at `inputs/<filename>` before the code runs — read it from that path (the "
+                            "result's `inputs_loaded` echoes the exact staged paths).",
                         },
                         "outputs": {
                             "type": "array",

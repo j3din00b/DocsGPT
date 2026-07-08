@@ -479,3 +479,45 @@ def test_materialize_inputs_dedupes_same_filename(monkeypatch):
     assert set(manager.put_files) == {"inputs/seed.csv", "inputs/seed-2.csv"}
     # Each path holds its own artifact's bytes (no clobber).
     assert manager.put_files["inputs/seed.csv"] != manager.put_files["inputs/seed-2.csv"]
+
+
+# ---------------------------------------------------------------------------
+# Metadata: workspace contract and preinstalled packages
+# ---------------------------------------------------------------------------
+
+
+def test_inputs_metadata_names_the_staging_path():
+    props = _tool().get_actions_metadata()[0]["parameters"]["properties"]
+    assert "inputs/<filename>" in props["inputs"]["description"]
+    assert "inputs_loaded" in props["inputs"]["description"]
+
+
+def test_description_lists_jupyter_preinstalled_packages(monkeypatch):
+    from application.core import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "SANDBOX_BACKEND", "jupyter", raising=False)
+    desc = _tool().get_actions_metadata()[0]["description"]
+    for pkg in ("pandas", "matplotlib", "python-docx"):
+        assert pkg in desc
+
+
+def test_description_warns_bare_daytona_image(monkeypatch):
+    from application.core import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "SANDBOX_BACKEND", "daytona", raising=False)
+    monkeypatch.setattr(settings_module.settings, "DAYTONA_SNAPSHOT", None, raising=False)
+    desc = _tool().get_actions_metadata()[0]["description"]
+    assert "Only the Python stdlib is preinstalled" in desc
+
+
+def test_description_lists_daytona_snapshot_packages(monkeypatch):
+    from application.core import settings as settings_module
+
+    monkeypatch.setattr(settings_module.settings, "SANDBOX_BACKEND", "daytona", raising=False)
+    monkeypatch.setattr(
+        settings_module.settings, "DAYTONA_SNAPSHOT", "docsgpt-artifacts-py312", raising=False
+    )
+    desc = _tool().get_actions_metadata()[0]["description"]
+    assert "python-pptx" in desc
+    # The snapshot bakes render libs only, not pandas.
+    assert "pandas" not in desc

@@ -363,3 +363,45 @@ def test_html_renderer_escapes_spec_markup():
     assert "<!doctype html>" in html_doc
     assert "<p>" in html_doc and "</p>" in html_doc
     assert "<table>" in html_doc and "<pre><code>" in html_doc
+
+
+# ---------------------------------------------------------------------------
+# Tool metadata: spec shapes are surfaced to the model
+# ---------------------------------------------------------------------------
+
+
+def _collect_schema_keys(schema, keys):
+    if isinstance(schema, dict):
+        for prop in schema.get("properties", {}):
+            keys.add(prop)
+        for sub in schema.values():
+            _collect_schema_keys(sub, keys)
+    elif isinstance(schema, list):
+        for sub in schema:
+            _collect_schema_keys(sub, keys)
+
+
+def test_spec_synopsis_covers_every_schema_key():
+    """Every kind and property in _SCHEMAS must appear in the metadata synopsis.
+
+    The synopsis is a hand-written mirror of _SCHEMAS; this guards drift when a
+    kind or key is added without updating what the model is told.
+    """
+    from application.agents.tools.artifact_generator import _SCHEMAS, _SPEC_SYNOPSIS
+
+    for kind, schema in _SCHEMAS.items():
+        assert kind in _SPEC_SYNOPSIS
+        keys: set = set()
+        _collect_schema_keys(schema, keys)
+        for key in keys:
+            assert key in _SPEC_SYNOPSIS, f"schema key {key!r} of kind {kind!r} missing from synopsis"
+
+
+def test_create_and_rewrite_metadata_embed_spec_synopsis():
+    from application.agents.tools.artifact_generator import _SPEC_SYNOPSIS
+
+    actions = {a["name"]: a for a in _tool().get_actions_metadata()}
+    create_spec = actions["create_artifact"]["parameters"]["properties"]["spec"]
+    rewrite_spec = actions["rewrite_artifact"]["parameters"]["properties"]["spec"]
+    assert _SPEC_SYNOPSIS in create_spec["description"]
+    assert _SPEC_SYNOPSIS in rewrite_spec["description"]

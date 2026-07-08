@@ -69,6 +69,9 @@ class WorkflowEngine:
         # artifact's parent; mint one when the caller has not supplied a
         # pre-created ``workflow_runs`` id so the engine is self-contained.
         self.workflow_run_id: str = workflow_run_id or str(uuid.uuid4())
+        # Per-node tool-call summary collected by the node executors and folded
+        # into the step log; reset before each node runs.
+        self._last_node_tool_calls: List[Dict[str, Any]] = []
         # False when no ``workflow_runs`` row backs ``workflow_run_id`` (unsaved /
         # embedded draft), so run-scoped artifacts must NOT be persisted as orphans.
         # Defaults True; WorkflowAgent flips it off on the draft path.
@@ -115,6 +118,12 @@ class WorkflowEngine:
             return
         current_node_id: Optional[str] = start_node.id
         steps = 0
+        # Snapshots are stored as per-node DELTAS: full state copied into
+        # every step grows the run row O(n^2) and repeats every upstream
+        # output verbatim. Point-in-time state = merge of deltas up to a step.
+        # The empty baseline attributes the pre-loop initialization (query,
+        # input documents) to the first step so steps alone reconstruct state.
+        pre_state: Dict[str, Any] = {}
 
         while current_node_id and steps < self.MAX_EXECUTION_STEPS:
             node = self.graph.get_node_by_id(current_node_id)
@@ -122,6 +131,7 @@ class WorkflowEngine:
                 yield {"type": "error", "error": f"Node {current_node_id} not found."}
                 break
             log_entry = self._create_log_entry(node)
+            self._last_node_tool_calls = []
 
             yield {
                 "type": "workflow_step",
@@ -134,7 +144,7 @@ class WorkflowEngine:
             try:
                 yield from self._execute_node(node)
                 log_entry["status"] = ExecutionStatus.COMPLETED.value
-                log_entry["completed_at"] = datetime.now(timezone.utc)
+                self._finalize_log_entry(log_entry, pre_state)
 
                 output_key = f"node_{node.id}_output"
                 node_output = self.state.get(output_key)
@@ -145,15 +155,14 @@ class WorkflowEngine:
                     "node_type": node.type.value,
                     "node_title": node.title,
                     "status": "completed",
-                    "state_snapshot": dict(self.state),
+                    "state_snapshot": log_entry["state_snapshot"],
                     "output": node_output,
                 }
             except Exception as e:
                 logger.error(f"Error executing node {node.id}: {e}", exc_info=True)
                 log_entry["status"] = ExecutionStatus.FAILED.value
                 log_entry["error"] = str(e)
-                log_entry["completed_at"] = datetime.now(timezone.utc)
-                log_entry["state_snapshot"] = dict(self.state)
+                self._finalize_log_entry(log_entry, pre_state)
                 self.execution_log.append(log_entry)
 
                 user_friendly_error = sanitize_api_error(e)
@@ -163,13 +172,13 @@ class WorkflowEngine:
                     "node_type": node.type.value,
                     "node_title": node.title,
                     "status": "failed",
-                    "state_snapshot": dict(self.state),
+                    "state_snapshot": log_entry["state_snapshot"],
                     "error": user_friendly_error,
                 }
                 yield {"type": "error", "error": user_friendly_error}
                 break
-            log_entry["state_snapshot"] = dict(self.state)
             self.execution_log.append(log_entry)
+            pre_state = dict(self.state)
 
             if node.type == NodeType.END:
                 break
@@ -199,6 +208,37 @@ class WorkflowEngine:
             "error": None,
             "state_snapshot": {},
         }
+
+    def _finalize_log_entry(self, log_entry: Dict[str, Any], pre_state: Dict[str, Any]) -> None:
+        """Stamp completion time, duration, the node's state delta, and its tool-call summary."""
+        completed_at = datetime.now(timezone.utc)
+        log_entry["completed_at"] = completed_at
+        log_entry["duration_ms"] = int((completed_at - log_entry["started_at"]).total_seconds() * 1000)
+        log_entry["state_snapshot"] = self._state_delta(pre_state)
+        if self._last_node_tool_calls:
+            log_entry["tool_calls"] = list(self._last_node_tool_calls)
+
+    def _state_delta(self, previous: Dict[str, Any]) -> Dict[str, Any]:
+        """Keys this node added or changed. Deleted keys are not tracked; nothing deletes state today."""
+        return {
+            key: value
+            for key, value in self.state.items()
+            if key not in previous or previous[key] != value
+        }
+
+    @staticmethod
+    def _summarize_tool_calls(node_agent: Any) -> List[Dict[str, Any]]:
+        """Compact per-node tool-call summary for the run record (no arguments/results)."""
+        executor = getattr(node_agent, "tool_executor", None)
+        calls = getattr(executor, "tool_calls", None) or []
+        return [
+            {
+                "tool_name": call.get("tool_name"),
+                "action_name": call.get("action_name"),
+                "status": call.get("status", "completed"),
+            }
+            for call in calls
+        ]
 
     def _get_next_node_id(self, current_node_id: str) -> Optional[str]:
         node = self.graph.get_node_by_id(current_node_id)
@@ -370,6 +410,7 @@ class WorkflowEngine:
         if node_config.stream_to_user:
             self._has_streamed = True
 
+        self._last_node_tool_calls = self._summarize_tool_calls(node_agent)
         full_response = "".join(full_response_parts).strip()
         output_value: Any = full_response
         if has_structured_response:
@@ -436,6 +477,15 @@ class WorkflowEngine:
         manager.put_file(session_id, "state.json", state_json)
         pre_signatures = snapshot_signatures(manager, session_id)
         result = manager.exec(session_id, code, timeout=timeout)
+        # Code nodes execute the sandbox directly (no tool_executor); record the
+        # run as a synthetic tool call so the step log shows it like agent nodes.
+        self._last_node_tool_calls = [
+            {
+                "tool_name": "code_executor",
+                "action_name": "run_code",
+                "status": "completed" if result.ok else "error",
+            }
+        ]
         if self.run_persisted:
             artifacts = capture_artifacts(
                 manager,
@@ -1083,8 +1133,10 @@ class WorkflowEngine:
                 status=ExecutionStatus(log["status"]),
                 started_at=log["started_at"],
                 completed_at=log.get("completed_at"),
+                duration_ms=log.get("duration_ms"),
                 error=log.get("error"),
                 state_snapshot=log.get("state_snapshot", {}),
+                tool_calls=log.get("tool_calls", []),
             )
             for log in self.execution_log
         ]

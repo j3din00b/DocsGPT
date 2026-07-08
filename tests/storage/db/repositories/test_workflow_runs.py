@@ -115,6 +115,8 @@ class TestMarkStaleRunningFailed:
         assert fetched["status"] == "failed"
         assert fetched["ended_at"] is not None
         assert "did not complete" in (fetched["result"] or {}).get("error", "")
+        # ended_at is the reap time, not when the run died; the marker says so.
+        assert (fetched["result"] or {}).get("failed_reason") == "stale_reaper"
 
     def test_leaves_recent_running_and_terminal_runs(self, pg_conn):
         wf = _wf(pg_conn)

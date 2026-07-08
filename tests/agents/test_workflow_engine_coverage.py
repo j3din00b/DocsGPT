@@ -846,3 +846,119 @@ class TestWorkflowBranchEndsNonEndNode:
         events = list(engine.execute({}, "q"))
         # Should complete without crash, branch ended warning logged
         assert len(events) > 0
+
+
+class TestStepTelemetry:
+    """Steps persist state DELTAS plus duration_ms and a per-node tool summary."""
+
+    def _run_state_workflow(self):
+        nodes = [
+            _make_node("n1", NodeType.START),
+            _make_node(
+                "n2",
+                NodeType.STATE,
+                "Set",
+                config={
+                    "config": {
+                        "operations": [
+                            {"expression": "1 + 1", "target_variable": "x"}
+                        ]
+                    }
+                },
+            ),
+            _make_node("n3", NodeType.END, "End", config={"config": {}}),
+        ]
+        edges = [_make_edge("e1", "n1", "n2"), _make_edge("e2", "n2", "n3")]
+        engine = WorkflowEngine(_make_graph(nodes, edges), _make_agent())
+        events = list(engine.execute({}, "q"))
+        return engine, events
+
+    @pytest.mark.unit
+    def test_step_snapshots_are_deltas_not_full_state(self):
+        engine, events = self._run_state_workflow()
+        by_node = {log["node_id"]: log for log in engine.execution_log}
+
+        # The start node's delta carries the initial state it set...
+        assert "query" in by_node["n1"]["state_snapshot"]
+        # ...and later nodes repeat none of it, only what they changed.
+        assert by_node["n2"]["state_snapshot"] == {"x": 2}
+        assert by_node["n3"]["state_snapshot"] == {}
+
+        # The streamed step events carry the same deltas.
+        streamed = {
+            e["node_id"]: e
+            for e in events
+            if e.get("type") == "workflow_step" and e.get("status") == "completed"
+        }
+        assert streamed["n2"]["state_snapshot"] == {"x": 2}
+        assert "query" not in streamed["n2"]["state_snapshot"]
+
+    @pytest.mark.unit
+    def test_steps_carry_duration_ms(self):
+        engine, _ = self._run_state_workflow()
+        for log in engine.execution_log:
+            assert isinstance(log["duration_ms"], int)
+            assert log["duration_ms"] >= 0
+
+        summary = engine.get_execution_summary()
+        assert all(step.duration_ms is not None for step in summary)
+
+    @pytest.mark.unit
+    def test_failed_step_snapshot_is_a_delta_too(self):
+        nodes = [
+            _make_node("n1", NodeType.START),
+            _make_node(
+                "n2",
+                NodeType.STATE,
+                "Bad",
+                config={
+                    "config": {
+                        "operations": [
+                            {"expression": "bad!!!", "target_variable": "x"}
+                        ]
+                    }
+                },
+            ),
+        ]
+        edges = [_make_edge("e1", "n1", "n2")]
+        engine = WorkflowEngine(_make_graph(nodes, edges), _make_agent())
+        events = list(engine.execute({}, "q"))
+
+        failed = [e for e in events if e.get("status") == "failed"]
+        assert failed and "query" not in failed[0]["state_snapshot"]
+        failed_log = engine.execution_log[-1]
+        assert failed_log["status"] == "failed"
+        assert failed_log["duration_ms"] >= 0
+
+    @pytest.mark.unit
+    def test_summarize_tool_calls_compacts_executor_calls(self):
+        engine = WorkflowEngine(_make_graph([], []), _make_agent())
+        node_agent = MagicMock()
+        node_agent.tool_executor.tool_calls = [
+            {
+                "tool_name": "artifact_generator",
+                "action_name": "create_artifact",
+                "arguments": {"kind": "html"},
+                "result": "x" * 5000,
+                "status": "error",
+            },
+            {
+                "tool_name": "artifact_generator",
+                "action_name": "create_artifact",
+                "arguments": {"kind": "html"},
+                "result": "ok",
+            },
+        ]
+        summary = engine._summarize_tool_calls(node_agent)
+        assert summary == [
+            {
+                "tool_name": "artifact_generator",
+                "action_name": "create_artifact",
+                "status": "error",
+            },
+            {
+                "tool_name": "artifact_generator",
+                "action_name": "create_artifact",
+                "status": "completed",
+            },
+        ]

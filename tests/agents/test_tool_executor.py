@@ -965,6 +965,8 @@ class TestToolExecutorExecute:
         assert "completed" in statuses
 
     def test_get_truncated_tool_calls(self):
+        from application.agents.tool_executor import PERSISTED_RESULT_MAX_LEN
+
         executor = ToolExecutor()
         executor.tool_calls = [
             {
@@ -973,13 +975,49 @@ class TestToolExecutorExecute:
                 "action_name": "act",
                 "arguments": {},
                 "result": "A" * 100,
+            },
+            {
+                "tool_name": "test",
+                "call_id": "2",
+                "action_name": "act",
+                "arguments": {},
+                "result": "B" * (PERSISTED_RESULT_MAX_LEN + 100),
+            },
+        ]
+
+        truncated = executor.get_truncated_tool_calls()
+        assert len(truncated) == 2
+        # Short results persist verbatim so stored errors stay diagnosable.
+        assert truncated[0]["result"] == "A" * 100
+        assert truncated[0]["status"] == "completed"
+        # Oversize results are bounded for the message JSONB copy.
+        assert len(truncated[1]["result"]) == PERSISTED_RESULT_MAX_LEN + 3
+        assert truncated[1]["result"].endswith("...")
+
+    def test_get_truncated_tool_calls_preserves_error_status(self):
+        executor = ToolExecutor()
+        executor.tool_calls = [
+            {
+                "tool_name": "test",
+                "call_id": "1",
+                "action_name": "act",
+                "arguments": {},
+                "result": "boom",
+                "status": "error",
             }
         ]
 
         truncated = executor.get_truncated_tool_calls()
-        assert len(truncated) == 1
-        assert len(truncated[0]["result"]) <= 53
-        assert truncated[0]["status"] == "completed"
+        assert truncated[0]["status"] == "error"
+
+    def test_result_status_reflects_in_band_tool_errors(self):
+        from application.agents.tool_executor import result_status
+
+        assert result_status({"status": "error", "error": "invalid spec"}) == "error"
+        assert result_status({"error": "input artifact A9 not found"}) == "error"
+        assert result_status({"status": "ok", "artifact_id": "x"}) == "completed"
+        assert result_status({"error": None, "status": "ok"}) == "completed"
+        assert result_status("plain text result") == "completed"
 
     def test_tool_caching(self, mock_tool_manager, monkeypatch):
         executor = ToolExecutor(user="test_user")

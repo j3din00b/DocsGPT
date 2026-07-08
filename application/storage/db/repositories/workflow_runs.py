@@ -103,7 +103,12 @@ class WorkflowRunsRepository:
             .values(
                 status="failed",
                 ended_at=func.now(),
-                result={"error": "Run did not complete (timed out or the client disconnected)."},
+                # failed_reason marks the reap so readers know ended_at is the
+                # reap time, not when the run actually died (duration is bogus).
+                result={
+                    "error": "Run did not complete (timed out or the client disconnected).",
+                    "failed_reason": "stale_reaper",
+                },
             )
         )
         res = self._conn.execute(stmt)
