@@ -371,9 +371,11 @@ class WorkflowEngine:
         # without a message_id, so providers that reuse deterministic call ids
         # ("functions.create_artifact:0") would otherwise collide across runs on
         # the tool_call_attempts primary key and drop the later journal rows.
-        node_agent.tool_executor.message_id = getattr(
-            self.agent.tool_executor, "message_id", None
-        )
+        node_executor = getattr(node_agent, "tool_executor", None)
+        if node_executor is not None:
+            node_executor.message_id = getattr(
+                getattr(self.agent, "tool_executor", None), "message_id", None
+            )
         # Run-scope the node agent's tools so artifact_generator / code_executor
         # address artifacts by this workflow run: a short ref (A1) created by one
         # node resolves for edit_artifact in a later node within the same run. Only
