@@ -234,6 +234,29 @@ class TestExecuteStateNode:
         assert "result" not in engine.state
 
 
+class TestEndNodeSeparator:
+
+    @pytest.mark.unit
+    def test_separates_from_prior_streamed_output(self):
+        # A prior streaming node ran, so the end template must be preceded by a
+        # paragraph break instead of mashing ("...growth.Sales analysis...").
+        node = _make_node("n1", NodeType.END, config={"config": {"output_template": "Final line."}})
+        engine = WorkflowEngine(_make_graph([node], []), _make_agent())
+        engine.state = {}
+        engine._has_streamed = True
+        answers = [e["answer"] for e in engine._execute_end_node(node)]
+        assert answers[0] == "\n\n"
+        assert answers[-1].strip() == "Final line."
+
+    @pytest.mark.unit
+    def test_no_separator_when_nothing_streamed(self):
+        node = _make_node("n1", NodeType.END, config={"config": {"output_template": "Final line."}})
+        engine = WorkflowEngine(_make_graph([node], []), _make_agent())
+        engine.state = {}
+        answers = [e["answer"] for e in engine._execute_end_node(node)]
+        assert answers == ["Final line."]
+
+
 class TestExecuteConditionNode:
 
     @pytest.mark.unit

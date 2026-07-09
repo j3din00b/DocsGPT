@@ -81,6 +81,22 @@ def _redact_args_for_log(args: Any) -> Any:
     return redacted
 
 
+def _journal_key(call_id: str, message_id: Optional[str]) -> str:
+    """Namespace the durability-journal key by the per-turn ``message_id``.
+
+    ``tool_call_attempts.call_id`` is a table-wide primary key, but providers
+    reuse deterministic ids (e.g. ``functions.create_artifact:0``) across turns
+    and users, so distinct calls collide on that PK and the later journal rows
+    are silently dropped (``ON CONFLICT DO NOTHING``). Scoping the key by
+    ``message_id`` (unique per turn) gives each logical call its own row while a
+    genuine retry of the same call within the same turn still dedupes. The raw
+    ``call_id`` is left untouched for LLM tool-call/tool-result pairing and the
+    UI. Headless attempts with no ``message_id`` keep the raw key (unchanged
+    pre-existing behaviour).
+    """
+    return f"{message_id}:{call_id}" if message_id else call_id
+
+
 def _record_proposed(
     call_id: str,
     tool_name: str,
@@ -104,7 +120,7 @@ def _record_proposed(
     try:
         with db_session() as conn:
             inserted = ToolCallAttemptsRepository(conn).record_proposed(
-                call_id,
+                _journal_key(call_id, message_id),
                 tool_name,
                 action_name,
                 arguments,
@@ -145,12 +161,13 @@ def _mark_executed(
     effect would be invisible to the journal. Both paths are scoped to
     the owning ``user_id`` so a reused ``call_id`` can't cross tenants.
     """
+    key = _journal_key(call_id, message_id)
     try:
         with db_session() as conn:
             repo = ToolCallAttemptsRepository(conn)
             if proposed_ok:
                 updated = repo.mark_executed(
-                    call_id,
+                    key,
                     result,
                     message_id=message_id,
                     artifact_id=artifact_id,
@@ -160,7 +177,7 @@ def _mark_executed(
                     return
             # Fallback synthesizes the row so the journal isn't lost.
             repo.upsert_executed(
-                call_id,
+                key,
                 tool_name=tool_name or "unknown",
                 action_name=action_name or "",
                 arguments=arguments if arguments is not None else {},
@@ -175,10 +192,18 @@ def _mark_executed(
         logger.exception("tool_call_attempts executed write failed for %s", call_id)
 
 
-def _mark_failed(call_id: str, error: str, *, user_id: Optional[str] = None) -> None:
+def _mark_failed(
+    call_id: str,
+    error: str,
+    *,
+    message_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+) -> None:
     try:
         with db_session() as conn:
-            ToolCallAttemptsRepository(conn).mark_failed(call_id, error, user_id=user_id)
+            ToolCallAttemptsRepository(conn).mark_failed(
+                _journal_key(call_id, message_id), error, user_id=user_id
+            )
     except Exception:
         logger.exception("tool_call_attempts failed-write failed for %s", call_id)
 
@@ -676,7 +701,12 @@ class ToolExecutor:
                 user_id=self.user,
                 agent_id=self.agent_id,
             ):
-                _mark_failed(call_id, tool_call_data["result"], user_id=self.user)
+                _mark_failed(
+                    call_id,
+                    tool_call_data["result"],
+                    message_id=self.message_id,
+                    user_id=self.user,
+                )
             yield {"type": "tool_call", "data": {**tool_call_data, "status": "error"}}
             self.tool_calls.append(tool_call_data)
             return "Failed to parse tool call.", call_id
@@ -714,6 +744,7 @@ class ToolExecutor:
                 _mark_failed(
                     call_id,
                     f"Tool with ID {tool_id} not found.",
+                    message_id=self.message_id,
                     user_id=self.user,
                 )
             yield {"type": "tool_call", "data": {**tool_call_data, "status": "error"}}
@@ -756,7 +787,9 @@ class ToolExecutor:
             tool_call_data["arguments"] = {}
             tool_call_data["status"] = "error"
             if proposed_ok:
-                _mark_failed(call_id, error_message, user_id=self.user)
+                _mark_failed(
+                    call_id, error_message, message_id=self.message_id, user_id=self.user
+                )
             yield {
                 "type": "tool_call",
                 "data": {**tool_call_data, "status": "error"},
@@ -813,7 +846,9 @@ class ToolExecutor:
             tool_call_data["result"] = error_message
             tool_call_data["status"] = "error"
             if proposed_ok:
-                _mark_failed(call_id, error_message, user_id=self.user)
+                _mark_failed(
+                    call_id, error_message, message_id=self.message_id, user_id=self.user
+                )
             yield {"type": "tool_call", "data": {**tool_call_data}}
             self.tool_calls.append(tool_call_data)
             return error_message, call_id
@@ -842,7 +877,9 @@ class ToolExecutor:
                 result = tool.execute_action(action_name, **parameters)
         except Exception as exc:
             if proposed_ok:
-                _mark_failed(call_id, str(exc), user_id=self.user)
+                _mark_failed(
+                    call_id, str(exc), message_id=self.message_id, user_id=self.user
+                )
             raise
 
         get_artifact_id = getattr(tool, "get_artifact_id", None) if tool_data["name"] != "api_tool" else None

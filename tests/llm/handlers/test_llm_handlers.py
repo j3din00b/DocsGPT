@@ -226,6 +226,62 @@ class TestLLMHandler:
 
 
 # ---------------------------------------------------------------------------
+# handle_tool_calls: assistant tool_call id <-> tool result id pairing
+# ---------------------------------------------------------------------------
+
+
+class _StubToolExecutor:
+    def __init__(self):
+        self._name_to_tool = {}
+
+    def check_pause(self, tools_dict, call, llm_class_name):
+        return None
+
+
+class _StubAgent:
+    """Minimal agent driving handle_tool_calls' success path."""
+
+    def __init__(self, resolved_call_id):
+        self.llm = Mock()
+        self.tool_executor = _StubToolExecutor()
+        self._resolved_call_id = resolved_call_id
+
+    def _execute_tool_action(self, tools_dict, call):
+        # Mirror tool_executor.execute: returns (result, call_id) where call_id
+        # is a synthesized UUID when the provider omitted the tool-call id.
+        yield from ()
+        return {"ok": True}, self._resolved_call_id
+
+
+class TestHandleToolCallsIdPairing:
+    def _drain(self, gen):
+        try:
+            while True:
+                next(gen)
+        except StopIteration as e:
+            return e.value
+
+    def test_tool_result_id_matches_assistant_when_provider_omits_id(self):
+        # Provider returned an empty tool-call id; the executor synthesizes one.
+        handler = ConcreteHandler()
+        call = ToolCall(id="", name="run_code", arguments={"code": "1"})
+        resolved = "resolved-uuid-123"
+        agent = _StubAgent(resolved)
+
+        updated_messages, pending = self._drain(
+            handler.handle_tool_calls(agent, [call], tools_dict={}, messages=[])
+        )
+
+        assistant = next(m for m in updated_messages if m["role"] == "assistant")
+        tool_msg = next(m for m in updated_messages if m["role"] == "tool")
+        assert assistant["tool_calls"][0]["id"] == resolved
+        # The tool result must carry the SAME id as the assistant tool_call,
+        # not the empty provider id — otherwise the next completion 400s.
+        assert tool_msg["tool_call_id"] == resolved
+        assert pending is None
+
+
+# ---------------------------------------------------------------------------
 # _append_unsupported_attachments
 # ---------------------------------------------------------------------------
 

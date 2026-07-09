@@ -963,6 +963,7 @@ class LLMHandler(ABC):
                         _mark_failed(
                             pause_info["call_id"],
                             f"headless: {deny_reason}",
+                            message_id=agent.tool_executor.message_id,
                             user_id=agent.tool_executor.user,
                         )
                     yield {
@@ -1047,7 +1048,18 @@ class LLMHandler(ABC):
                 updated_messages.append(assistant_msg)
                 assistant_appended = True
 
-                updated_messages.append(self.create_tool_message(call, tool_response))
+                # The tool result's tool_call_id must match the id put on the
+                # assistant tool_call above (``call_id`` — a synthesized UUID
+                # when the provider omitted an id), not the raw ``call.id`` which
+                # may be empty. A mismatch orphans the tool message and 400s the
+                # next completion ("'tool' must be a response to a preceding
+                # message with 'tool_calls'").
+                resolved_call = ToolCall(
+                    id=call_id, name=call.name, arguments=call.arguments
+                )
+                updated_messages.append(
+                    self.create_tool_message(resolved_call, tool_response)
+                )
             except Exception as e:
                 logger.error(f"Error executing tool: {str(e)}", exc_info=True)
                 # The error tool message's tool_call_id must match the assistant

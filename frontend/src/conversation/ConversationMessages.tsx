@@ -287,7 +287,10 @@ export default function ConversationMessages({
       query.response ||
       (query.tool_calls && query.tool_calls.length > 0) ||
       query.research ||
-      query.notice;
+      query.notice ||
+      // An artifact-only workflow run may produce no textual answer / tool_calls;
+      // the run id alone is enough to render its produced artifacts.
+      query.workflow_run_id;
     if (hasContent) {
       const isCurrentlyStreaming =
         status === 'loading' && index === queries.length - 1;
@@ -308,6 +311,7 @@ export default function ConversationMessages({
             thought={query.thought}
             sources={query.sources}
             toolCalls={query.tool_calls}
+            workflowRunId={query.workflow_run_id}
             research={query.research}
             onOpenArtifact={onOpenArtifact}
             onToolAction={onToolAction}

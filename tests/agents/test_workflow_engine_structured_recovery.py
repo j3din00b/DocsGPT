@@ -42,3 +42,21 @@ def test_parse_structured_output_empty():
 def test_strip_json_fence_prefers_fence_over_braces():
     out = WorkflowEngine._strip_json_fence('lead {"outer": 1} ```json\n{"in": 2}\n```')
     assert out == '{"in": 2}'
+
+
+def test_parse_structured_output_prose_wrapped_array():
+    ok, val = _engine()._parse_structured_output(
+        'Here are the results: [{"name": "a"}, {"name": "b"}]'
+    )
+    assert ok and val == [{"name": "a"}, {"name": "b"}]
+
+
+def test_strip_json_fence_earliest_bracket_wins_for_array():
+    # A top-level array must not be mis-sliced from its first "{" to its last
+    # "}" (which would drop the array framing or extract an inner object).
+    assert WorkflowEngine._strip_json_fence('x [1, 2, {"k": 3}] y') == '[1, 2, {"k": 3}]'
+
+
+def test_strip_json_fence_earliest_bracket_wins_for_object():
+    # An object that opens before any "[" still wins.
+    assert WorkflowEngine._strip_json_fence('x {"a": [1, 2]} y') == '{"a": [1, 2]}'

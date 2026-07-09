@@ -366,6 +366,14 @@ class WorkflowEngine:
             }
 
         node_agent = WorkflowNodeAgentFactory.create(**factory_kwargs)
+        # Attribute this node's tool calls to the run's message and, crucially,
+        # namespace their durability journal keys by it: node executors are built
+        # without a message_id, so providers that reuse deterministic call ids
+        # ("functions.create_artifact:0") would otherwise collide across runs on
+        # the tool_call_attempts primary key and drop the later journal rows.
+        node_agent.tool_executor.message_id = getattr(
+            self.agent.tool_executor, "message_id", None
+        )
         # Run-scope the node agent's tools so artifact_generator / code_executor
         # address artifacts by this workflow run: a short ref (A1) created by one
         # node resolves for edit_artifact in a later node within the same run. Only
@@ -998,7 +1006,14 @@ class WorkflowEngine:
         output_template = str(config.get("output_template", ""))
         if output_template:
             formatted_output = self._format_template(output_template)
+            # A prior streaming node's text otherwise runs straight into the
+            # end-node output ("...enterprise growth.Sales analysis complete");
+            # insert the same paragraph break streamed nodes use between each
+            # other so the segments stay readable.
+            if getattr(self, "_has_streamed", False):
+                yield {"answer": "\n\n"}
             yield {"answer": formatted_output}
+            self._has_streamed = True
 
     def _parse_structured_output(self, raw_response: str) -> tuple[bool, Optional[Any]]:
         normalized_response = raw_response.strip()
@@ -1031,13 +1046,20 @@ class WorkflowEngine:
         fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
         if fence:
             return fence.group(1).strip()
-        # Fall back to the outermost {...} or [...] span.
+        # Fall back to the outermost {...} or [...] span, choosing whichever
+        # bracket opens first. Fixing the order to "{" before "[" would slice a
+        # top-level array (``[{...},{...}]``) from its first "{" to its last "}",
+        # dropping the array framing (invalid JSON) or extracting an inner object
+        # that parses as silently-wrong structured data.
+        best: Optional[str] = None
+        best_start = -1
         for open_ch, close_ch in (("{", "}"), ("[", "]")):
             start = text.find(open_ch)
             end = text.rfind(close_ch)
-            if start != -1 and end > start:
-                return text[start : end + 1]
-        return None
+            if start != -1 and end > start and (best_start == -1 or start < best_start):
+                best_start = start
+                best = text[start : end + 1]
+        return best
 
     def _normalize_node_json_schema(
         self, schema: Optional[Dict[str, Any]], node_title: str

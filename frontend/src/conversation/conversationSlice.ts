@@ -55,6 +55,7 @@ export function mapServerQueryToClient(raw: any): Query {
     thought: raw?.thought ?? undefined,
     sources: sources && sources.length > 0 ? sources : undefined,
     tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+    workflow_run_id: raw?.workflow_run_id ?? undefined,
     attachments: raw?.attachments ?? undefined,
     messageId: raw?.message_id ?? undefined,
     messageStatus: status,
@@ -434,6 +435,13 @@ export const fetchAnswer = createAsyncThunk<
             } else if (data.type === 'tool_calls_pending') {
               dispatch(
                 conversationSlice.actions.setStatus('awaiting_tool_actions'),
+              );
+            } else if (data.type === 'workflow_run') {
+              dispatch(
+                conversationSlice.actions.setWorkflowRunId({
+                  index: targetIndex,
+                  workflowRunId: data.workflow_run_id,
+                }),
               );
             } else if (data.type === 'research_plan') {
               dispatch(
@@ -877,6 +885,17 @@ export const conversationSlice = createSlice({
         };
       } else state.queries[index].tool_calls.push(tool_call);
     },
+    // Records the workflow run id so the answer bubble can render the run's
+    // produced artifacts (WorkflowRunArtifacts fetches by this id).
+    setWorkflowRunId(
+      state,
+      action: PayloadAction<{ index: number; workflowRunId: string }>,
+    ) {
+      const { index, workflowRunId } = action.payload;
+      const query = state.queries[index];
+      if (!query || !workflowRunId) return;
+      query.workflow_run_id = workflowRunId;
+    },
     updateResearchPlan(
       state,
       action: PayloadAction<{
@@ -1090,6 +1109,7 @@ export const {
   updateThought,
   updateStreamingSource,
   updateToolCall,
+  setWorkflowRunId,
   updateResearchPlan,
   updateResearchProgress,
   setConversation,

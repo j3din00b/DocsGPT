@@ -237,6 +237,10 @@ class BaseAnswerResource:
             Server-sent event strings
         """
         response_full, thought, source_log_docs, tool_calls = "", "", [], []
+        # Set when a workflow agent run emits its ``workflow_run`` event; persisted
+        # onto the message metadata so the chat can render the run's produced
+        # artifacts on reload.
+        workflow_run_id: Optional[str] = None
         is_structured = False
         schema_info = None
         structured_chunks = []
@@ -557,6 +561,15 @@ class BaseAnswerResource:
                         # documents were dropped). Forwarded verbatim so the client can
                         # surface it without failing the turn; never sanitized as an error.
                         yield _emit({"type": "notice", "notice": line.get("notice", "")})
+                    elif line.get("type") == "workflow_run":
+                        # Stash the run id in the message metadata so every
+                        # persistence path (finalize / save / abort / error) records
+                        # it — the chat renders the run's produced artifacts from it
+                        # on reload. Still forwarded so the live client captures it.
+                        workflow_run_id = line.get("workflow_run_id")
+                        if workflow_run_id:
+                            query_metadata["workflow_run_id"] = workflow_run_id
+                        yield _emit(line)
                     else:
                         yield _emit(line)
             if is_structured and structured_chunks:

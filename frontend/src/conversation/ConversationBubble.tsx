@@ -14,6 +14,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 
 import SchedulerToolCallCard from '../agents/schedules/SchedulerToolCallCard';
+import WorkflowRunArtifacts from '../agents/workflow/WorkflowRunArtifacts';
 import ChevronDown from '../assets/chevron-down.svg';
 import Cloud from '../assets/cloud.svg';
 import DocsGPT3 from '../assets/cute_docsgpt3.svg';
@@ -68,6 +69,9 @@ const ConversationBubble = forwardRef<
     thought?: string;
     sources?: { title: string; text: string; link: string }[];
     toolCalls?: ToolCallsType[];
+    /** Set when this answer came from a workflow agent run; renders the
+     * run's produced artifacts as click-through chips/previews. */
+    workflowRunId?: string;
     research?: ResearchState;
     retryBtn?: React.ReactElement;
     questionNumber?: number;
@@ -97,6 +101,7 @@ const ConversationBubble = forwardRef<
     thought,
     sources,
     toolCalls,
+    workflowRunId,
     research,
     retryBtn,
     questionNumber,
@@ -491,6 +496,14 @@ const ConversationBubble = forwardRef<
             ))}
           </div>
         )}
+        {workflowRunId && (
+          <div className="my-2 mr-5 ml-2">
+            <WorkflowRunArtifacts
+              workflowRunId={workflowRunId}
+              inProgress={isStreaming}
+            />
+          </div>
+        )}
         {thought && (
           <Thought thought={thought} preprocessLaTeX={preprocessLaTeX} />
         )}
@@ -523,7 +536,10 @@ const ConversationBubble = forwardRef<
                         {segment.type === 'text' ? (
                           <ReactMarkdown
                             className="fade-in flex flex-col gap-3 leading-normal wrap-break-word whitespace-pre-wrap"
-                            remarkPlugins={[remarkGfm, remarkMath]}
+                            remarkPlugins={[
+                              remarkGfm,
+                              [remarkMath, { singleDollarTextMath: false }],
+                            ]}
                             rehypePlugins={[rehypeKatex]}
                             components={{
                               a({ href, children }) {
@@ -1335,7 +1351,10 @@ function Thought({
           <div className="bg-muted dark:bg-answer-bubble rounded-3xl px-7 py-4.5">
             <ReactMarkdown
               className="fade-in leading-normal wrap-break-word whitespace-pre-wrap"
-              remarkPlugins={[remarkGfm, remarkMath]}
+              remarkPlugins={[
+                remarkGfm,
+                [remarkMath, { singleDollarTextMath: false }],
+              ]}
               rehypePlugins={[rehypeKatex]}
               components={{
                 code(props) {
