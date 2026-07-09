@@ -26,6 +26,7 @@ class _FakeManager:
         self._result = result
         self.closed: list = []
         self.opened: list = []
+        self.list_calls = 0
 
     def open(self, session_id, ttl=None):
         self.opened.append((session_id, ttl))
@@ -35,6 +36,7 @@ class _FakeManager:
         return self._result
 
     def list_files(self, session_id):
+        self.list_calls += 1
         return []
 
     def close(self, session_id):
@@ -300,6 +302,25 @@ def test_session_kept_alive_on_positive_ttl(monkeypatch):
         monkeypatch, manager, code="print(1)", ttl=30, capture_artifacts=False
     )
     assert manager.closed == []
+
+
+def test_invalidated_runtime_skips_post_exec_artifact_capture(monkeypatch):
+    manager = _FakeManager(
+        ExecResult(
+            status="error",
+            error_name="TimeoutError",
+            error_value="execution exceeded 60s",
+            runtime_invalidated=True,
+        )
+    )
+
+    payload = _run_with_fake_manager(monkeypatch, manager, code="while True: pass", persist=True)
+
+    assert payload["status"] == "error"
+    assert "timed out" in payload["error"].lower()
+    # The pre-exec signature snapshot lists files once; a post-exec capture
+    # would issue a second list against the now-destroyed runtime.
+    assert manager.list_calls == 1
 
 
 # ---------------------------------------------------------------------------

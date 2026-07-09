@@ -174,6 +174,81 @@ def test_exec_and_file_roundtrip_through_manager(backend):
     assert mgr.list_files("conv-1") == ["a.txt"]
 
 
+def test_runtime_invalidation_drops_cached_handle_and_next_open_is_cold():
+    """A backend-killed runtime must not remain reusable in the manager cache."""
+
+    class _InvalidatingBackend(FakeBackend):
+        def exec(self, session_id, code, timeout=None):
+            self._handles.pop(session_id, None)
+            return ExecResult(
+                status="error",
+                error_name="TimeoutError",
+                error_value="execution exceeded its deadline",
+                exit_code=-1,
+                runtime_invalidated=True,
+            )
+
+    backend = _InvalidatingBackend()
+    mgr = SandboxManager(backend, max_ttl=600)
+    old_handle = mgr.open("conv-1")
+
+    result = mgr.exec("conv-1", "while True: pass", timeout=1)
+
+    assert result.runtime_invalidated is True
+    assert not mgr.has_session("conv-1")
+    new_handle = mgr.open("conv-1")
+    assert new_handle != old_handle
+    assert backend.open_calls == ["conv-1", "conv-1"]
+    assert backend.closed_handles == []  # the backend already destroyed the invalid runtime
+
+
+def test_old_file_operation_cannot_release_reopened_session_after_invalidation():
+    """A stale operation's leave must not decrement a replacement session generation."""
+
+    class _BlockedReadInvalidatingBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.read_started = threading.Event()
+            self.release_read = threading.Event()
+
+        def get_file(self, session_id, path):
+            self.read_started.set()
+            assert self.release_read.wait(timeout=5)
+            return b"old-generation"
+
+        def exec(self, session_id, code, timeout=None):
+            self._handles.pop(session_id, None)
+            return ExecResult(status="error", error_name="TimeoutError", runtime_invalidated=True)
+
+    backend = _BlockedReadInvalidatingBackend()
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    read_result: Dict[str, bytes] = {}
+    reader = threading.Thread(
+        target=lambda: read_result.__setitem__("data", mgr.get_file("conv-1", "old.txt"))
+    )
+    reader.start()
+    assert backend.read_started.wait(timeout=5)
+
+    mgr.exec("conv-1", "while True: pass", timeout=1)
+    assert not mgr.has_session("conv-1")
+    mgr.open("conv-1")
+    replacement = mgr._enter("conv-1")
+
+    backend.release_read.set()
+    reader.join(timeout=5)
+    assert not reader.is_alive()
+    assert read_result == {"data": b"old-generation"}
+    assert replacement.in_use == 1
+
+    # Closing is still deferred for the replacement's genuine hold. A stale
+    # unguarded leave would have decremented it to zero and closed immediately.
+    mgr.close("conv-1")
+    assert mgr.has_session("conv-1")
+    mgr._leave("conv-1", expected=replacement)
+    assert not mgr.has_session("conv-1")
+
+
 def test_file_ops_require_open_session(backend):
     mgr = SandboxManager(backend, max_ttl=600)
     with pytest.raises(KeyError):

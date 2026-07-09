@@ -53,9 +53,12 @@ _CONTAINMENT_SNIPPET = (
 class _Kernel:
     """Tracks one gateway kernel plus the per-session workspace it executes in."""
 
-    def __init__(self, kernel_id: str, workspace: str) -> None:
+    def __init__(
+        self, kernel_id: str, workspace: str, session_id: Optional[str] = None
+    ) -> None:
         self.kernel_id = kernel_id
         self.workspace = workspace
+        self.session_id = session_id
         self.initialized = False
 
 
@@ -86,6 +89,9 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         self._max_output_bytes = max_output_bytes
         self._max_file_bytes = max_file_bytes
         self._kernels: Dict[str, _Kernel] = {}
+        # Timed-out kernels whose DELETE could not yet be confirmed. Immutable
+        # ids stay retryable here and are never reused as active runtimes.
+        self._quarantined_kernels: Dict[str, Optional[str]] = {}
         self._lock = threading.Lock()
         # Session ids with a create in flight; a second open() for the same id
         # waits on this CV and reuses the result instead of double-creating a
@@ -110,6 +116,9 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         return urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
     def _get_kernel(self, session_id: str) -> _Kernel:
+        # A manager may cache a replacement handle, so normal traffic is also
+        # an opportunity to retire an older quarantined kernel.
+        self._retry_quarantined_kernels(session_id)
         with self._lock:
             kernel = self._kernels.get(session_id)
         if kernel is None:
@@ -136,10 +145,24 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             while session_id in self._creating:
                 self._create_cv.wait()
             existing = self._kernels.get(session_id)
-            if existing is not None:
+            has_quarantine = any(
+                owner == session_id for owner in self._quarantined_kernels.values()
+            )
+            if existing is not None and not has_quarantine:
                 return existing.kernel_id
             self._creating.add(session_id)
         try:
+            unresolved = self._retry_quarantined_kernels(session_id)
+            with self._lock:
+                # A replacement may already exist. It is safe to use even when
+                # deletion of an older exact id remains pending.
+                existing = self._kernels.get(session_id)
+            if existing is not None:
+                return existing.kernel_id
+            if unresolved:
+                raise RuntimeError(
+                    f"Previous timed-out kernel for {session_id!r} could not be terminated"
+                )
             resp = requests.post(
                 f"{self._base_url}/api/kernels",
                 headers=self._headers(),
@@ -149,7 +172,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             resp.raise_for_status()
             kernel_id = resp.json()["id"]
             workspace = f"{_WORKSPACE_ROOT}/{session_id}"
-            kernel = _Kernel(kernel_id, workspace)
+            kernel = _Kernel(kernel_id, workspace, session_id)
             with self._lock:
                 self._kernels[session_id] = kernel
             self._prime(kernel)
@@ -162,6 +185,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
     def attach(self, session_id: str) -> str:
         """Reattach to a still-running kernel for ``session_id``; open a cold one if gone."""
         self._validate_session_id(session_id)
+        unresolved = self._retry_quarantined_kernels(session_id)
         with self._lock:
             existing = self._kernels.get(session_id)
         if existing is not None and self._kernel_alive(existing.kernel_id):
@@ -169,6 +193,10 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         if existing is not None:
             with self._lock:
                 self._kernels.pop(session_id, None)
+        if unresolved:
+            raise RuntimeError(
+                f"Previous timed-out kernel for {session_id!r} could not be terminated"
+            )
         logger.warning("Re-attaching session %s to a cold kernel; previous state is lost", session_id)
         return self.open(session_id)
 
@@ -205,16 +233,25 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                 self._kernels.pop(session_id, None)
         self._delete_kernel(kernel_id)
 
-    def _delete_kernel(self, kernel_id: str) -> None:
-        """Best-effort DELETE of a gateway kernel by id (teardown never raises)."""
-        try:
-            requests.delete(
-                f"{self._base_url}/api/kernels/{kernel_id}",
-                headers=self._headers(),
-                timeout=self._http_timeout,
-            )
-        except requests.RequestException as exc:  # teardown is best-effort
-            logger.warning("Failed to delete kernel %s: %s", kernel_id, exc)
+    def _delete_kernel(self, kernel_id: str) -> bool:
+        """Best-effort DELETE of a gateway kernel, retrying once and never raising."""
+        last_error = "unknown error"
+        for _attempt in range(2):
+            try:
+                resp = requests.delete(
+                    f"{self._base_url}/api/kernels/{kernel_id}",
+                    headers=self._headers(),
+                    timeout=self._http_timeout,
+                )
+            except requests.RequestException as exc:  # teardown is best-effort
+                last_error = str(exc)
+                continue
+            # A missing kernel is already in the desired state.
+            if 200 <= resp.status_code < 300 or resp.status_code == 404:
+                return True
+            last_error = f"HTTP {resp.status_code}"
+        logger.warning("Failed to delete kernel %s after retry: %s", kernel_id, last_error)
+        return False
 
     def _kernel_alive(self, kernel_id: str) -> bool:
         try:
@@ -238,8 +275,8 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         except requests.RequestException as exc:
             logger.warning("Failed to interrupt kernel %s: %s", kernel_id, exc)
 
-    def _interrupt_and_drain(self, ws: websocket.WebSocket, msg_id: str, kernel_id: str) -> None:
-        """Interrupt the kernel then drain frames until it idles, leaving the session reusable."""
+    def _interrupt_and_drain(self, ws: websocket.WebSocket, msg_id: str, kernel_id: str) -> bool:
+        """Interrupt and drain the request, returning whether matching idle was observed."""
         self._interrupt(kernel_id)
         drain_deadline = time.monotonic() + self._http_timeout
         while time.monotonic() < drain_deadline:
@@ -247,7 +284,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                 ws.settimeout(max(0.05, drain_deadline - time.monotonic()))
                 raw = ws.recv()
             except (websocket.WebSocketTimeoutException, websocket.WebSocketConnectionClosedException):
-                return
+                return False
             if not raw:
                 continue
             try:
@@ -258,7 +295,51 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
                 continue
             msg_type = msg.get("msg_type") or msg.get("header", {}).get("msg_type")
             if msg_type == "status" and msg.get("content", {}).get("execution_state") == "idle":
-                return
+                return True
+        return False
+
+    def _retry_quarantined_kernels(self, session_id: str) -> List[str]:
+        """Retry pending exact-id deletes for this session; return unresolved ids."""
+        with self._lock:
+            pending = [
+                (kernel_id, owner)
+                for kernel_id, owner in self._quarantined_kernels.items()
+                if owner == session_id
+            ]
+        unresolved: List[str] = []
+        for kernel_id, owner in pending:
+            if self._delete_kernel(kernel_id):
+                with self._lock:
+                    if (
+                        kernel_id in self._quarantined_kernels
+                        and self._quarantined_kernels[kernel_id] == owner
+                    ):
+                        self._quarantined_kernels.pop(kernel_id, None)
+            else:
+                unresolved.append(kernel_id)
+        return unresolved
+
+    def _invalidate_kernel(
+        self, kernel_id: str, session_id: Optional[str] = None
+    ) -> bool:
+        """Quarantine and hard-delete one exact kernel without touching a replacement."""
+        with self._lock:
+            stale_sessions = [
+                session_id
+                for session_id, kernel in self._kernels.items()
+                if kernel.kernel_id == kernel_id
+            ]
+            owner = session_id or (stale_sessions[0] if len(stale_sessions) == 1 else None)
+            # Register before eviction so a failed DELETE never loses the only
+            # retryable reference to this runaway kernel id.
+            self._quarantined_kernels[kernel_id] = owner
+            for session_id in stale_sessions:
+                self._kernels.pop(session_id, None)
+        deleted = self._delete_kernel(kernel_id)
+        if deleted:
+            with self._lock:
+                self._quarantined_kernels.pop(kernel_id, None)
+        return deleted
 
     def _prime(self, kernel: _Kernel) -> None:
         """Create the per-session workspace (mode 0700) and chdir the kernel into it."""
@@ -314,7 +395,14 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         try:
             msg_id = uuid.uuid4().hex
             ws.send(json.dumps(self._execute_request(msg_id, code)))
-            return self._collect(ws, msg_id, timeout, kernel.kernel_id, max_output_bytes)
+            return self._collect(
+                ws,
+                msg_id,
+                timeout,
+                kernel.kernel_id,
+                max_output_bytes,
+                session_id=kernel.session_id,
+            )
         finally:
             try:
                 ws.close()
@@ -357,6 +445,7 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
         timeout: float,
         kernel_id: str,
         max_output_bytes: Optional[int] = None,
+        session_id: Optional[str] = None,
     ) -> ExecResult:
         """Read iopub/shell frames until ``execute_reply``/idle, a wall-clock deadline, or a closed socket."""
         effective = max_output_bytes if max_output_bytes is not None else self._max_output_bytes
@@ -374,14 +463,18 @@ class JupyterKernelGatewaySandbox(CodeSandbox):
             remaining = deadline - now
             if remaining <= 0:
                 self._fail(result, "TimeoutError", f"execution exceeded {timeout}s")
-                self._interrupt_and_drain(ws, msg_id, kernel_id)
+                if not self._interrupt_and_drain(ws, msg_id, kernel_id):
+                    self._invalidate_kernel(kernel_id, session_id)
+                    result.runtime_invalidated = True
                 break
             try:
                 ws.settimeout(remaining)
                 raw = ws.recv()
             except websocket.WebSocketTimeoutException:
                 self._fail(result, "TimeoutError", f"execution exceeded {timeout}s")
-                self._interrupt_and_drain(ws, msg_id, kernel_id)
+                if not self._interrupt_and_drain(ws, msg_id, kernel_id):
+                    self._invalidate_kernel(kernel_id, session_id)
+                    result.runtime_invalidated = True
                 break
             except websocket.WebSocketConnectionClosedException:
                 self._fail(result, "KernelDiedError", "kernel channel closed before completion")

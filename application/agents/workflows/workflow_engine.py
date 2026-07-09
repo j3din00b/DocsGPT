@@ -499,7 +499,11 @@ class WorkflowEngine:
                 "status": "completed" if result.ok else "error",
             }
         ]
-        if self.run_persisted:
+        if result.runtime_invalidated:
+            # A hard timeout destroyed the workspace runtime, so there is
+            # nothing reachable to capture and the timeout below stays primary.
+            artifacts = []
+        elif self.run_persisted:
             artifacts = capture_artifacts(
                 manager,
                 session_id,

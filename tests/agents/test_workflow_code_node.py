@@ -50,12 +50,20 @@ def _code_node(node_id="code_1", **config) -> WorkflowNode:
 
 
 class _Result:
-    def __init__(self, ok=True, stdout="", error_name=None, error_value=None):
+    def __init__(
+        self,
+        ok=True,
+        stdout="",
+        error_name=None,
+        error_value=None,
+        runtime_invalidated=False,
+    ):
         self.status = "ok" if ok else "error"
         self.stdout = stdout
         self.stderr = ""
         self.error_name = error_name
         self.error_value = error_value
+        self.runtime_invalidated = runtime_invalidated
 
     @property
     def ok(self):
@@ -273,6 +281,22 @@ def test_code_node_failure_raises(patch_sandbox):
 
     with pytest.raises(ValueError, match="failed: ValueError: boom"):
         list(engine._execute_code_node(node))
+
+
+def test_code_node_invalidated_runtime_skips_capture_and_preserves_timeout(patch_sandbox):
+    engine = _engine()
+    patch_sandbox["result"] = _Result(
+        ok=False,
+        error_name="TimeoutError",
+        error_value="execution exceeded 30s",
+        runtime_invalidated=True,
+    )
+    node = _code_node(code="while True: pass")
+
+    with pytest.raises(ValueError, match="failed: TimeoutError: execution exceeded 30s"):
+        list(engine._execute_code_node(node))
+
+    assert patch_sandbox["capture_calls"] == 0
 
 
 def test_code_node_empty_code_raises(patch_sandbox):

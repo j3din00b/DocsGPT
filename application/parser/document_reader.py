@@ -15,7 +15,7 @@ import os
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from application.core.settings import settings
 from application.parser.file.bulk import get_default_file_extractor
@@ -35,6 +35,8 @@ _MAX_CELL_CHARS = 200
 # Caps applied to the bounded view that rides back through the Redis result
 # backend (the full result still lives in the persisted artifact).
 _MAX_CHUNKS_RETURNED = 50
+_MAX_PAGE_SELECTIONS = 10_000
+_MAX_PAGE_SELECTOR_TOKENS = 20_000
 
 _VALID_OUTPUTS = ("markdown", "text", "structured", "chunks")
 _VALID_OCR = ("auto", "on", "off")
@@ -256,35 +258,100 @@ def _structure_summary(structured: Any) -> Dict[str, int]:
 
 def _apply_pages(text: str, pages: Any) -> str:
     """Best-effort page-range slice on a page-delimited markdown blob (``\\f`` separated)."""
-    if not pages:
+    if not pages or "\f" not in text:
         return text
-    parts = text.split("\f")
-    if len(parts) <= 1:
-        return text
-    selected = _selected_page_indices(pages, len(parts))
+    total = text.count("\f") + 1
+    selected = _selected_page_indices(pages, total)
     if not selected:
         return text
-    return "\f".join(parts[i] for i in selected if 0 <= i < len(parts))
+
+    # Splitting a hostile form-feed blob could allocate millions of strings.
+    # Walk boundaries and retain only the bounded set of requested pages.
+    wanted = set(selected)
+    found: Dict[int, tuple[int, int]] = {}
+    page_index = 0
+    start = 0
+    while wanted:
+        end = text.find("\f", start)
+        if end < 0:
+            end = len(text)
+        if page_index in wanted:
+            found[page_index] = (start, end)
+            wanted.remove(page_index)
+        if end == len(text):
+            break
+        page_index += 1
+        start = end + 1
+
+    # Preserve requested order and ordinary duplicates, but never let repeated
+    # selectors amplify the output beyond the source text's resident size.
+    output = io.StringIO()
+    output_chars = 0
+    wrote_page = False
+    for index in selected:
+        span = found.get(index)
+        if span is None:
+            continue
+        page_start, page_end = span
+        added = (page_end - page_start) + (1 if wrote_page else 0)
+        if output_chars + added > len(text):
+            break
+        if wrote_page:
+            output.write("\f")
+        output.write(text[page_start:page_end])
+        output_chars += added
+        wrote_page = True
+    return output.getvalue() if wrote_page else text
+
+
+def _iter_page_tokens(pages: Any) -> Iterator[Any]:
+    """Yield bounded selector tokens without materializing a comma-split list."""
+    if isinstance(pages, list):
+        for position, token in enumerate(pages):
+            if position >= _MAX_PAGE_SELECTOR_TOKENS:
+                break
+            yield token
+        return
+
+    raw = str(pages)
+    start = 0
+    emitted = 0
+    while emitted < _MAX_PAGE_SELECTOR_TOKENS:
+        end = raw.find(",", start)
+        if end < 0:
+            yield raw[start:]
+            return
+        yield raw[start:end]
+        emitted += 1
+        start = end + 1
 
 
 def _selected_page_indices(pages: Any, total: int) -> List[int]:
-    """Parse ``pages`` ("1-3", "2", [1,2]) into 0-based indices bounded by ``total``."""
+    """Parse ``pages`` into a bounded list of valid 0-based page occurrences."""
+    if total <= 0:
+        return []
+
     indices: List[int] = []
-    tokens = pages if isinstance(pages, list) else str(pages).split(",")
-    for token in tokens:
+    for token in _iter_page_tokens(pages):
+        if len(indices) >= _MAX_PAGE_SELECTIONS:
+            break
         token = str(token).strip()
         if "-" in token:
             try:
                 lo, hi = (int(p) for p in token.split("-", 1))
             except ValueError:
                 continue
-            indices.extend(range(lo - 1, hi))
+            start = max(lo - 1, 0)
+            stop = min(hi, total, start + (_MAX_PAGE_SELECTIONS - len(indices)))
+            indices.extend(range(start, stop))
         else:
             try:
-                indices.append(int(token) - 1)
+                index = int(token) - 1
             except ValueError:
                 continue
-    return [i for i in indices if 0 <= i < total]
+            if 0 <= index < total:
+                indices.append(index)
+    return indices
 
 
 def _to_chunks(text: str, max_chars: Optional[int]) -> List[str]:

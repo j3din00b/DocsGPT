@@ -234,10 +234,10 @@ class CodeExecutorTool(Tool):
                 logger.exception("code_executor: exec raised")
                 return {"status": "error", "error": f"execution failed: {type(exc).__name__}: {exc}"}
 
-            # Capture even on error/timeout so partial outputs aren't lost; a
-            # capture failure must never mask the run's real status.
+            # Capture even on error/timeout while the runtime remains reachable
+            # so partial outputs aren't lost; capture never masks the run status.
             artifacts: List[Dict[str, Any]] = []
-            if should_capture:
+            if should_capture and not result.runtime_invalidated:
                 try:
                     artifacts = self._capture_artifacts(manager, session_id, pre_signatures, outputs)
                 except Exception:

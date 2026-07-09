@@ -260,6 +260,71 @@ def test_pages_slices_form_feed_blob(monkeypatch):
     assert out["content"] == "page2"
 
 
+@pytest.mark.unit
+def test_page_ranges_are_bounded_before_materializing(monkeypatch):
+    """Clamp hostile ranges to real pages while preserving selection semantics."""
+    real_range = range
+    range_calls: List[tuple[int, int]] = []
+
+    def _guarded_range(start: int, stop: int) -> range:
+        range_calls.append((start, stop))
+        if stop - start > 100:
+            raise AssertionError("attempted to materialize an unbounded page range")
+        return real_range(start, stop)
+
+    monkeypatch.setattr(dr, "range", _guarded_range, raising=False)
+
+    selected = dr._selected_page_indices("1-1000000000,1-1000000000", total=3)
+
+    assert selected == [0, 1, 2, 0, 1, 2]
+    assert range_calls == [(0, 3), (0, 3)]
+
+
+@pytest.mark.unit
+def test_page_range_expansion_has_an_absolute_cap(monkeypatch):
+    """An attacker-controlled page count cannot turn a range into millions of ints."""
+    real_range = range
+    range_calls: List[tuple[int, int]] = []
+
+    def _guarded_range(start: int, stop: int) -> range:
+        range_calls.append((start, stop))
+        if stop - start > dr._MAX_PAGE_SELECTIONS:
+            raise AssertionError("attempted to expand beyond the page-selection cap")
+        return real_range(start, stop)
+
+    monkeypatch.setattr(dr, "range", _guarded_range, raising=False)
+
+    selected = dr._selected_page_indices("1-1000000000", total=25_000_000)
+
+    assert len(selected) == dr._MAX_PAGE_SELECTIONS
+    assert selected[0] == 0
+    assert selected[-1] == dr._MAX_PAGE_SELECTIONS - 1
+    assert range_calls == [(0, dr._MAX_PAGE_SELECTIONS)]
+
+
+@pytest.mark.unit
+def test_page_slicing_never_split_materializes_all_pages():
+    """Form-feed slicing walks boundaries without allocating one string per page."""
+
+    class _NoSplitText(str):
+        def split(self, *_args, **_kwargs):
+            raise AssertionError("page slicing must not call str.split")
+
+    text = _NoSplitText("page1\fpage2\fpage3")
+
+    assert dr._apply_pages(text, "3,1,3") == "page3\fpage1\fpage3"
+
+
+@pytest.mark.unit
+def test_duplicate_page_selection_cannot_amplify_source_text():
+    """Repeated selectors remain bounded to the source text's resident size."""
+    text = ("x" * 100) + "\fy"
+
+    selected = dr._apply_pages(text, [1] * (dr._MAX_PAGE_SELECTIONS * 2))
+
+    assert len(selected) <= len(text)
+
+
 # ---------------------------------------------------------------------------
 # structured output (Docling stubbed)
 # ---------------------------------------------------------------------------

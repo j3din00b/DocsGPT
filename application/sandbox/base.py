@@ -37,6 +37,9 @@ class ExecResult:
     display_data: List[DisplayData] = field(default_factory=list)
     plots: List[Plot] = field(default_factory=list)
     truncated: bool = False  # output exceeded the budget and was cut; status stays "ok"
+    # The backend invalidated the runtime while producing this result. Managers
+    # must discard their cached handle so the next open performs a cold start.
+    runtime_invalidated: bool = False
 
     @property
     def ok(self) -> bool:

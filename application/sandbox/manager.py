@@ -194,40 +194,43 @@ class SandboxManager:
 
     def exec(self, session_id: str, code: str, timeout: Optional[float] = None) -> ExecResult:
         """Execute ``code`` in the bound session, holding it in-use so a reap/evict can't pull it."""
-        self._enter(session_id)
+        session = self._enter(session_id)
         try:
-            return self._backend.exec(session_id, code, timeout)
+            result = self._backend.exec(session_id, code, timeout)
+            if result.runtime_invalidated:
+                self._drop_invalidated_session(session_id, session)
+            return result
         finally:
-            self._leave(session_id)
+            self._leave(session_id, expected=session)
 
     def put_file(self, session_id: str, dest_path: str, data: bytes) -> None:
         """Write ``data`` into the bound session's workspace."""
-        self._enter(session_id)
+        session = self._enter(session_id)
         try:
             self._backend.put_file(session_id, dest_path, data)
         finally:
-            self._leave(session_id)
+            self._leave(session_id, expected=session)
 
     def get_file(self, session_id: str, path: str) -> bytes:
         """Read ``path`` from the bound session's workspace."""
-        self._enter(session_id)
+        session = self._enter(session_id)
         try:
             return self._backend.get_file(session_id, path)
         finally:
-            self._leave(session_id)
+            self._leave(session_id, expected=session)
 
     def list_files(self, session_id: str) -> List[str]:
         """List files in the bound session's workspace."""
-        self._enter(session_id)
+        session = self._enter(session_id)
         try:
             return self._backend.list_files(session_id)
         finally:
-            self._leave(session_id)
+            self._leave(session_id, expected=session)
 
     def remove_path(self, session_id: str, path: str) -> None:
         """Best-effort delete a workspace-relative path; never raises (cleanup must not fail an op)."""
         try:
-            self._enter(session_id)
+            session = self._enter(session_id)
         except KeyError:
             return
         try:
@@ -239,7 +242,7 @@ class SandboxManager:
         except Exception:
             logger.exception("SandboxManager: best-effort remove_path failed for %r", path)
         finally:
-            self._leave(session_id)
+            self._leave(session_id, expected=session)
 
     def _remove_via_exec(self, session_id: str, path: str) -> None:
         """Fallback workspace cleanup: run a contained shutil.rmtree of the relative path."""
@@ -300,7 +303,7 @@ class SandboxManager:
             session = self._sessions.get(session_id)
             return session.ttl if session else None
 
-    def _enter(self, session_id: str) -> None:
+    def _enter(self, session_id: str) -> _Session:
         """Touch the idle clock and mark the session in-use so a concurrent reap/evict skips it."""
         with self._lock:
             session = self._sessions.get(session_id)
@@ -308,19 +311,28 @@ class SandboxManager:
                 raise KeyError(f"No sandbox session bound for {session_id!r}")
             session.last_access = time.monotonic()
             session.in_use += 1
+            return session
 
-    def _leave(self, session_id: str) -> None:
+    def _drop_invalidated_session(self, session_id: str, expected: _Session) -> None:
+        """Drop the exact manager entry whose backend runtime was already destroyed."""
+        with self._lock:
+            if self._sessions.get(session_id) is expected:
+                self._sessions.pop(session_id, None)
+
+    def _leave(self, session_id: str, expected: Optional[_Session] = None) -> None:
         """Release an in-use hold taken by ``_enter``; run a close deferred by ``close`` on the last release.
 
-        Idempotent if the session was already closed. When the final hold is released and
-        a ``close`` was deferred (``pending_close``), the session is popped here and its
-        backend torn down OUTSIDE the lock, keyed by the captured handle.
+        Idempotent if the session was already closed. If ``expected`` is supplied,
+        a newer entry under the same id is never modified (generation/ABA guard).
+        When the final hold is released and a ``close`` was deferred
+        (``pending_close``), the session is popped here and its backend torn down
+        OUTSIDE the lock, keyed by the captured handle.
         """
         handle: Optional[str] = None
         do_close = False
         with self._lock:
             session = self._sessions.get(session_id)
-            if session is not None and session.in_use > 0:
+            if session is not None and (expected is None or session is expected) and session.in_use > 0:
                 session.in_use -= 1
                 session.last_access = time.monotonic()
                 if session.in_use == 0 and session.pending_close:

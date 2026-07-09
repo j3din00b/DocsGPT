@@ -175,6 +175,248 @@ class _FakeWS:
         raise websocket.WebSocketConnectionClosedException()
 
 
+class _TimeoutWS:
+    """A channel that never yields another frame, even after an interrupt."""
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self):
+        import websocket
+
+        raise websocket.WebSocketTimeoutException()
+
+
+class _TimeoutThenIdleWS:
+    """Reach the exec deadline, then report matching idle after the interrupt."""
+
+    def __init__(self, msg_id):
+        self._msg_id = msg_id
+        self._calls = 0
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self):
+        import websocket
+
+        self._calls += 1
+        if self._calls == 1:
+            raise websocket.WebSocketTimeoutException()
+        return _frame(self._msg_id, "status", {"execution_state": "idle"})
+
+
+def test_timeout_deletes_and_invalidates_kernel_when_interrupt_never_idles(monkeypatch):
+    """A kernel that catches the interrupt cannot outlive the execution deadline."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    kernel = _Kernel("stuck-kernel", "/tmp/stuck")
+    sb._kernels["session-stuck"] = kernel
+    interrupted = []
+    deleted = []
+    monkeypatch.setattr(sb, "_interrupt", lambda kernel_id: interrupted.append(kernel_id))
+    monkeypatch.setattr(sb, "_delete_kernel", lambda kernel_id: deleted.append(kernel_id) or True)
+
+    result = sb._collect(
+        _TimeoutWS(),
+        "timed-out-message",
+        timeout=5,
+        kernel_id=kernel.kernel_id,
+    )
+
+    assert result.error_name == "TimeoutError"
+    assert result.runtime_invalidated is True
+    assert interrupted == [kernel.kernel_id]
+    assert deleted == [kernel.kernel_id]
+    assert "session-stuck" not in sb._kernels
+
+
+def test_timeout_keeps_kernel_when_interrupt_reaches_matching_idle(monkeypatch):
+    """A confirmed-idle interrupted kernel remains reusable and is not deleted."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    kernel = _Kernel("reusable-kernel", "/tmp/reusable")
+    sb._kernels["session-reusable"] = kernel
+    interrupted = []
+    deleted = []
+    monkeypatch.setattr(sb, "_interrupt", lambda kernel_id: interrupted.append(kernel_id))
+    monkeypatch.setattr(sb, "_delete_kernel", lambda kernel_id: deleted.append(kernel_id) or True)
+    msg_id = "timed-out-message"
+
+    result = sb._collect(
+        _TimeoutThenIdleWS(msg_id),
+        msg_id,
+        timeout=5,
+        kernel_id=kernel.kernel_id,
+    )
+
+    assert result.error_name == "TimeoutError"
+    assert result.runtime_invalidated is False
+    assert interrupted == [kernel.kernel_id]
+    assert deleted == []
+    assert sb._kernels["session-reusable"] is kernel
+
+
+def test_timeout_invalidation_does_not_remove_replacement_kernel(monkeypatch):
+    """Late cleanup of an old timeout must leave a newly opened generation registered."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    old = _Kernel("old-kernel", "/tmp/old")
+    replacement = _Kernel("new-kernel", "/tmp/new")
+    sb._kernels["session-race"] = old
+    deleted = []
+
+    def replace_during_drain(*_args):
+        sb._kernels["session-race"] = replacement
+        return False
+
+    monkeypatch.setattr(sb, "_interrupt_and_drain", replace_during_drain)
+    monkeypatch.setattr(sb, "_delete_kernel", lambda kernel_id: deleted.append(kernel_id) or True)
+
+    result = sb._collect(
+        _TimeoutWS(),
+        "timed-out-message",
+        timeout=5,
+        kernel_id=old.kernel_id,
+    )
+
+    assert result.runtime_invalidated is True
+    assert deleted == [old.kernel_id]
+    assert sb._kernels["session-race"] is replacement
+
+
+def test_failed_replacement_race_quarantine_does_not_block_unrelated_open(monkeypatch):
+    """A failed old-id DELETE remains scoped to its original session."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    old = _Kernel("old-kernel", "/tmp/old", "session-race")
+    replacement = _Kernel("new-kernel", "/tmp/new", "session-race")
+
+    def replace_during_drain(*_args):
+        sb._kernels["session-race"] = replacement
+        return False
+
+    class _Response:
+        status_code = 201
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "unrelated-kernel"}
+
+    monkeypatch.setattr(sb, "_interrupt_and_drain", replace_during_drain)
+    monkeypatch.setattr(sb, "_delete_kernel", lambda _kernel_id: False)
+    monkeypatch.setattr(jupyter_gateway.requests, "post", lambda *args, **kwargs: _Response())
+    monkeypatch.setattr(sb, "_prime", lambda _kernel: None)
+
+    result = sb._collect(
+        _TimeoutWS(),
+        "timed-out-message",
+        timeout=5,
+        kernel_id=old.kernel_id,
+        session_id=old.session_id,
+    )
+
+    assert result.runtime_invalidated is True
+    assert sb._quarantined_kernels == {old.kernel_id: "session-race"}
+    assert sb.open("unrelated") == "unrelated-kernel"
+    assert sb._kernels["session-race"] is replacement
+    assert sb._quarantined_kernels == {old.kernel_id: "session-race"}
+
+
+def test_delete_kernel_retries_transient_http_failure(monkeypatch):
+    """A transient gateway failure gets one more termination attempt."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    statuses = iter((500, 204))
+    calls = []
+
+    class _Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def fake_delete(url, **_kwargs):
+        calls.append(url)
+        return _Response(next(statuses))
+
+    monkeypatch.setattr(jupyter_gateway.requests, "delete", fake_delete)
+
+    assert sb._delete_kernel("stuck-kernel") is True
+    assert calls == [
+        "http://unused/api/kernels/stuck-kernel",
+        "http://unused/api/kernels/stuck-kernel",
+    ]
+
+
+def test_delete_kernel_reports_failure_after_both_attempts(monkeypatch, caplog):
+    """Two non-success responses leave termination explicitly unconfirmed."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    statuses = iter((500, 503))
+    calls = []
+
+    class _Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def fake_delete(url, **_kwargs):
+        calls.append(url)
+        return _Response(next(statuses))
+
+    monkeypatch.setattr(jupyter_gateway.requests, "delete", fake_delete)
+
+    assert sb._delete_kernel("stuck-kernel") is False
+    assert len(calls) == 2
+    assert "Failed to delete kernel stuck-kernel after retry: HTTP 503" in caplog.text
+
+
+def test_failed_timeout_delete_is_quarantined_and_cold_open_fails_closed(monkeypatch):
+    """An undeletable runaway remains retryable and blocks a duplicate cold kernel."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    kernel = _Kernel("stuck-kernel", "/tmp/stuck")
+    sb._kernels["session-stuck"] = kernel
+    delete_calls = []
+    post_calls = []
+    monkeypatch.setattr(sb, "_interrupt", lambda _kernel_id: None)
+    monkeypatch.setattr(
+        sb,
+        "_delete_kernel",
+        lambda kernel_id: (delete_calls.append(kernel_id), False)[1],
+    )
+    monkeypatch.setattr(
+        jupyter_gateway.requests,
+        "post",
+        lambda *args, **kwargs: post_calls.append((args, kwargs)),
+    )
+
+    result = sb._collect(
+        _TimeoutWS(), "timed-out-message", timeout=5, kernel_id=kernel.kernel_id
+    )
+
+    assert result.runtime_invalidated is True
+    assert "session-stuck" not in sb._kernels
+    assert sb._quarantined_kernels == {kernel.kernel_id: "session-stuck"}
+    with pytest.raises(RuntimeError, match="could not be terminated"):
+        sb.open("session-stuck")
+    assert delete_calls == [kernel.kernel_id, kernel.kernel_id]
+    assert post_calls == []
+    assert sb._quarantined_kernels == {kernel.kernel_id: "session-stuck"}
+
+
+def test_cached_replacement_retries_old_quarantine_without_touching_replacement(monkeypatch):
+    """Cached-session traffic retires only the old immutable kernel id."""
+    sb = JupyterKernelGatewaySandbox(gateway_url="http://unused")
+    replacement = _Kernel("replacement-kernel", "/tmp/replacement")
+    sb._kernels["session-race"] = replacement
+    sb._quarantined_kernels["old-kernel"] = "session-race"
+    deleted = []
+    monkeypatch.setattr(
+        sb,
+        "_delete_kernel",
+        lambda kernel_id: (deleted.append(kernel_id), True)[1],
+    )
+
+    assert sb._get_kernel("session-race") is replacement
+    assert deleted == ["old-kernel"]
+    assert sb._quarantined_kernels == {}
+    assert sb._kernels["session-race"] is replacement
+
+
 def test_collect_caps_oversize_rich_output(monkeypatch):
     # A huge execute_result must NOT be buffered: once it would exceed the byte
     # budget the bundle is dropped and the result is marked truncated.
