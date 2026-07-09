@@ -573,7 +573,7 @@ class TestGetExecutionSummary:
                 "started_at": now,
                 "completed_at": now,
                 "error": None,
-                "state_snapshot": {},
+                "state_delta": {},
             }
         ]
         summary = engine.get_execution_summary()
@@ -879,10 +879,10 @@ class TestStepTelemetry:
         by_node = {log["node_id"]: log for log in engine.execution_log}
 
         # The start node's delta carries the initial state it set...
-        assert "query" in by_node["n1"]["state_snapshot"]
+        assert "query" in by_node["n1"]["state_delta"]
         # ...and later nodes repeat none of it, only what they changed.
-        assert by_node["n2"]["state_snapshot"] == {"x": 2}
-        assert by_node["n3"]["state_snapshot"] == {}
+        assert by_node["n2"]["state_delta"] == {"x": 2}
+        assert by_node["n3"]["state_delta"] == {}
 
         # The streamed step events carry the same deltas.
         streamed = {
@@ -890,8 +890,8 @@ class TestStepTelemetry:
             for e in events
             if e.get("type") == "workflow_step" and e.get("status") == "completed"
         }
-        assert streamed["n2"]["state_snapshot"] == {"x": 2}
-        assert "query" not in streamed["n2"]["state_snapshot"]
+        assert streamed["n2"]["state_delta"] == {"x": 2}
+        assert "query" not in streamed["n2"]["state_delta"]
 
     @pytest.mark.unit
     def test_steps_carry_duration_ms(self):
@@ -925,7 +925,7 @@ class TestStepTelemetry:
         events = list(engine.execute({}, "q"))
 
         failed = [e for e in events if e.get("status") == "failed"]
-        assert failed and "query" not in failed[0]["state_snapshot"]
+        assert failed and "query" not in failed[0]["state_delta"]
         failed_log = engine.execution_log[-1]
         assert failed_log["status"] == "failed"
         assert failed_log["duration_ms"] >= 0
@@ -962,3 +962,99 @@ class TestStepTelemetry:
                 "status": "completed",
             },
         ]
+
+
+class TestNodeDocumentManifest:
+    """The engine appends a per-node manifest of staged input documents to the
+    node system prompt, scoped to that node's input_documents selection."""
+
+    _ART_1 = "11111111-1111-4111-8111-111111111111"
+    _ART_2 = "22222222-2222-4222-8222-222222222222"
+
+    def _engine_with_docs(self, monkeypatch):
+        from contextlib import contextmanager
+
+        engine = WorkflowEngine(_make_graph([], []), _make_agent())
+        engine.state["input_documents"] = [
+            {"artifact_id": self._ART_1, "ref": "A1", "filename": "portfolio_v1.csv"},
+            {"artifact_id": self._ART_2, "ref": "A2", "filename": "notes.txt"},
+        ]
+
+        rows = {
+            self._ART_1: (
+                {"current_version": 3, "metadata": {"ref_seq": 1}, "title": "Portfolio"},
+                {"filename": "portfolio_v1.csv", "mime_type": "text/csv"},
+            ),
+            self._ART_2: (
+                {"current_version": 1, "metadata": {}, "title": "Notes"},
+                {"filename": "notes.txt", "mime_type": "text/plain"},
+            ),
+        }
+
+        class FakeRepo:
+            def __init__(self, conn):
+                pass
+
+            def resolve_id_by_ref_seq(self, position, conversation_id=None, workflow_run_id=None):
+                for artifact_id, (artifact, _version) in rows.items():
+                    if artifact["metadata"].get("ref_seq") == position:
+                        return artifact_id
+                return None
+
+            def artifact_id_at_position(self, position, conversation_id=None, workflow_run_id=None):
+                return None
+
+            def get_artifact_in_parent(self, artifact_id, conversation_id=None, workflow_run_id=None):
+                entry = rows.get(artifact_id)
+                return entry[0] if entry else None
+
+            def get_version(self, artifact_id, version):
+                return rows[artifact_id][1]
+
+        @contextmanager
+        def fake_readonly():
+            yield object()
+
+        monkeypatch.setattr("application.storage.db.session.db_readonly", fake_readonly)
+        monkeypatch.setattr(
+            "application.storage.db.repositories.artifacts.ArtifactsRepository", FakeRepo
+        )
+        return engine
+
+    @pytest.mark.unit
+    def test_manifest_lists_refs_filenames_and_mimes(self, monkeypatch):
+        from application.agents.workflows.schemas import AgentNodeConfig
+
+        engine = self._engine_with_docs(monkeypatch)
+        config = AgentNodeConfig(agent_type="classic", input_documents=["*"])
+        manifest = engine._node_document_manifest(config)
+        assert "- A1: portfolio_v1.csv (text/csv)" in manifest
+        # Legacy artifact without ref_seq falls back to the full id, which tools accept.
+        assert f"- {self._ART_2}: notes.txt (text/plain)" in manifest
+        assert "Pass a ref" in manifest
+
+    @pytest.mark.unit
+    def test_manifest_empty_without_selection(self, monkeypatch):
+        from application.agents.workflows.schemas import AgentNodeConfig
+
+        engine = self._engine_with_docs(monkeypatch)
+        config = AgentNodeConfig(agent_type="classic", input_documents=[])
+        assert engine._node_document_manifest(config) == ""
+
+    @pytest.mark.unit
+    def test_manifest_failure_never_breaks_the_node(self, monkeypatch):
+        from contextlib import contextmanager
+
+        from application.agents.workflows.schemas import AgentNodeConfig
+
+        engine = WorkflowEngine(_make_graph([], []), _make_agent())
+        engine.state["input_documents"] = [{"artifact_id": self._ART_1}]
+
+        @contextmanager
+        def broken_readonly():
+            raise RuntimeError("db down")
+            yield
+
+        monkeypatch.setattr("application.storage.db.session.db_readonly", broken_readonly)
+        config = AgentNodeConfig(agent_type="classic", input_documents=["*"])
+        assert engine._node_document_manifest(config) == ""

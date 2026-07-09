@@ -851,6 +851,7 @@ const ConversationBubble = forwardRef<
           <Sheet open={isSidebarOpen} onOpenChange={setIsSidebarOpen}>
             <SheetContent
               side="right"
+              title="Sources"
               className="bg-card w-64 border-l border-[#9ca3af]/10 sm:w-80 sm:max-w-none"
             >
               <div className="flex h-full flex-col items-center gap-2 px-6 py-4 text-center">

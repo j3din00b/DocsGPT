@@ -21,11 +21,15 @@ interface RunArtifactSummary {
 
 interface WorkflowRunArtifactsProps {
   workflowRunId: string;
+  /** True while the run is still streaming; flipping to false refetches so
+   * a panel opened mid-run picks up the final artifact list. */
+  inProgress?: boolean;
 }
 
 /** List a workflow run's produced artifacts, with click-through preview + download. */
 export default function WorkflowRunArtifacts({
   workflowRunId,
+  inProgress = false,
 }: WorkflowRunArtifactsProps) {
   const token = useSelector(selectToken);
   const [artifacts, setArtifacts] = useState<RunArtifactSummary[] | null>(null);
@@ -77,7 +81,7 @@ export default function WorkflowRunArtifacts({
   useEffect(() => {
     const cleanup = loadList();
     return cleanup;
-  }, [loadList]);
+  }, [loadList, inProgress]);
 
   const fetchDetail = useCallback(
     (artifactId: string) => {
@@ -147,7 +151,9 @@ export default function WorkflowRunArtifacts({
   if (!artifacts || artifacts.length === 0) {
     return (
       <div className="px-3 py-3 text-sm text-gray-500 dark:text-gray-400">
-        No artifacts produced by this run.
+        {inProgress
+          ? 'Run in progress — artifacts appear here as nodes produce them.'
+          : 'No artifacts produced by this run.'}
       </div>
     );
   }

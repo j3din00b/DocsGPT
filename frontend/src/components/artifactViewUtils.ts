@@ -188,6 +188,12 @@ export function displayFilename(
   return version?.filename || artifact.title || `artifact-${artifact.id}`;
 }
 
+// `frame-ancestors` is ignored when delivered via a <meta> element (CSP spec),
+// and these CSPs live in the srcdoc document's <meta> — there is no HTTP
+// response to attach a real header to. It only produced a console warning while
+// doing nothing; the preview iframe's framing is already constrained by its
+// sandbox (no allow-same-origin), so the directive is omitted here.
+
 /**
  * Restrictive CSP for the preview iframe. No network, no scripts from origins,
  * no plugins; inline styles/SVG allowed so generated markup renders. Used for
@@ -195,8 +201,7 @@ export function displayFilename(
  */
 export const PREVIEW_CSP =
   "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; " +
-  "font-src data:; script-src 'none'; form-action 'none'; base-uri 'none'; " +
-  "frame-ancestors 'none'";
+  "font-src data:; script-src 'none'; form-action 'none'; base-uri 'none'";
 
 /**
  * CSP for the mermaid preview. Mermaid's `securityLevel: 'sandbox'` output is an
@@ -208,7 +213,7 @@ export const PREVIEW_CSP =
 export const PREVIEW_CSP_MERMAID =
   "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; " +
   "font-src data:; script-src 'none'; frame-src data:; form-action 'none'; " +
-  "base-uri 'none'; frame-ancestors 'none'";
+  "base-uri 'none'";
 
 /**
  * Wrap artifact markup in a minimal HTML document carrying the restrictive CSP.

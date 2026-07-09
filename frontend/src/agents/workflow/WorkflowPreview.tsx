@@ -145,8 +145,8 @@ function ExecutionDetails({
               const node = nodes.find((n) => n.id === step.nodeId);
               const displayName =
                 node?.title || node?.data?.title || step.nodeTitle;
-              const stateVars = step.stateSnapshot
-                ? Object.entries(step.stateSnapshot).filter(
+              const stateVars = step.stateDelta
+                ? Object.entries(step.stateDelta).filter(
                     ([key]) => !['query', 'chat_history'].includes(key),
                   )
                 : [];
@@ -253,10 +253,12 @@ function RunArtifactsSection({
   workflowRunId,
   isOpen,
   onToggle,
+  runInProgress = false,
 }: {
   workflowRunId: string;
   isOpen: boolean;
   onToggle: () => void;
+  runInProgress?: boolean;
 }) {
   return (
     <div className="mb-4 flex w-full flex-col flex-wrap items-start self-start lg:flex-nowrap">
@@ -289,7 +291,12 @@ function RunArtifactsSection({
       >
         <div className="overflow-hidden">
           <div className="max-h-[480px] overflow-y-auto pr-2">
-            {isOpen && <WorkflowRunArtifacts workflowRunId={workflowRunId} />}
+            {isOpen && (
+              <WorkflowRunArtifacts
+                workflowRunId={workflowRunId}
+                inProgress={runInProgress}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -687,9 +694,10 @@ export default function WorkflowPreview({
                         />
                       )}
 
-                      {/* Run artifacts (only once a persisted run id is known
-                          and the run is no longer streaming) */}
-                      {query.workflowRunId && !isStreamingLastQuery && (
+                      {/* Run artifacts — shown as soon as a persisted run id
+                          is known; mid-run it lists artifacts as nodes produce
+                          them and refetches when the run completes. */}
+                      {query.workflowRunId && (
                         <RunArtifactsSection
                           workflowRunId={query.workflowRunId}
                           isOpen={openArtifactsIndex === index}
@@ -698,6 +706,7 @@ export default function WorkflowPreview({
                               openArtifactsIndex === index ? null : index,
                             )
                           }
+                          runInProgress={isStreamingLastQuery}
                         />
                       )}
 

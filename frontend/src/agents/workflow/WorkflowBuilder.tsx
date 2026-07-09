@@ -3030,6 +3030,7 @@ function WorkflowBuilderInner() {
         <Sheet open={showPreview} onOpenChange={setShowPreview}>
           <SheetContent
             side="right"
+            title="Workflow preview"
             className="bg-card w-full max-w-none p-0 sm:max-w-[600px] md:max-w-[700px] lg:max-w-[800px]"
           >
             <WorkflowPreview

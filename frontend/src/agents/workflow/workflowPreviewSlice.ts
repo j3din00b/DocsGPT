@@ -13,7 +13,7 @@ export interface WorkflowExecutionStep {
   reasoning?: string;
   startedAt?: number;
   completedAt?: number;
-  stateSnapshot?: Record<string, unknown>;
+  stateDelta?: Record<string, unknown>;
   output?: unknown;
   error?: string;
 }
@@ -212,7 +212,8 @@ export const fetchWorkflowPreviewAnswer = createAsyncThunk<
                             nodeTitle: data.node_title,
                             status: data.status,
                             reasoning: data.reasoning,
-                            stateSnapshot: data.state_snapshot,
+                            // Older streams (pre-rename) still say state_snapshot.
+                            stateDelta: data.state_delta ?? data.state_snapshot,
                             output: data.output,
                             error: data.error,
                           },
@@ -410,7 +411,7 @@ export const workflowPreviewSlice = createSlice({
         nodeTitle: step.nodeTitle,
         status: step.status,
         reasoning: step.reasoning,
-        stateSnapshot: step.stateSnapshot,
+        stateDelta: step.stateDelta,
         output: step.output,
         error: step.error,
         startedAt:
@@ -426,8 +427,8 @@ export const workflowPreviewSlice = createSlice({
       };
 
       if (existingIndex !== -1) {
-        updatedStep.stateSnapshot =
-          step.stateSnapshot ?? querySteps[existingIndex].stateSnapshot;
+        updatedStep.stateDelta =
+          step.stateDelta ?? querySteps[existingIndex].stateDelta;
         updatedStep.output = step.output ?? querySteps[existingIndex].output;
         updatedStep.error = step.error ?? querySteps[existingIndex].error;
         querySteps[existingIndex] = updatedStep;

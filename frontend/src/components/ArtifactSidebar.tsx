@@ -521,6 +521,7 @@ export default function ArtifactSidebar({
       <SheetContent
         side="right"
         showCloseButton={false}
+        title={title || 'Artifact preview'}
         className="dark:bg-card bg-card flex h-full w-80 flex-col gap-0 border-l border-[#9ca3af]/10 p-0 sm:w-96 sm:max-w-none"
       >
         <div className="flex w-full items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-700">

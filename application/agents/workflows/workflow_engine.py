@@ -155,7 +155,7 @@ class WorkflowEngine:
                     "node_type": node.type.value,
                     "node_title": node.title,
                     "status": "completed",
-                    "state_snapshot": log_entry["state_snapshot"],
+                    "state_delta": log_entry["state_delta"],
                     "output": node_output,
                 }
             except Exception as e:
@@ -172,7 +172,7 @@ class WorkflowEngine:
                     "node_type": node.type.value,
                     "node_title": node.title,
                     "status": "failed",
-                    "state_snapshot": log_entry["state_snapshot"],
+                    "state_delta": log_entry["state_delta"],
                     "error": user_friendly_error,
                 }
                 yield {"type": "error", "error": user_friendly_error}
@@ -206,7 +206,7 @@ class WorkflowEngine:
             "completed_at": None,
             "status": ExecutionStatus.RUNNING.value,
             "error": None,
-            "state_snapshot": {},
+            "state_delta": {},
         }
 
     def _finalize_log_entry(self, log_entry: Dict[str, Any], pre_state: Dict[str, Any]) -> None:
@@ -214,7 +214,7 @@ class WorkflowEngine:
         completed_at = datetime.now(timezone.utc)
         log_entry["completed_at"] = completed_at
         log_entry["duration_ms"] = int((completed_at - log_entry["started_at"]).total_seconds() * 1000)
-        log_entry["state_snapshot"] = self._state_delta(pre_state)
+        log_entry["state_delta"] = self._state_delta(pre_state)
         if self._last_node_tool_calls:
             log_entry["tool_calls"] = list(self._last_node_tool_calls)
 
@@ -334,6 +334,11 @@ class WorkflowEngine:
                     f'Model "{node_model_id}" does not support structured output for node "{node.title}"'
                 )
 
+        node_prompt = node_config.system_prompt
+        doc_manifest = self._node_document_manifest(node_config)
+        if doc_manifest:
+            node_prompt = f"{node_prompt}\n\n{doc_manifest}" if node_prompt else doc_manifest
+
         factory_kwargs = {
             "agent_type": node_config.agent_type,
             "endpoint": self.agent.endpoint,
@@ -342,7 +347,7 @@ class WorkflowEngine:
             "model_user_id": getattr(self.agent, "model_user_id", None),
             "api_key": node_api_key,
             "tool_ids": node_config.tools,
-            "prompt": node_config.system_prompt,
+            "prompt": node_prompt,
             "chat_history": self.agent.chat_history,
             "decoded_token": self.agent.decoded_token,
             "json_schema": node_json_schema,
@@ -609,6 +614,54 @@ class WorkflowEngine:
             manager.put_file(session_id, rel_path, data)
             loaded.append(rel_path)
         return loaded
+
+    def _node_document_manifest(self, node_config: AgentNodeConfig) -> str:
+        """One-line-per-document manifest of the node's selected input documents.
+
+        Appended to the node's system prompt so the model knows the concrete
+        refs (``A1``) and filenames it can pass to document/code tools —
+        without it, models guess placeholder names ("attached_file") or paste
+        file contents inline. Scoped to THIS node's ``input_documents``
+        selection, so it never widens per-node document access. Best-effort:
+        a resolution failure drops the manifest, never the node.
+        """
+        from application.agents.tools.artifact_ref import make_ref, resolve_artifact_id
+        from application.storage.db.repositories.artifacts import ArtifactsRepository
+        from application.storage.db.session import db_readonly
+
+        try:
+            raw_ids = self._resolve_input_artifact_ids(node_config.input_documents)
+            if not raw_ids:
+                return ""
+            lines: List[str] = []
+            with db_readonly() as conn:
+                repo = ArtifactsRepository(conn)
+                for raw in raw_ids:
+                    artifact_id = resolve_artifact_id(repo, raw, workflow_run_id=self.workflow_run_id)
+                    artifact = (
+                        repo.get_artifact_in_parent(artifact_id, workflow_run_id=self.workflow_run_id)
+                        if artifact_id is not None
+                        else None
+                    )
+                    if artifact is None:
+                        continue
+                    version = repo.get_version(artifact_id, artifact["current_version"]) or {}
+                    ref_seq = (artifact.get("metadata") or {}).get("ref_seq")
+                    # Legacy artifacts predate ref_seq; the full id works in every tool.
+                    handle = make_ref(int(ref_seq)) if ref_seq else str(artifact_id)
+                    filename = version.get("filename") or artifact.get("title") or str(artifact_id)
+                    mime = version.get("mime_type") or "application/octet-stream"
+                    lines.append(f"- {handle}: {filename} ({mime})")
+        except Exception:
+            logger.exception("Node document manifest failed; continuing without it")
+            return ""
+        if not lines:
+            return ""
+        return (
+            "## Input documents for this node\n"
+            "These files are staged for this node. Pass a ref (e.g. A1) or the "
+            "filename to a document or code tool to read the file:\n" + "\n".join(lines)
+        )
 
     def _materialize_node_attachments(
         self,
@@ -1135,7 +1188,7 @@ class WorkflowEngine:
                 completed_at=log.get("completed_at"),
                 duration_ms=log.get("duration_ms"),
                 error=log.get("error"),
-                state_snapshot=log.get("state_snapshot", {}),
+                state_delta=log.get("state_delta", {}),
                 tool_calls=log.get("tool_calls", []),
             )
             for log in self.execution_log
