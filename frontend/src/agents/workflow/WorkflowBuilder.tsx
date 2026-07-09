@@ -76,6 +76,7 @@ import {
   validateCodeJsonSchema,
 } from './codeNodeConfig';
 import MobileBlocker from './components/MobileBlocker';
+import { buildSimpleCel, parseSimpleCel } from './simpleCel';
 import NodeDocumentsControl from './components/NodeDocumentsControl';
 import PromptTextArea, {
   extractUpstreamVariables,
@@ -179,79 +180,6 @@ function canReachEnd(
   return edges
     .filter((e) => e.source === nodeId)
     .some((e) => canReachEnd(e.target, edges, nodeIds, endIds, visited));
-}
-
-function parseSimpleCel(expression: string): {
-  variable: string;
-  operator: string;
-  value: string;
-} {
-  const trimmedExpression = expression.trim();
-
-  let match = trimmedExpression.match(
-    /^(\w+)\.(contains|startsWith)\(["'](.*)["']\)$/,
-  );
-  if (match) return { variable: match[1], operator: match[2], value: match[3] };
-
-  match = trimmedExpression.match(/^(\w+)\.(contains|startsWith)\((.*)\)$/);
-  if (match) {
-    const rawValue = match[3].trim();
-    const unquotedValue = rawValue.replace(/^["'](.*)["']$/, '$1');
-    return {
-      variable: match[1],
-      operator: match[2],
-      value: unquotedValue,
-    };
-  }
-
-  match = trimmedExpression.match(/^(contains|startsWith)\(["'](.*)["']\)$/);
-  if (match) return { variable: '', operator: match[1], value: match[2] };
-
-  match = trimmedExpression.match(/^(contains|startsWith)\((.*)\)$/);
-  if (match) {
-    const rawValue = match[2].trim();
-    const unquotedValue = rawValue.replace(/^["'](.*)["']$/, '$1');
-    return { variable: '', operator: match[1], value: unquotedValue };
-  }
-
-  match = trimmedExpression.match(/^(\w+)\s*(==|!=|>=|<=|>|<)\s*["'](.*)["']$/);
-  if (match) return { variable: match[1], operator: match[2], value: match[3] };
-
-  match = trimmedExpression.match(/^(==|!=|>=|<=|>|<)\s*["'](.*)["']$/);
-  if (match) return { variable: '', operator: match[1], value: match[2] };
-
-  match = trimmedExpression.match(/^(\w+)\s*(==|!=|>=|<=|>|<)\s*(.*)$/);
-  if (match) return { variable: match[1], operator: match[2], value: match[3] };
-
-  match = trimmedExpression.match(/^(==|!=|>=|<=|>|<)\s*(.*)$/);
-  if (match) return { variable: '', operator: match[1], value: match[2] };
-
-  return { variable: '', operator: '==', value: '' };
-}
-
-function buildSimpleCel(
-  variable: string,
-  operator: string,
-  value: string,
-): string {
-  const trimmedValue = value.trim();
-  const isNumeric = trimmedValue !== '' && !isNaN(Number(trimmedValue));
-  const isBool = trimmedValue === 'true' || trimmedValue === 'false';
-  const literalValue =
-    isNumeric || isBool ? trimmedValue : JSON.stringify(value);
-  const stringValue = JSON.stringify(value);
-  if (operator === 'contains') {
-    return variable
-      ? `${variable}.contains(${stringValue})`
-      : `contains(${stringValue})`;
-  }
-  if (operator === 'startsWith') {
-    return variable
-      ? `${variable}.startsWith(${stringValue})`
-      : `startsWith(${stringValue})`;
-  }
-  if (!variable) return `${operator} ${literalValue}`;
-  return `${variable} ${operator} ${literalValue}`;
 }
 
 function normalizeConditionCases(cases: ConditionCase[]): ConditionCase[] {

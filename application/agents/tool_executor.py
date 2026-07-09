@@ -210,6 +210,10 @@ class ToolExecutor:
         self.tool_allowlist: set = {str(x) for x in tool_allowlist} if tool_allowlist else set()
         self.tool_calls: List[Dict] = []
         self._loaded_tools: Dict[str, object] = {}
+        # Explicit tool-id scope (workflow agent nodes): when set (even empty),
+        # get_tools() resolves EXACTLY these ids — builtin synthetic ids and
+        # user_tools rows alike — with no defaults mixed in. None = unscoped.
+        self.allowed_tool_ids: Optional[List[str]] = None
         self.conversation_id: Optional[str] = None
         # Set by the workflow engine for agent nodes so run-scoped tools
         # (artifact_generator / code_executor) address artifacts by the
@@ -232,7 +236,9 @@ class ToolExecutor:
         If *client_tools* have been set on this executor, they are
         automatically merged into the returned dict.
         """
-        if self.user_api_key:
+        if self.allowed_tool_ids is not None:
+            tools = self._get_tools_by_ids(self.allowed_tool_ids)
+        elif self.user_api_key:
             tools = self._get_tools_by_api_key(self.user_api_key)
         else:
             tools = self._get_user_tools(self.user or "local")
@@ -250,6 +256,29 @@ class ToolExecutor:
         """
         return {str(tool["name"]) for tool in self.get_tools().values() if isinstance(tool, dict) and tool.get("name")}
 
+    def _get_tools_by_ids(self, tool_ids: List[str]) -> Dict[str, Dict]:
+        """Resolve an explicit tool-id scope — exactly these ids, no defaults.
+
+        Used by workflow agent nodes: the node's configured tools (builtin
+        synthetic ids like Artifact/Code Executor/Read Document, or the user's
+        ``user_tools`` rows) are the node's WHOLE toolset. An unresolvable id
+        is dropped with a warning rather than failing the node.
+        """
+        if not tool_ids:
+            return {}
+        with db_readonly() as conn:
+            tools_repo = UserToolsRepository(conn)
+            tools: List[Dict] = []
+            for tid in tool_ids:
+                row = resolve_tool_by_id(tid, self.user, user_tools_repo=tools_repo)
+                if row is None:
+                    logger.warning("tool id %s did not resolve; dropped from scoped toolset", tid)
+                    continue
+                if self.headless and is_headless_excluded_tool(row.get("name")):
+                    continue
+                tools.append(row)
+        return {str(tool["id"]): tool for tool in tools}
+
     def _get_tools_by_api_key(self, api_key: str) -> Dict[str, Dict]:
         """Resolve an agent's toolset — exactly ``agents.tools``, no defaults."""
         # Per-operation session: the answer pipeline spans a long-lived
@@ -264,6 +293,10 @@ class ToolExecutor:
             for tid in tool_ids:
                 row = resolve_tool_by_id(tid, owner, user_tools_repo=tools_repo)
                 if row is None:
+                    continue
+                # Workflow-only builtins (read_document) never resolve for a
+                # chat/scheduled agent — nodes get them via the scoped-id path.
+                if row.get("workflow_only"):
                     continue
                 # Headless runs (scheduled / webhook) drop chat-only tools
                 # like ``scheduler`` so a fire-time LLM can't chain schedules.

@@ -1,3 +1,5 @@
+from kombu import Queue
+
 from application.core.settings import settings
 
 # Pydantic loads .env into ``settings`` but does not inject values into
@@ -26,6 +28,14 @@ task_default_routing_key = "docsgpt"
 task_routes = {
     "application.api.user.tasks.parse_document": {"queue": settings.DOCUMENT_PARSE_QUEUE},
 }
+
+# Declare every queue so a bare ``celery worker`` (no -Q) consumes ALL of them —
+# the default worker does the whole job, parsing included. Operators who want
+# heavy OCR isolated run one worker with ``-Q docsgpt`` and another with
+# ``-Q parsing``. (dict.fromkeys dedupes if DOCUMENT_PARSE_QUEUE == "docsgpt".)
+task_queues = tuple(
+    Queue(name) for name in dict.fromkeys(["docsgpt", settings.DOCUMENT_PARSE_QUEUE])
+)
 
 beat_scheduler = "redbeat.RedBeatScheduler"
 redbeat_redis_url = broker_url

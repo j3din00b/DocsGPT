@@ -57,18 +57,20 @@ full flag set.
 Run the Celery worker in a separate terminal (if needed):
 
 ```bash
-celery -A application.app.celery worker -l INFO -Q docsgpt,parsing
+celery -A application.app.celery worker -l INFO
 ```
 
 On macOS, prefer the solo pool for Celery:
 
 ```bash
-python -m celery -A application.app.celery worker -l INFO --pool=solo -Q docsgpt,parsing
+python -m celery -A application.app.celery worker -l INFO --pool=solo
 ```
 
-The `parsing` queue serves document parsing (the `read_document` tool / workflow
-native-file parse); without it those calls hang `DOCUMENT_PARSE_TIMEOUT` then
-error. A dedicated `-Q parsing` worker can be GPU-enabled for heavier parsers.
+A bare worker (no `-Q`) consumes every configured queue, so one worker does the
+whole job — app tasks and document parsing (the `read_document` tool / workflow
+native-file parse) alike. Use `-Q` only to split load: run the main worker with
+`-Q docsgpt` and a dedicated (e.g. GPU-enabled) parser worker with `-Q parsing`
+for heavy OCR.
 
 ### Frontend
 

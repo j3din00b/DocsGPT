@@ -401,6 +401,26 @@ def merge_patch(target: Any, patch: Any) -> Any:
     return result
 
 
+def _apply_spec_append(spec: Dict[str, Any], spec_append: Dict[str, Any]) -> Dict[str, Any]:
+    """Concatenate items onto the spec's top-level lists (blocks/sections/slides/sheets).
+
+    RFC 7386 merge-patch replaces arrays wholesale, so "add a section" via
+    spec_patch silently wipes the existing ones unless the model resends the
+    full array. spec_append is the safe additive path: each key must name a
+    list (absent counts as empty) and its items are appended in order.
+    Returns {"spec": merged} or {"error": message}.
+    """
+    result = copy.deepcopy(spec)
+    for key, items in spec_append.items():
+        if not isinstance(items, list):
+            return {"error": f"spec_append[{key!r}] must be a list of items to append."}
+        current = result.get(key, [])
+        if not isinstance(current, list):
+            return {"error": f"spec_append target {key!r} is not a list in the current spec."}
+        result[key] = current + copy.deepcopy(items)
+    return {"spec": result}
+
+
 class ArtifactGeneratorTool(Tool):
     """Artifact
     Create, edit, and version documents - slides, docs, sheets, PDF, HTML.
@@ -450,8 +470,10 @@ class ArtifactGeneratorTool(Tool):
             {
                 "name": "edit_artifact",
                 "description": (
-                    "Apply a JSON merge-patch (RFC 7386) to the current spec, re-render, and append a "
-                    "new version. Preferred for small, targeted changes."
+                    "Apply a JSON merge-patch (RFC 7386) and/or append items to the current spec, "
+                    "re-render, and append a new version. Preferred for small, targeted changes. "
+                    "CAUTION: an array in spec_patch REPLACES the whole existing array — to add "
+                    "slides/sections/blocks/sheets while keeping the existing ones, use spec_append."
                 ),
                 "active": True,
                 "parameters": {
@@ -464,10 +486,17 @@ class ArtifactGeneratorTool(Tool):
                         },
                         "spec_patch": {
                             "type": "object",
-                            "description": "RFC 7386 merge-patch; null values delete keys.",
+                            "description": "RFC 7386 merge-patch; null values delete keys; arrays "
+                            "replace the existing array wholesale.",
+                        },
+                        "spec_append": {
+                            "type": "object",
+                            "description": "Additive edit: {key: [items]} appends items to the "
+                            'spec\'s top-level list, e.g. {"blocks": [{"type": "heading", "text": '
+                            '"Risks"}]} keeps existing blocks and adds these after them.',
                         },
                     },
-                    "required": ["id", "spec_patch"],
+                    "required": ["id"],
                 },
             },
             {
@@ -559,14 +588,24 @@ class ArtifactGeneratorTool(Tool):
         return {"status": "ok", **ref}
 
     def _edit(self, **kwargs: Any) -> Dict[str, Any]:
-        """Merge-patch the current spec, re-render, and append a version."""
+        """Merge-patch and/or list-append the current spec, re-render, and append a version."""
         spec_patch = kwargs.get("spec_patch")
-        if not isinstance(spec_patch, dict):
+        spec_append = kwargs.get("spec_append")
+        if spec_patch is None and spec_append is None:
+            return {"status": "error", "error": "edit_artifact needs spec_patch and/or spec_append."}
+        if spec_patch is not None and not isinstance(spec_patch, dict):
             return {"status": "error", "error": "spec_patch must be a JSON object (merge-patch)."}
+        if spec_append is not None and not isinstance(spec_append, dict):
+            return {"status": "error", "error": "spec_append must be a JSON object of {key: [items]}."}
         loaded = self._load_current(kwargs.get("id"))
         if loaded.get("error"):
             return {"status": "error", "error": loaded["error"]}
-        new_spec = merge_patch(loaded["spec"], spec_patch)
+        new_spec = merge_patch(loaded["spec"], spec_patch) if spec_patch else dict(loaded["spec"] or {})
+        if spec_append:
+            appended = _apply_spec_append(new_spec, spec_append)
+            if "error" in appended:
+                return {"status": "error", "error": appended["error"]}
+            new_spec = appended["spec"]
         return self._reversion(
             loaded["artifact_id"], loaded["kind"], new_spec, "edit_artifact", loaded.get("title")
         )

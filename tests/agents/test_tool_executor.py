@@ -66,6 +66,33 @@ class TestToolExecutorGetTools:
         assert str(tool["id"]) in tools
         assert tools[str(tool["id"])]["id"] == tool["id"]
 
+    def test_api_key_agent_never_resolves_workflow_only_builtins(self, pg_conn, monkeypatch):
+        """read_document is workflow-only: a chat/scheduled agent carrying its
+        builtin id must not get it; workflow nodes get it via allowed_tool_ids."""
+        from application.agents.default_tools import default_tool_id
+        from application.storage.db.repositories.agents import AgentsRepository
+
+        read_doc_id = default_tool_id("read_document")
+        artifact_id = default_tool_id("artifact_generator")
+        AgentsRepository(pg_conn).create(
+            user_id="alice",
+            name="a",
+            status="active",
+            key="wf_only_key",
+            tools=[read_doc_id, artifact_id],
+        )
+        self._patch_conn(monkeypatch, pg_conn)
+
+        chat_tools = ToolExecutor(user_api_key="wf_only_key", user="alice").get_tools()
+        chat_names = {t["name"] for t in chat_tools.values()}
+        assert "artifact_generator" in chat_names
+        assert "read_document" not in chat_names
+
+        scoped = ToolExecutor(user="alice")
+        scoped.allowed_tool_ids = [read_doc_id]
+        node_names = {t["name"] for t in scoped.get_tools().values()}
+        assert node_names == {"read_document"}
+
     def test_agentless_chat_synthesizes_defaults(self, pg_conn, monkeypatch):
         from application.agents.default_tools import loaded_default_tools
         from application.storage.db.repositories.user_tools import UserToolsRepository

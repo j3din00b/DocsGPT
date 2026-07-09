@@ -405,3 +405,60 @@ def test_create_and_rewrite_metadata_embed_spec_synopsis():
     rewrite_spec = actions["rewrite_artifact"]["parameters"]["properties"]["spec"]
     assert _SPEC_SYNOPSIS in create_spec["description"]
     assert _SPEC_SYNOPSIS in rewrite_spec["description"]
+
+
+# ---------------------------------------------------------------------------
+# spec_append: additive edits that don't clobber arrays
+# ---------------------------------------------------------------------------
+
+
+def test_spec_append_preserves_existing_items():
+    from application.agents.tools.artifact_generator import _apply_spec_append
+
+    spec = {"title": "Brief", "blocks": [{"type": "heading", "text": "Overview"}]}
+    out = _apply_spec_append(spec, {"blocks": [{"type": "heading", "text": "Risks"}]})
+    assert "error" not in out
+    assert [b["text"] for b in out["spec"]["blocks"]] == ["Overview", "Risks"]
+    # The input spec is not mutated.
+    assert len(spec["blocks"]) == 1
+
+
+def test_spec_append_creates_missing_list():
+    from application.agents.tools.artifact_generator import _apply_spec_append
+
+    out = _apply_spec_append({"title": "x"}, {"blocks": [{"type": "paragraph", "text": "p"}]})
+    assert out["spec"]["blocks"] == [{"type": "paragraph", "text": "p"}]
+
+
+def test_spec_append_rejects_non_list_values_and_targets():
+    from application.agents.tools.artifact_generator import _apply_spec_append
+
+    assert "error" in _apply_spec_append({}, {"blocks": "not-a-list"})
+    assert "error" in _apply_spec_append({"title": "t"}, {"title": ["x"]})
+
+
+def test_edit_with_only_spec_append_appends_to_loaded_spec(monkeypatch):
+    tool = _tool()
+    loaded_spec = {"blocks": [{"type": "heading", "text": "Overview"}]}
+    monkeypatch.setattr(
+        tool,
+        "_load_current",
+        lambda raw_id: {"artifact_id": "a-1", "kind": "html", "spec": loaded_spec, "title": "T"},
+    )
+    captured = {}
+
+    def fake_reversion(artifact_id, kind, spec, action, title=None):
+        captured["spec"] = spec
+        return {"status": "ok", "artifact_id": artifact_id}
+
+    monkeypatch.setattr(tool, "_reversion", fake_reversion)
+
+    result = tool._edit(id="A1", spec_append={"blocks": [{"type": "paragraph", "text": "Risks…"}]})
+    assert result["status"] == "ok"
+    assert [b["text"] for b in captured["spec"]["blocks"]] == ["Overview", "Risks…"]
+
+
+def test_edit_requires_patch_or_append():
+    err = _tool()._edit(id="A1")
+    assert err["status"] == "error"
+    assert "spec_patch and/or spec_append" in err["error"]

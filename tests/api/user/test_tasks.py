@@ -791,3 +791,16 @@ class TestIngestPoisonEvent:
             )
 
         assert published[0][0][2]["operation"] == "reingest"
+
+
+@pytest.mark.unit
+def test_bare_worker_consumes_app_and_parsing_queues():
+    """task_queues declares every queue, so a worker started without -Q serves
+    both app tasks and document parsing — a -Q-less dev worker must never
+    silently strand attachment uploads or parse_document tasks."""
+    import application.celeryconfig as celeryconfig
+    from application.core.settings import settings
+
+    names = {queue.name for queue in celeryconfig.task_queues}
+    assert "docsgpt" in names
+    assert settings.DOCUMENT_PARSE_QUEUE in names
