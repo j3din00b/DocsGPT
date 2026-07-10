@@ -34,6 +34,7 @@ from application.parser.schema.base import Document
 
 from application.storage.db.base_repository import looks_like_uuid
 from application.storage.db.repositories.agents import AgentsRepository
+from application.storage.db.repositories.artifacts import ArtifactsRepository
 from application.storage.db.repositories.attachments import AttachmentsRepository
 from application.storage.db.repositories.ingest_chunk_progress import (
     IngestChunkProgressRepository,
@@ -1607,6 +1608,121 @@ def attachment_worker(self, file_info, user):
             scope={"kind": "attachment", "id": str(attachment_id)},
         )
         raise
+
+
+def parse_document_worker(self, artifact_id, parent, user_id, options):
+    """Thin Celery-task wrapper; delegates to the process-agnostic ``run_parse_document``."""
+    return run_parse_document(artifact_id, parent, user_id, options)
+
+
+def run_parse_document(artifact_id, parent, user_id, options):
+    """Parse an input artifact's bytes to a shaped result; runnable inline OR on the parsing queue.
+
+    Security: the artifact is re-resolved through the run-scoped gate here (never trusting a
+    raw storage path) so authz is enforced independently, in addition to the pre-enqueue check
+    in the tool. ``read_document`` calls this directly (in-process) when it already runs inside a
+    Celery worker; the web process dispatches ``parse_document`` to the parsing queue, which lands
+    here via ``parse_document_worker``.
+    """
+    from application.agents.tools.artifact_ref import resolve_artifact_id
+    from application.parser.document_reader import bound_parse_payload, parse_document_bytes
+
+    options = options or {}
+    parent = parent or {}
+    conversation_id = parent.get("conversation_id")
+    workflow_run_id = parent.get("workflow_run_id")
+    if conversation_id is None and workflow_run_id is None:
+        return {"status": "error", "error": "parse_document requires a conversation_id or workflow_run_id."}
+
+    # Re-resolve through the parent-scoped gate so a forged/cross-run id is rejected
+    # here too; resolve a short ref to an id within this parent only.
+    try:
+        with db_readonly() as conn:
+            repo = ArtifactsRepository(conn)
+            resolved_id = resolve_artifact_id(
+                repo, artifact_id, conversation_id=conversation_id, workflow_run_id=workflow_run_id
+            )
+            artifact = (
+                repo.get_artifact_in_parent(
+                    resolved_id, conversation_id=conversation_id, workflow_run_id=workflow_run_id
+                )
+                if resolved_id is not None
+                else None
+            )
+            if artifact is None:
+                return {"status": "error", "error": f"input artifact {artifact_id} not found in this conversation/run."}
+            version = repo.get_version(resolved_id, artifact["current_version"])
+    except Exception:
+        logging.error("run_parse_document: failed to resolve input artifact", exc_info=True)
+        return {"status": "error", "error": f"failed to load input artifact {artifact_id}."}
+
+    if not version or not version.get("storage_path"):
+        return {"status": "error", "error": f"input artifact {artifact_id} has no stored content."}
+
+    display_name = version.get("filename") or artifact.get("title") or str(resolved_id)
+    filename = safe_filename(display_name)
+    try:
+        data = StorageCreator.get_storage().get_file(version["storage_path"]).read()
+    except Exception:
+        logging.error("run_parse_document: failed to read input artifact bytes", exc_info=True)
+        return {"status": "error", "error": f"failed to read input artifact {artifact_id}."}
+
+    # Parse returns the FULL content (no max_chars/window here) so the persisted artifact is the
+    # complete parse; all view-bounding is applied by ``bound_parse_payload`` below.
+    result = parse_document_bytes(
+        data,
+        filename,
+        output=options.get("output", "markdown"),
+        ocr=options.get("ocr", "auto"),
+        pages=options.get("pages"),
+        engine=options.get("engine", "auto"),
+        include_tables=bool(options.get("include_tables", True)),
+    )
+    if result.get("error"):
+        return {"status": "error", "error": result["error"]}
+
+    payload = {"status": "ok", **result}
+    if options.get("persist"):
+        # Persist the FULL shaped result by reference (bytes live in the artifact); only the
+        # bounded view computed below rides back through the Redis result backend.
+        artifact_ref = _persist_parse_result(result, display_name, user_id, parent, options)
+        if isinstance(artifact_ref, dict) and artifact_ref.get("error"):
+            payload["artifact_error"] = artifact_ref["error"]
+        elif artifact_ref is not None:
+            payload["artifact"] = artifact_ref
+    # Bound the Redis-backed VIEW across all shapes: content is capped by max_chars (else the
+    # default head+tail window), chunks are count/length-capped, and structured (needed for
+    # json_schema validation) rides back as-is. The FULL result already lives in the artifact.
+    payload = bound_parse_payload(payload, max_chars=options.get("max_chars"))
+    return payload
+
+
+def _persist_parse_result(result, title, user_id, parent, options):
+    """Persist the full shaped parse result as an owner/parent-scoped ``data`` artifact; return its ref."""
+    from application.sandbox.artifacts_capture import QuotaExceeded, persist_new_artifact
+
+    try:
+        data = json.dumps(result).encode("utf-8")
+    except (TypeError, ValueError):
+        logging.error("parse_document_worker: parse result is not JSON-serializable", exc_info=True)
+        return {"error": "parse result is not JSON-serializable."}
+    base = safe_filename(title) or "document"
+    filename = f"{base}.parsed.json"
+    try:
+        return persist_new_artifact(
+            user_id=user_id,
+            kind="data",
+            data=data,
+            filename=filename,
+            mime_type="application/json",
+            title=f"{title} (parsed)",
+            conversation_id=parent.get("conversation_id"),
+            workflow_run_id=parent.get("workflow_run_id"),
+            message_id=parent.get("message_id"),
+            produced_by={"tool": "read_document", "action": "read_document", "tool_id": options.get("tool_id")},
+        )
+    except QuotaExceeded as exc:
+        return {"error": str(exc)}
 
 
 def agent_webhook_worker(self, agent_id, payload):

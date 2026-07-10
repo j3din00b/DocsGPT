@@ -276,7 +276,7 @@ class TestSetupPeriodicTasks:
 
         setup_periodic_tasks(sender)
 
-        assert sender.add_periodic_task.call_count == 11
+        assert sender.add_periodic_task.call_count == 13
 
         calls = sender.add_periodic_task.call_args_list
 
@@ -308,6 +308,12 @@ class TestSetupPeriodicTasks:
         # schedule runs cleanup (24h)
         assert calls[10][0][0] == timedelta(hours=24)
         assert calls[10][1].get("name") == "cleanup-schedule-runs"
+        # sandbox session reaper (60s)
+        assert calls[11][0][0] == timedelta(seconds=60)
+        assert calls[11][1].get("name") == "reap-sandbox-sessions"
+        # stale workflow-run reaper (5m)
+        assert calls[12][0][0] == timedelta(seconds=300)
+        assert calls[12][1].get("name") == "reap-stale-workflow-runs"
 
 
 class TestMcpOauthTask:
@@ -322,6 +328,53 @@ class TestMcpOauthTask:
 
         mock_worker.assert_called_once_with(ANY, {"server": "mcp"}, "user1")
         assert result == {"url": "http://auth"}
+
+
+class TestParseDocumentTask:
+    """parse_document runs on the parsing queue under a bounded time limit."""
+
+    @pytest.mark.unit
+    @patch("application.api.user.tasks.parse_document_worker")
+    def test_calls_parse_document_worker(self, mock_worker):
+        from application.api.user.tasks import parse_document
+
+        mock_worker.return_value = {"status": "ok", "content": "hi"}
+
+        result = parse_document(
+            "art-1", {"conversation_id": "c1"}, "user1", {"output": "markdown"},
+        )
+
+        mock_worker.assert_called_once_with(
+            ANY, "art-1", {"conversation_id": "c1"}, "user1",
+            {"output": "markdown"},
+        )
+        assert result == {"status": "ok", "content": "hi"}
+
+    @pytest.mark.unit
+    @patch("application.api.user.tasks.parse_document_worker")
+    def test_soft_time_limit_returns_clean_error(self, mock_worker):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from application.api.user.tasks import parse_document
+
+        mock_worker.side_effect = SoftTimeLimitExceeded("parse")
+
+        # The task must swallow the soft-limit signal and return the worker's
+        # clean error shape so the parsing-worker slot frees instead of crashing.
+        result = parse_document("art-1", {"conversation_id": "c1"}, "user1")
+
+        assert result["status"] == "error"
+        assert "timed out" in result["error"]
+
+    @pytest.mark.unit
+    def test_time_limits_derived_from_document_parse_timeout(self):
+        from application.api.user.tasks import parse_document
+        from application.core.settings import settings
+
+        assert parse_document.soft_time_limit == settings.DOCUMENT_PARSE_TIMEOUT
+        assert parse_document.time_limit == settings.DOCUMENT_PARSE_TIMEOUT + 30
+        # Hard limit must exceed the soft limit so the handler can unwind first.
+        assert parse_document.time_limit > parse_document.soft_time_limit
 
 
 class TestDurableTaskRetryPolicy:
@@ -738,3 +791,16 @@ class TestIngestPoisonEvent:
             )
 
         assert published[0][0][2]["operation"] == "reingest"
+
+
+@pytest.mark.unit
+def test_bare_worker_consumes_app_and_parsing_queues():
+    """task_queues declares every queue, so a worker started without -Q serves
+    both app tasks and document parsing — a -Q-less dev worker must never
+    silently strand attachment uploads or parse_document tasks."""
+    import application.celeryconfig as celeryconfig
+    from application.core.settings import settings
+
+    names = {queue.name for queue in celeryconfig.task_queues}
+    assert "docsgpt" in names
+    assert settings.DOCUMENT_PARSE_QUEUE in names
