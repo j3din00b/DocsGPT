@@ -137,6 +137,19 @@ export default function Conversation() {
     toolName: string;
   } | null>(null);
 
+  const [conversationMountKey, setConversationMountKey] = useState(0);
+  const [prevMountConversationId, setPrevMountConversationId] = useState<
+    string | null
+  >(conversationId);
+  if (prevMountConversationId !== conversationId) {
+    const isServerAssignedId =
+      prevMountConversationId === null &&
+      conversationId !== null &&
+      isNewChatRoute;
+    setPrevMountConversationId(conversationId);
+    if (!isServerAssignedId) setConversationMountKey((k) => k + 1);
+  }
+
   useEffect(() => {
     const prevId = prevConversationId.current;
     // Don't reset when the backend assigns the conversation id mid-stream (null -> id)
@@ -324,6 +337,7 @@ export default function Conversation() {
       >
         <div className="relative min-h-0 flex-1">
           <ConversationMessages
+            key={conversationMountKey}
             handleQuestion={handleQuestion}
             handleQuestionSubmission={handleQuestionSubmission}
             handleFeedback={handleFeedback}
@@ -372,7 +386,7 @@ export default function Conversation() {
         >
           <div className="flex w-full items-center rounded-full px-2">
             <MessageInput
-              key={conversationId || 'new'}
+              key={conversationMountKey}
               onSubmit={(text) => {
                 handleQuestionSubmission(text);
               }}

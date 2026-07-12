@@ -1200,7 +1200,7 @@ export function ToolCalls({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-auto bg-transparent px-0 py-0 font-normal hover:bg-transparent"
+              className="h-auto bg-transparent px-0 py-0 font-normal hover:bg-transparent dark:hover:bg-transparent"
               onClick={() => setIsToolCallsOpen(!isToolCallsOpen)}
             >
               <p className="text-base font-semibold">Tool Calls</p>
@@ -1250,7 +1250,7 @@ export function ToolCalls({
                                   )}
                                 />
                               </p>
-                              <p className="dark:bg-card rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
+                              <p className="dark:bg-card max-h-80 overflow-y-auto rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
                                 <span className="dark:text-muted-foreground leading-5.75 text-black">
                                   {JSON.stringify(toolCall.arguments, null, 2)}
                                 </span>
@@ -1273,14 +1273,14 @@ export function ToolCalls({
                                 </span>
                               )}
                               {toolCall.status === 'completed' && (
-                                <p className="dark:bg-card rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
+                                <p className="dark:bg-card max-h-80 overflow-y-auto rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
                                   <span className="dark:text-muted-foreground leading-5.75 text-black">
                                     {JSON.stringify(toolCall.result, null, 2)}
                                   </span>
                                 </p>
                               )}
                               {toolCall.status === 'error' && (
-                                <p className="dark:bg-card rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
+                                <p className="dark:bg-card max-h-80 overflow-y-auto rounded-b-2xl p-2 font-mono text-sm wrap-break-word">
                                   <span className="text-destructive leading-5.75">
                                     {toolCall.error}
                                   </span>
