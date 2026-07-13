@@ -67,7 +67,8 @@ This is the mechanism behind catalog entries like DeepSeek, which declare their 
 For OpenAI models that support it, DocsGPT can call the newer **Responses API** (`/v1/responses`) instead of Chat Completions. This is selected per model in the catalog via an `api_flavor: responses` capability and enables features like server-side reasoning. Related settings:
 
 - `reasoning_effort` — per-model reasoning effort hint (for example `medium`) declared in the model catalog.
-- `OPENAI_RESPONSES_STORE` (default `false`) — when `true`, lets OpenAI persist Responses API state server-side.
+- `OPENAI_RESPONSES_STORE` (default `false`) — when `true`, lets OpenAI persist Responses API state server-side and chains calls with `previous_response_id`. When `false`, DocsGPT requests encrypted reasoning items and persists those ciphertext items itself so reasoning survives tool calls and later conversation turns without OpenAI retaining the response.
+- `V1_SESSION_TTL_SECONDS` (default `86400`) — lifetime of the hashed Redis mapping used to associate OpenAI-compatible client session headers with hidden DocsGPT conversations. Explicit DocsGPT conversation IDs always take precedence.
 
 See [App Configuration](/Deploying/DocsGPT-Settings) for the full settings reference.
 

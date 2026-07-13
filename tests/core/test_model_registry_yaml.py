@@ -90,8 +90,11 @@ def _make_settings(**overrides):
 def _reset_registry(monkeypatch):
     ModelRegistry.reset()
     # openai_compatible catalogs read their key directly from os.environ,
-    # so clear any host-set keys to keep these tests deterministic.
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    # so clear every built-in/operator catalog key to keep these tests
+    # deterministic even when a developer has an ignored ``*_internal.yaml``.
+    for catalog in load_model_yamls([BUILTIN_MODELS_DIR]):
+        if catalog.api_key_env:
+            monkeypatch.delenv(catalog.api_key_env, raising=False)
     yield
     ModelRegistry.reset()
 
@@ -118,7 +121,17 @@ class TestYAMLLoader:
     def test_each_provider_has_expected_ids(self):
         grouped = _by_provider(load_model_yamls([BUILTIN_MODELS_DIR]))
         for provider, expected in EXPECTED_IDS.items():
-            actual = {m.id for c in grouped[provider] for m in c.models}
+            # Local ``*_internal.yaml`` files are intentionally gitignored
+            # operator extensions, not part of the canonical catalog snapshot.
+            canonical = [
+                c
+                for c in grouped[provider]
+                if not (
+                    c.source_path
+                    and c.source_path.stem.endswith("_internal")
+                )
+            ]
+            actual = {m.id for c in canonical for m in c.models}
             assert actual == expected, f"{provider}: expected {expected}, got {actual}"
 
     def test_attachment_alias_image_expands_to_five_mime_types(self):

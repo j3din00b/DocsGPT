@@ -586,23 +586,14 @@ class TestNativePauseUnchanged:
 
 
 # ---------------------------------------------------------------------------
-# Guarantee 2 — coherent Option B routing: a v1 continuation carrying a
-# conversation_id rebuilds STATELESSLY via build_continuation_from_messages
-# (never resume_from_tool_actions), and threads no reserved_message_id.
+# Guarantee 2 — legacy continuations without pending server state still fall
+# back to a stateless transcript rebuild.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 class TestV1ContinuationRoutesStatelessly:
-    """Coherent Option B: a v1 tool-result continuation is fully stateless on
-    the resume side. Because the pause finalized the prior row ``complete`` and
-    wrote NO ``pending_tool_state``, the route must rebuild from the re-POSTed
-    history via ``build_continuation_from_messages`` — **even when a
-    ``conversation_id`` is carried** — and must NOT call
-    ``resume_from_tool_actions`` (whose ``load_state`` would 400). The
-    ``_continuation`` dict therefore carries no live ``reserved_message_id`` /
-    ``request_id`` (id-reuse is inert under this design).
-    """
+    """A carried conversation id with no pending state remains compatible."""
 
     def _build_app(self) -> Flask:
         app = Flask(__name__)
@@ -667,6 +658,15 @@ class TestV1ContinuationRoutesStatelessly:
             yield MagicMock()
 
         with patch(
+            "application.api.v1.routes._lookup_agent",
+            return_value={"id": "agent-1", "name": "Agent", "user_id": "owner"},
+        ), patch(
+            "application.api.v1.routes.ContinuationService.claim_state",
+            return_value=None,
+        ), patch(
+            "application.api.v1.routes._conversation_belongs_to_agent",
+            return_value=True,
+        ), patch(
             "application.api.v1.routes.translate_request",
             side_effect=_fake_translate,
         ), patch(
@@ -708,13 +708,12 @@ class TestV1ContinuationRoutesStatelessly:
 
         continuation = captured.get("_continuation")
         assert continuation is not None
-        # id-reuse is gone from the v1 continuation dict (inert under Option B).
-        assert "reserved_message_id" not in continuation
-        assert "request_id" not in continuation
-        # The v1 path still runs in stateless-finalize mode.
-        assert captured.get("finalize_tool_pause_as_complete") is True
-        # The incoming conversation_id is the persistence target.
+        assert continuation["reserved_message_id"] is None
+        assert continuation["request_id"] is None
+        assert captured.get("finalize_tool_pause_as_complete") is False
+        # Missing durable state runs without appending a blank sibling turn.
         assert captured.get("conversation_id") == "conv-1"
+        assert captured.get("should_persist") is False
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +735,9 @@ class _FakeLLMGen:
 
     def gen(self, *args, **kwargs) -> str:
         return "Title"
+
+    def gen_stream(self, *args, **kwargs):
+        yield "It is 72F and sunny in SF."
 
 
 class _FakeClientToolExecutor:
@@ -912,6 +914,9 @@ class TestV1ToolRoundTripEndToEnd:
             "application.api.answer.services.stream_processor.StreamProcessor"
             ".build_agent",
             _fake_build_agent,
+        ), patch(
+            "application.api.v1.routes._conversation_belongs_to_agent",
+            return_value=True,
         ):
             with app.test_client() as c:
                 resp1 = _post_chat(
@@ -919,7 +924,10 @@ class TestV1ToolRoundTripEndToEnd:
                     {
                         "messages": [{"role": "user", "content": "weather in SF?"}],
                         "tools": [self.CLIENT_TOOL],
-                        "docsgpt": {"save_conversation": True},
+                        "docsgpt": {
+                            "save_conversation": True,
+                            "session_id": "tool-session",
+                        },
                     },
                     api_key,
                 )
@@ -936,19 +944,21 @@ class TestV1ToolRoundTripEndToEnd:
         conv_id = body1.get("docsgpt", {}).get("conversation_id")
         assert conv_id
 
-        # Reserved row finalized ``complete`` (with tool_calls); no
-        # ``pending_tool_state`` and no non-terminal row.
+        # The pause remains resumable and owns the original WAL placeholder.
         with pg_engine.connect() as conn:
             statuses = _row_statuses(conn, conv_id)
-            assert statuses == ["complete"]
-            assert _pending_tool_state_count(conn, conv_id) == 0
-            assert self._count_non_terminal(conn, user_id) == 0
+            assert statuses[0] in ("pending", "streaming")
+            assert _pending_tool_state_count(conn, conv_id) == 1
+            assert self._count_non_terminal(conn, user_id) == 1
 
         # ---- POST #2: tool result + conversation_id -> agent answers ----
         with _wire_v1_route_db(pg_engine, monkeypatch), patch(
             "application.api.answer.services.stream_processor.StreamProcessor"
             ".build_agent",
             _fake_build_agent,
+        ), patch(
+            "application.api.v1.routes._conversation_belongs_to_agent",
+            return_value=True,
         ):
             with app.test_client() as c:
                 resp2 = _post_chat(
@@ -977,7 +987,10 @@ class TestV1ToolRoundTripEndToEnd:
                             },
                         ],
                         "conversation_id": conv_id,
-                        "docsgpt": {"save_conversation": True},
+                        "docsgpt": {
+                            "save_conversation": True,
+                            "session_id": "tool-session",
+                        },
                     },
                     api_key,
                 )
@@ -996,12 +1009,12 @@ class TestV1ToolRoundTripEndToEnd:
             from sqlalchemy import text
 
             # The answer is a NEW terminal turn appended to the same
-            # conversation: the original tool-call turn + the answer turn.
+            # conversation: the original WAL placeholder is finalized.
             statuses = _row_statuses(conn, conv_id)
-            assert statuses == ["complete", "complete"]
+            assert statuses == ["complete"]
             # Nothing left non-terminal anywhere for this user / conversation.
             assert self._count_non_terminal(conn, user_id) == 0
-            # The appended turn carries the assistant answer.
+            # The finalized turn carries the assistant answer.
             answer_rows = conn.execute(
                 text(
                     "SELECT response FROM conversation_messages "
@@ -1017,4 +1030,3 @@ class TestV1ToolRoundTripEndToEnd:
                 {"u": user_id},
             ).scalar()
             assert conv_count == 1
-

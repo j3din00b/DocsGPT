@@ -1,25 +1,9 @@
-"""Foreign-``conversation_id`` ownership gate on the ``/v1`` continuation path.
+"""Owner-and-agent ``conversation_id`` gates on the ``/v1`` continuation path.
 
-A ``/v1`` tool continuation persists its final answer into a client-supplied
-``conversation_id``. Ownership IS enforced deep in the stack:
-
-    route → ``build_continuation_from_messages`` → ``build_agent("")``
-          → ``initialize`` → ``_load_conversation_history``
-          → ``get_conversation(conversation_id, owner)``  ← owner-scoped read
-          → ``None`` for a foreign conversation
-          → ``ValueError("Conversation not found or unauthorized")``
-          → route's ``except ValueError`` → HTTP 400
-
-…but the existing E2E suite mocks ``build_agent``, so this security gate is
-never actually exercised. This test seeds a conversation owned by user A and an
-agent owned by user B, then POSTs a continuation with B's api_key targeting A's
-conversation. The ownership read runs against the **real** DB (not mocked): we
-only short-circuit ``StreamProcessor.initialize`` to the
-``_load_conversation_history`` step so the test doesn't have to stand up the
-full agent/model/source/retriever machinery to reach the gate.
-
-Asserted: the route returns 400 AND no assistant turn is appended to A's
-conversation (the foreign write is rejected before persistence).
+The route validates conversation metadata before initializing the stream
+processor. These tests use the real database to verify that a foreign-owner or
+same-owner/different-agent conversation cannot receive a continuation and that
+the rejected request never appends an assistant turn.
 """
 
 from __future__ import annotations
@@ -58,10 +42,12 @@ CLIENT_TOOL = {
 }
 
 
-def _seed_conversation(conn, user_id: str, name: str) -> str:
+def _seed_conversation(
+    conn, user_id: str, name: str, agent_id: str | None = None
+) -> str:
     """Create a conversation owned by ``user_id`` with one finalized turn."""
     repo = ConversationsRepository(conn)
-    conv = repo.create(user_id, name)
+    conv = repo.create(user_id, name, agent_id=agent_id)
     conv_id = str(conv["id"])
     repo.reserve_message(
         conv_id,
@@ -72,8 +58,10 @@ def _seed_conversation(conn, user_id: str, name: str) -> str:
     return conv_id
 
 
-def _seed_agent(conn, user_id: str, key: str) -> None:
-    AgentsRepository(conn).create(user_id, "Weather Agent", "published", key=key)
+def _seed_agent(conn, user_id: str, key: str) -> dict:
+    return AgentsRepository(conn).create(
+        user_id, "Weather Agent", "published", key=key
+    )
 
 
 def _build_app() -> Flask:
@@ -141,9 +129,11 @@ class TestForeignConversationOwnership:
             _seed_user(conn, user_a)
             _seed_user(conn, user_b)
             # Agent owned by B → the v1 route resolves decoded_token={"sub": B}.
-            _seed_agent(conn, user_b, api_key)
+            agent = _seed_agent(conn, user_b, api_key)
             # Conversation owned by A, with one existing complete turn.
-            conv_id = _seed_conversation(conn, user_a, "A's private chat")
+            conv_id = _seed_conversation(
+                conn, user_a, "A's private chat", agent_id=str(agent["id"])
+            )
 
         with pg_engine.connect() as conn:
             rows_before = _row_count(conn, conv_id)
@@ -173,7 +163,7 @@ class TestForeignConversationOwnership:
         # The ownership gate raised ValueError → route returns 400.
         assert resp.status_code == 400, resp.get_data(as_text=True)
         body = resp.get_json()
-        assert body["error"]["type"] == "invalid_request"
+        assert body["error"]["type"] == "invalid_request_error"
 
         # No assistant turn was appended to A's conversation — the foreign
         # write was rejected before any persistence.
@@ -191,9 +181,11 @@ class TestForeignConversationOwnership:
 
         with pg_engine.begin() as conn:
             _seed_user(conn, owner)
-            _seed_agent(conn, owner, api_key)
+            agent = _seed_agent(conn, owner, api_key)
             # Conversation owned by the agent owner (the caller).
-            conv_id = _seed_conversation(conn, owner, "owner's chat")
+            conv_id = _seed_conversation(
+                conn, owner, "owner's chat", agent_id=str(agent["id"])
+            )
 
         app = _build_app()
 

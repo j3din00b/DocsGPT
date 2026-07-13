@@ -9,6 +9,7 @@ This module handles:
 import json
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 # Some upstream models/proxies echo their reasoning into ``content`` as
@@ -143,14 +144,18 @@ def content_to_text(content: Any) -> str:
 
 
 def extract_system_prompt(messages: List[Dict]) -> Optional[str]:
-    """Extract the first system message content from the messages array.
+    """Combine system and developer instructions in request order.
 
-    Returns None if no system message is present.
+    Chat-completions clients use both roles. DocsGPT has one prompt-override
+    slot, so preserving their order is the least surprising translation.
+    Returns None when neither role is present.
     """
-    for msg in messages:
-        if msg.get("role") == "system":
-            return content_to_text(msg.get("content", ""))
-    return None
+    prompts = [
+        content_to_text(msg.get("content", ""))
+        for msg in messages
+        if msg.get("role") in ("system", "developer")
+    ]
+    return "\n\n".join(prompts) if prompts else None
 
 
 def convert_history(messages: List[Dict]) -> List[Dict]:
@@ -163,7 +168,7 @@ def convert_history(messages: List[Dict]) -> List[Dict]:
     i = 0
     while i < len(messages):
         msg = messages[i]
-        if msg.get("role") == "system":
+        if msg.get("role") in ("system", "developer"):
             i += 1
             continue
         if msg.get("role") == "user":
@@ -247,13 +252,19 @@ def translate_request(
     # max_completion_tokens, so drop the alias when the canonical key is present.
     if "max_completion_tokens" in sampling_params:
         sampling_params.pop("max_tokens", None)
+    if data.get("tools") and data.get("tool_choice") is not None:
+        sampling_params["tool_choice"] = data["tool_choice"]
+    if data.get("tools") and data.get("parallel_tool_calls") is not None:
+        sampling_params["parallel_tool_calls"] = data["parallel_tool_calls"]
 
     # Check for continuation (tool results after assistant tool_calls)
     if is_continuation(messages):
         tool_actions = extract_tool_results(messages)
         conversation_id = extract_conversation_id(messages)
         if not conversation_id:
-            conversation_id = data.get("conversation_id")
+            conversation_id = data.get("conversation_id") or (
+                data.get("docsgpt") or {}
+            ).get("conversation_id")
         result = {
             "conversation_id": conversation_id,
             "tool_actions": tool_actions,
@@ -263,6 +274,8 @@ def translate_request(
             # rebuilt from the resent messages instead of server-side state.
             "messages": messages,
         }
+        if data.get("conversation_id") and not result.get("conversation_id"):
+            result["conversation_id"] = data["conversation_id"]
         # Persistence: stateful continuations (carrying a conversation_id)
         # persist the final turn; stateless ones (no conversation_id, e.g.
         # opencode) skip it, else every tool round writes an orphan conversation
@@ -307,6 +320,9 @@ def translate_request(
         # owner's sidebar; the legacy ``docsgpt.save_conversation`` flag
         # (old meaning: "persist this conversation") is ignored.
     }
+    conversation_id = data.get("conversation_id") or docsgpt.get("conversation_id")
+    if conversation_id:
+        result["conversation_id"] = conversation_id
 
     if system_prompt_override is not None:
         result["system_prompt_override"] = system_prompt_override
@@ -346,6 +362,8 @@ def translate_response(
     model_name: str,
     pending_tool_calls: Optional[List[Dict]] = None,
     strip_reasoning_leak: bool = False,
+    usage: Optional[Dict[str, Any]] = None,
+    finish_reason_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Translate DocsGPT response to chat completions format.
 
@@ -395,7 +413,7 @@ def translate_response(
         combined_reasoning = (thought or "") + leaked_reasoning
         if combined_reasoning:
             message["reasoning_content"] = combined_reasoning
-        finish_reason = "stop"
+        finish_reason = finish_reason_override or "stop"
 
     result: Dict[str, Any] = {
         "id": completion_id,
@@ -409,7 +427,7 @@ def translate_response(
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
+        "usage": usage or {
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -435,6 +453,15 @@ def translate_response(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class StreamTranslationState:
+    """State shared while translating one internal stream."""
+
+    tool_indices: Dict[str, int] = field(default_factory=dict)
+    tool_pause_finished: bool = False
+    done: bool = False
+
+
 def _make_chunk(
     completion_id: str,
     model_name: str,
@@ -454,6 +481,21 @@ def _make_chunk(
                 "finish_reason": finish_reason,
             }
         ],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def make_usage_chunk(
+    completion_id: str, model_name: str, usage: Dict[str, Any]
+) -> str:
+    """Build the optional final usage chunk used by ``stream_options``."""
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [],
+        "usage": usage,
     }
     return f"data: {json.dumps(chunk)}\n\n"
 
@@ -483,6 +525,7 @@ def translate_stream_event(
     completion_id: str,
     model_name: str,
     strip_reasoning_leak: bool = False,
+    state: Optional[StreamTranslationState] = None,
 ) -> List[str]:
     """Translate a DocsGPT SSE event dict to standard streaming chunks.
 
@@ -501,6 +544,7 @@ def translate_stream_event(
     """
     event_type = event_data.get("type")
     chunks: List[str] = []
+    state = state or StreamTranslationState()
 
     if event_type == "answer":
         raw = event_data.get("answer", "")
@@ -540,11 +584,14 @@ def translate_stream_event(
             # Standard: stream as tool_calls delta
             args = tc_data.get("arguments", {})
             args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+            call_id = tc_data.get("call_id", "")
+            if call_id not in state.tool_indices:
+                state.tool_indices[call_id] = len(state.tool_indices)
             chunks.append(
                 _make_chunk(completion_id, model_name, {
                     "tool_calls": [{
-                        "index": 0,
-                        "id": tc_data.get("call_id", ""),
+                        "index": state.tool_indices[call_id],
+                        "id": call_id,
                         "type": "function",
                         "function": {
                             "name": _get_client_tool_name(tc_data),
@@ -562,9 +609,11 @@ def translate_stream_event(
 
     elif event_type == "tool_calls_pending":
         # Standard: finish_reason = tool_calls
-        chunks.append(
-            _make_chunk(completion_id, model_name, {}, finish_reason="tool_calls")
-        )
+        if not state.tool_pause_finished:
+            chunks.append(
+                _make_chunk(completion_id, model_name, {}, finish_reason="tool_calls")
+            )
+            state.tool_pause_finished = True
         # Also emit as docsgpt extension
         chunks.append(
             _make_docsgpt_chunk(
@@ -577,10 +626,18 @@ def translate_stream_event(
         )
 
     elif event_type == "end":
-        chunks.append(
-            _make_chunk(completion_id, model_name, {}, finish_reason="stop")
-        )
-        chunks.append("data: [DONE]\n\n")
+        if not state.done:
+            if not state.tool_pause_finished:
+                chunks.append(
+                    _make_chunk(
+                        completion_id,
+                        model_name,
+                        {},
+                        finish_reason=event_data.get("finish_reason") or "stop",
+                    )
+                )
+            chunks.append("data: [DONE]\n\n")
+            state.done = True
 
     elif event_type == "id":
         # Skip the "None" placeholder conversation_id emitted when the call is

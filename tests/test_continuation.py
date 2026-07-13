@@ -838,12 +838,10 @@ class TestValidateRequest:
 
 @pytest.mark.unit
 class TestResumeMarkResuming:
-    """Resumed runs must mark state ``resuming`` instead of deleting it
-    eagerly; the row stays in PG so a crashed resume can be retried."""
+    """Resumed runs atomically claim state instead of deleting it eagerly."""
 
-    def test_resume_calls_mark_resuming_not_delete(self, monkeypatch):
-        """``resume_from_tool_actions`` flips the row to 'resuming' and
-        does not delete it before the run finishes."""
+    def test_resume_claims_state_once_and_does_not_delete(self, monkeypatch):
+        """``resume_from_tool_actions`` consumes one atomic claim."""
         from application.api.answer.services import (
             continuation_service as cont_mod,
         )
@@ -852,7 +850,7 @@ class TestResumeMarkResuming:
         from application.llm.handlers import handler_creator as handler_mod
 
         cont_service = MagicMock()
-        cont_service.load_state.return_value = {
+        cont_service.claim_state.return_value = {
             "messages": [],
             "pending_tool_calls": [],
             "tools_dict": {},
@@ -871,8 +869,6 @@ class TestResumeMarkResuming:
             },
             "client_tools": None,
         }
-        cont_service.mark_resuming.return_value = True
-
         monkeypatch.setattr(
             cont_mod, "ContinuationService", lambda: cont_service
         )
@@ -908,7 +904,7 @@ class TestResumeMarkResuming:
             conversation_id="00000000-0000-0000-0000-000000000001",
         )
 
-        cont_service.mark_resuming.assert_called_once_with(
+        cont_service.claim_state.assert_called_once_with(
             "00000000-0000-0000-0000-000000000001", "alice"
         )
         cont_service.delete_state.assert_not_called()
@@ -929,7 +925,7 @@ class TestResumeMarkResuming:
         reserved_id = "22222222-2222-2222-2222-222222222222"
 
         cont_service = MagicMock()
-        cont_service.load_state.return_value = {
+        cont_service.claim_state.return_value = {
             "messages": [],
             "pending_tool_calls": [],
             "tools_dict": {},
@@ -949,7 +945,6 @@ class TestResumeMarkResuming:
             },
             "client_tools": None,
         }
-        cont_service.mark_resuming.return_value = True
         monkeypatch.setattr(cont_mod, "ContinuationService", lambda: cont_service)
         monkeypatch.setattr(
             llm_creator_mod.LLMCreator, "create_llm", lambda *a, **kw: MagicMock(),
@@ -1004,7 +999,7 @@ class TestResumeMarkResuming:
         from application.llm.handlers import handler_creator as handler_mod
 
         cont_service = MagicMock()
-        cont_service.load_state.return_value = {
+        cont_service.claim_state.return_value = {
             "messages": [],
             "pending_tool_calls": [],
             "tools_dict": {},
@@ -1023,7 +1018,6 @@ class TestResumeMarkResuming:
             },
             "client_tools": None,
         }
-        cont_service.mark_resuming.return_value = True
         monkeypatch.setattr(cont_mod, "ContinuationService", lambda: cont_service)
         monkeypatch.setattr(
             llm_creator_mod.LLMCreator, "create_llm", lambda *a, **kw: MagicMock(),
@@ -1066,8 +1060,7 @@ class TestResumeMarkResuming:
 
         fake_repo.find_by_key.assert_called_once_with("agent-key-1")
         # The lookup + claim now key on the owner id, not None.
-        cont_service.load_state.assert_called_once_with(conv_id, "owner-1")
-        cont_service.mark_resuming.assert_called_once_with(conv_id, "owner-1")
+        cont_service.claim_state.assert_called_once_with(conv_id, "owner-1")
         assert sp.initial_user_id == "owner-1"
         assert sp.decoded_token == {"sub": "owner-1"}
 
@@ -1120,7 +1113,7 @@ class TestContinuationServiceMarkResuming:
         assert flipped is True
 
         with pg_engine.connect() as conn:
-            row = PendingToolStateRepository(conn).load_state(
+            row = PendingToolStateRepository(conn).load_state_any(
                 conv["id"], "alice"
             )
         assert row["status"] == "resuming"

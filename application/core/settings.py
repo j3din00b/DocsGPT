@@ -249,6 +249,15 @@ class Settings(BaseSettings):
     # reasoning items instead.
     OPENAI_RESPONSES_STORE: bool = False
 
+    # OpenAI-compatible clients can identify a logical chat with session
+    # headers even though chat-completions itself has no conversation field.
+    V1_SESSION_TTL_SECONDS: int = 24 * 60 * 60
+
+    # Optional cheaper model for first-party conversation titles. When unset,
+    # listed conversations use their answer model, but title work is still
+    # dispatched off the response path.
+    TITLE_MODEL_ID: Optional[str] = None
+
     # Config-free tools on by default in agentless chats. ``scheduler`` is
     # dual-registered (also in ``BUILTIN_AGENT_TOOLS``) so the same synthetic id
     DEFAULT_CHAT_TOOLS: list = [

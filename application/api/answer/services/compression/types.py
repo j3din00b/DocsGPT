@@ -87,5 +87,7 @@ class CompressionResult:
             }
             if q.get("thought"):
                 entry["thought"] = q["thought"]
+            if q.get("tool_calls"):
+                entry["tool_calls"] = q["tool_calls"]
             out.append(entry)
         return out

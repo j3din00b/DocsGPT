@@ -145,23 +145,85 @@ class BaseAgent(ABC):
         yield from self._emit_responses_metadata()
 
     def _emit_responses_metadata(self) -> Generator[Dict, None, None]:
-        """Surface the latest Responses API id so the route can persist it in
-        message metadata for previous_response_id chaining across turns."""
-        if not settings.OPENAI_RESPONSES_STORE:
+        """Surface Responses continuity and usage for durable next turns."""
+        uses_responses = getattr(self.llm, "_uses_responses_api", None)
+        if callable(uses_responses) and not uses_responses():
             return
         response_id = getattr(self.llm, "_last_response_id", None)
-        if response_id:
-            yield {"metadata": {"response_id": response_id}}
+        chain_key_factory = getattr(self.llm, "responses_chain_key", None)
+        chain_key = chain_key_factory() if callable(chain_key_factory) else None
+        exporter = getattr(self.llm, "export_responses_state", None)
+        state = exporter() if callable(exporter) else None
+        stored_metadata = (
+            {
+                "response_id": response_id,
+                "response_chain_key": chain_key,
+            }
+            if settings.OPENAI_RESPONSES_STORE
+            else {}
+        )
+        metadata = {
+            **stored_metadata,
+            "responses_state": state,
+            "usage": getattr(self.llm, "_last_usage", None),
+        }
+        metadata = {key: value for key, value in metadata.items() if value is not None}
+        if metadata:
+            yield {"metadata": metadata}
 
     def _previous_response_id(self) -> Optional[str]:
-        """Most recent stored Responses API id from chat history, if any."""
-        for turn in reversed(self.chat_history or []):
-            if not isinstance(turn, dict):
-                continue
-            meta = turn.get("metadata")
-            if isinstance(meta, dict) and meta.get("response_id"):
-                return meta["response_id"]
+        """Return the immediately preceding compatible Responses API id."""
+        if not self.chat_history:
+            return None
+        turn = self.chat_history[-1]
+        if not isinstance(turn, dict):
+            return None
+        meta = turn.get("metadata")
+        if not isinstance(meta, dict):
+            return None
+        chain_key_factory = getattr(self.llm, "responses_chain_key", None)
+        current_chain_key = (
+            chain_key_factory() if callable(chain_key_factory) else None
+        )
+        if (
+            current_chain_key
+            and meta.get("response_chain_key") == current_chain_key
+            and meta.get("response_id")
+        ):
+            return meta["response_id"]
         return None
+
+    def _previous_responses_state(self) -> Optional[Dict[str, Any]]:
+        """Return continuity state from the immediately preceding turn."""
+        if not self.chat_history or not isinstance(self.chat_history[-1], dict):
+            return None
+        metadata = self.chat_history[-1].get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        state = metadata.get("responses_state")
+        return state if isinstance(state, dict) else None
+
+    def _compatible_responses_state(
+        self, metadata: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Return Responses state only for the active Responses target."""
+        uses_responses = getattr(self.llm, "_uses_responses_api", None)
+        if not callable(uses_responses) or not uses_responses():
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        state = metadata.get("responses_state")
+        chain_key_factory = getattr(self.llm, "responses_chain_key", None)
+        current_chain_key = (
+            chain_key_factory() if callable(chain_key_factory) else None
+        )
+        if (
+            not isinstance(state, dict)
+            or not current_chain_key
+            or state.get("chain_key") != current_chain_key
+        ):
+            return None
+        return state
 
     @abstractmethod
     def _gen_inner(
@@ -308,7 +370,7 @@ class BaseAgent(ABC):
                 }
 
         # Resume the LLM loop with the updated messages
-        llm_response = self._llm_gen(messages)
+        llm_response = self._llm_gen(messages, preserve_responses_state=True)
         yield from self._handle_response(
             llm_response, tools_dict, messages, None
         )
@@ -475,8 +537,87 @@ class BaseAgent(ABC):
         messages = [{"role": "system", "content": system_prompt}]
 
         for i in working_history:
-            if "prompt" in i and "response" in i:
+            has_completed_turn = "prompt" in i and "response" in i
+            if has_completed_turn:
                 messages.append({"role": "user", "content": i["prompt"]})
+            state = self._compatible_responses_state(i.get("metadata"))
+            historical_tool_calls = i.get("tool_calls") or []
+            if historical_tool_calls:
+                tool_message: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [],
+                }
+                call_reasoning: List[Dict[str, Any]] = []
+                seen_reasoning_ids = set()
+                used_replay_call_ids: set[str] = set()
+                call_id_occurrences: Dict[str, int] = {}
+                for tool_call in historical_tool_calls:
+                    # Persistence flattens all tool rounds in a turn. Some
+                    # providers reuse deterministic call IDs in later rounds,
+                    # so retain the first ID and synthesize stable replay-only
+                    # IDs for collisions without dropping any call or result.
+                    source_call_id = str(
+                        tool_call.get("call_id") or uuid.uuid4()
+                    )
+                    occurrence = call_id_occurrences.get(source_call_id, 0)
+                    call_id_occurrences[source_call_id] = occurrence + 1
+                    call_id = source_call_id
+                    while call_id in used_replay_call_ids:
+                        occurrence += 1
+                        call_id = "replay_" + str(uuid.uuid5(
+                            uuid.NAMESPACE_OID,
+                            f"{source_call_id}:{occurrence}",
+                        ))
+                    used_replay_call_ids.add(call_id)
+                    args = tool_call.get("arguments")
+                    args_str = (
+                        json.dumps(args)
+                        if isinstance(args, dict)
+                        else (args or "{}")
+                    )
+                    tool_message["tool_calls"].append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.get("action_name", ""),
+                            "arguments": args_str,
+                        },
+                    })
+                    if state:
+                        for reasoning_item in (
+                            state.get("reasoning_for_calls", {}).get(
+                                source_call_id, []
+                            )
+                        ):
+                            reasoning_id = (
+                                reasoning_item.get("id")
+                                if isinstance(reasoning_item, dict)
+                                else None
+                            )
+                            if reasoning_id and reasoning_id in seen_reasoning_ids:
+                                continue
+                            if reasoning_id:
+                                seen_reasoning_ids.add(reasoning_id)
+                            call_reasoning.append(reasoning_item)
+                if call_reasoning:
+                    tool_message["responses_reasoning_items"] = call_reasoning
+                messages.append(tool_message)
+                for tool_call, emitted_call in zip(
+                    historical_tool_calls, tool_message["tool_calls"]
+                ):
+                    result = tool_call.get("result")
+                    result_str = (
+                        json.dumps(result)
+                        if not isinstance(result, str)
+                        else (result or "")
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": emitted_call["id"],
+                        "content": result_str,
+                    })
+            if has_completed_turn:
                 asst_msg: Dict[str, Any] = {
                     "role": "assistant",
                     "content": i["response"],
@@ -487,39 +628,9 @@ class BaseAgent(ABC):
                 # request. Other OpenAI-compatible APIs ignore the field.
                 if i.get("thought"):
                     asst_msg["reasoning_content"] = i["thought"]
+                if isinstance(state, dict) and state.get("reasoning_items"):
+                    asst_msg["responses_reasoning_items"] = state["reasoning_items"]
                 messages.append(asst_msg)
-            if "tool_calls" in i:
-                for tool_call in i["tool_calls"]:
-                    call_id = tool_call.get("call_id") or str(uuid.uuid4())
-                    args = tool_call.get("arguments")
-                    args_str = (
-                        json.dumps(args)
-                        if isinstance(args, dict)
-                        else (args or "{}")
-                    )
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tool_call.get("action_name", ""),
-                                "arguments": args_str,
-                            },
-                        }],
-                    })
-                    result = tool_call.get("result")
-                    result_str = (
-                        json.dumps(result)
-                        if not isinstance(result, str)
-                        else (result or "")
-                    )
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": result_str,
-                    })
         # When the request was multimodal, send the full content array (text +
         # image_url parts) so images reach the model; the text-only `query` above
         # is used only for token budgeting / retrieval.
@@ -577,8 +688,18 @@ class BaseAgent(ABC):
 
     # ---- LLM generation ----
 
-    def _llm_gen(self, messages: List[Dict], log_context: Optional[LogContext] = None):
+    def _llm_gen(
+        self,
+        messages: List[Dict],
+        log_context: Optional[LogContext] = None,
+        preserve_responses_state: bool = False,
+    ):
         self._validate_context_size(messages)
+
+        if not preserve_responses_state:
+            starter = getattr(self.llm, "start_responses_turn", None)
+            if callable(starter):
+                starter()
 
         # Use the upstream id resolved by LLMCreator (see __init__).
         # Built-in models: same as self.model_id. BYOM: the user's

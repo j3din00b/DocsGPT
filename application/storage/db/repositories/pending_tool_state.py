@@ -1,14 +1,14 @@
 """Repository for the ``pending_tool_state`` table.
 
-Mirrors the continuation service's three operations on
-``pending_tool_state`` in Mongo:
+Provides the continuation lifecycle operations for ``pending_tool_state``:
 
 - save_state  → upsert (INSERT ... ON CONFLICT DO UPDATE)
-- load_state  → find_one by (conversation_id, user_id)
+- load_state  → fetch live pending state by (conversation_id, user_id)
+- claim_state → atomically transition live pending state to ``resuming``
 - delete_state → delete_one by (conversation_id, user_id)
 
-Adds ``mark_resuming`` so a resumed run can claim a row without
-deleting it; a separate ``revert_stale_resuming`` flips abandoned
+Retains ``mark_resuming`` for compatibility; new resume paths use the atomic
+claim. A separate ``revert_stale_resuming`` flips abandoned
 ``resuming`` rows back to ``pending`` so a crashed worker doesn't
 strand the user.
 
@@ -102,11 +102,46 @@ class PendingToolStateRepository:
         return row_to_dict(result.fetchone())
 
     def load_state(self, conversation_id: str, user_id: str) -> Optional[dict]:
+        """Load live pending state without exposing expired/resuming rows."""
+        result = self._conn.execute(
+            text(
+                "SELECT * FROM pending_tool_state "
+                "WHERE conversation_id = CAST(:conv_id AS uuid) "
+                "AND user_id = :user_id "
+                "AND status = 'pending' "
+                "AND expires_at > clock_timestamp()"
+            ),
+            {"conv_id": conversation_id, "user_id": user_id},
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def load_state_any(self, conversation_id: str, user_id: str) -> Optional[dict]:
+        """Load state regardless of lifecycle for conflict classification."""
         result = self._conn.execute(
             text(
                 "SELECT * FROM pending_tool_state "
                 "WHERE conversation_id = CAST(:conv_id AS uuid) "
                 "AND user_id = :user_id"
+            ),
+            {"conv_id": conversation_id, "user_id": user_id},
+        )
+        row = result.fetchone()
+        return row_to_dict(row) if row is not None else None
+
+    def claim_state(self, conversation_id: str, user_id: str) -> Optional[dict]:
+        """Atomically claim one live pending continuation and return it."""
+        result = self._conn.execute(
+            text(
+                """
+                UPDATE pending_tool_state
+                SET status = 'resuming', resumed_at = clock_timestamp()
+                WHERE conversation_id = CAST(:conv_id AS uuid)
+                  AND user_id = :user_id
+                  AND status = 'pending'
+                  AND expires_at > clock_timestamp()
+                RETURNING *
+                """
             ),
             {"conv_id": conversation_id, "user_id": user_id},
         )
@@ -134,6 +169,7 @@ class PendingToolStateRepository:
                 WHERE conversation_id = CAST(:conv_id AS uuid)
                   AND user_id = :user_id
                   AND status = 'pending'
+                  AND expires_at > clock_timestamp()
                 """
             ),
             {"conv_id": conversation_id, "user_id": user_id},
@@ -177,7 +213,7 @@ class PendingToolStateRepository:
         result = self._conn.execute(
             text(
                 "DELETE FROM pending_tool_state WHERE expires_at < clock_timestamp() "
-                "RETURNING conversation_id, user_id"
+                "RETURNING conversation_id, user_id, agent_config"
             )
         )
         return [row_to_dict(r) for r in result.fetchall()]

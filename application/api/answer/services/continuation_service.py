@@ -23,7 +23,16 @@ PENDING_STATE_TTL_SECONDS = 30 * 60  # 30 minutes
 
 # Re-export so the existing tests at tests/api/answer/services/test_continuation_service_pg.py
 # can keep importing ``_make_serializable`` from here.
-__all__ = ["_make_serializable", "ContinuationService", "PENDING_STATE_TTL_SECONDS"]
+__all__ = [
+    "_make_serializable",
+    "ContinuationService",
+    "PENDING_STATE_TTL_SECONDS",
+    "ResumeInProgressError",
+]
+
+
+class ResumeInProgressError(ValueError):
+    """Raised when another request already owns a continuation claim."""
 
 
 class ContinuationService:
@@ -119,6 +128,29 @@ class ContinuationService:
         if not doc:
             return None
         return doc
+
+    def claim_state(
+        self, conversation_id: str, user: str
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically claim live state or classify an active duplicate."""
+        with db_session() as conn:
+            conv = ConversationsRepository(conn).get_by_legacy_id(conversation_id)
+            if conv is not None:
+                pg_conv_id = conv["id"]
+            elif looks_like_uuid(conversation_id):
+                pg_conv_id = conversation_id
+            else:
+                return None
+            repo = PendingToolStateRepository(conn)
+            claimed = repo.claim_state(pg_conv_id, user)
+            if claimed:
+                return claimed
+            existing = repo.load_state_any(pg_conv_id, user)
+            if existing and existing.get("status") == "resuming":
+                raise ResumeInProgressError(
+                    "Resume already in progress for this conversation."
+                )
+        return None
 
     def delete_state(self, conversation_id: str, user: str) -> bool:
         """Delete pending state after successful resumption.

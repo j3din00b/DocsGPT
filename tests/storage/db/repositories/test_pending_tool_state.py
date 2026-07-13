@@ -109,7 +109,7 @@ class TestMarkResuming:
         flipped = repo.mark_resuming(conv["id"], "user-1")
         assert flipped is True
 
-        loaded = repo.load_state(conv["id"], "user-1")
+        loaded = repo.load_state_any(conv["id"], "user-1")
         assert loaded["status"] == "resuming"
         assert loaded["resumed_at"] is not None
 
@@ -181,7 +181,7 @@ class TestRevertStaleResuming:
         reverted = repo.revert_stale_resuming(grace_seconds=600)
         assert reverted == 0
 
-        loaded = repo.load_state(conv["id"], "user-1")
+        loaded = repo.load_state_any(conv["id"], "user-1")
         assert loaded["status"] == "resuming"
 
     def test_leaves_pending_alone(self, pg_conn):
@@ -201,9 +201,17 @@ class TestRevertStaleResuming:
         # so the user gets a fresh window to retry.
         conv = _conv(pg_conn)
         repo = _repo(pg_conn)
-        repo.save_state(conv["id"], "user-1", **_sample_state(), ttl_seconds=0)
+        repo.save_state(conv["id"], "user-1", **_sample_state())
         repo.mark_resuming(conv["id"], "user-1")
         self._backdate_resumed(pg_conn, conv["id"], "user-1", 660)
+        pg_conn.execute(
+            text(
+                "UPDATE pending_tool_state "
+                "SET expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE conversation_id = CAST(:conv_id AS uuid)"
+            ),
+            {"conv_id": conv["id"]},
+        )
 
         repo.revert_stale_resuming(grace_seconds=600)
         # Same tick: the original expires_at was set to "now" (ttl=0)

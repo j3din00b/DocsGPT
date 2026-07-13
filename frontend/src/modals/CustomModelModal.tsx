@@ -8,11 +8,24 @@ import Spinner from '../components/Spinner';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../components/ui/select';
 import { ActiveState } from '../models/misc';
 import { selectToken } from '../preferences/preferenceSlice';
 import { Modal } from '../components/ui/modal';
 
-import type { CreateCustomModelPayload, CustomModel } from '../models/types';
+import type {
+  CreateCustomModelPayload,
+  CustomModel,
+  CustomModelCapabilities,
+  ModelApiFlavor,
+  ReasoningEffort,
+} from '../models/types';
 
 interface CustomModelModalProps {
   modalState: ActiveState;
@@ -31,6 +44,8 @@ interface FormState {
   supports_structured_output: boolean;
   supports_images: boolean;
   context_window: number | '';
+  api_flavor: ModelApiFlavor;
+  reasoning_effort: ReasoningEffort | 'default';
   enabled: boolean;
 }
 
@@ -50,6 +65,8 @@ const buildInitialFormState = (model?: CustomModel | null): FormState => {
       supports_structured_output: true,
       supports_images: false,
       context_window: DEFAULT_CONTEXT_WINDOW,
+      api_flavor: 'chat_completions',
+      reasoning_effort: 'default',
       enabled: true,
     };
   }
@@ -68,6 +85,8 @@ const buildInitialFormState = (model?: CustomModel | null): FormState => {
     supports_images: attachments.includes('image'),
     context_window:
       model.capabilities?.context_window ?? DEFAULT_CONTEXT_WINDOW,
+    api_flavor: model.capabilities?.api_flavor ?? 'chat_completions',
+    reasoning_effort: model.capabilities?.reasoning_effort ?? 'default',
     enabled: model.enabled ?? true,
   };
 };
@@ -172,17 +191,22 @@ export default function CustomModelModal({
       formData.context_window === ''
         ? DEFAULT_CONTEXT_WINDOW
         : Number(formData.context_window);
+    const capabilities: CustomModelCapabilities = {
+      supports_tools: formData.supports_tools,
+      supports_structured_output: formData.supports_structured_output,
+      attachments: formData.supports_images ? ['image'] : [],
+      context_window: ctxValue,
+      api_flavor: formData.api_flavor,
+    };
+    if (formData.reasoning_effort !== 'default') {
+      capabilities.reasoning_effort = formData.reasoning_effort;
+    }
     const payload: CreateCustomModelPayload = {
       upstream_model_id: formData.upstream_model_id.trim(),
       display_name: formData.display_name.trim(),
       description: formData.description.trim(),
       base_url: formData.base_url.trim(),
-      capabilities: {
-        supports_tools: formData.supports_tools,
-        supports_structured_output: formData.supports_structured_output,
-        attachments: formData.supports_images ? ['image'] : [],
-        context_window: ctxValue,
-      },
+      capabilities,
       enabled: formData.enabled,
     };
     if (formData.api_key.trim()) {
@@ -246,18 +270,23 @@ export default function CustomModelModal({
     setTesting(true);
     setTestResult(null);
     try {
+      const capabilities = {
+        api_flavor: formData.api_flavor,
+      };
       const result =
         isEditMode && model?.id
           ? await customModelsService.testCustomModel(model.id, token, {
               base_url: trimmedBaseUrl,
               api_key: trimmedApiKey,
               upstream_model_id: trimmedUpstreamId,
+              capabilities,
             })
           : await customModelsService.testCustomModelPayload(
               {
                 base_url: trimmedBaseUrl,
                 api_key: trimmedApiKey,
                 upstream_model_id: trimmedUpstreamId,
+                capabilities,
               },
               token,
             );
@@ -447,6 +476,80 @@ export default function CustomModelModal({
             {/* Row 4: Capabilities — flat (no border), chips + inline ctx */}
             <div className="flex flex-col gap-2">
               <Label>{t('settings.customModels.capabilities.title')}</Label>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="flex flex-col gap-1.5">
+                  <Label
+                    htmlFor="cm-api-flavor"
+                    className="text-muted-foreground text-xs"
+                  >
+                    {t('settings.customModels.capabilities.apiFlavor')}
+                  </Label>
+                  <Select
+                    value={formData.api_flavor}
+                    onValueChange={(value) =>
+                      handleChange('api_flavor', value as ModelApiFlavor)
+                    }
+                  >
+                    <SelectTrigger id="cm-api-flavor" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="chat_completions">
+                        {t(
+                          'settings.customModels.capabilities.apiFlavors.chatCompletions',
+                        )}
+                      </SelectItem>
+                      <SelectItem value="responses">
+                        {t(
+                          'settings.customModels.capabilities.apiFlavors.responses',
+                        )}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <Label
+                    htmlFor="cm-reasoning-effort"
+                    className="text-muted-foreground text-xs"
+                  >
+                    {t('settings.customModels.capabilities.reasoningEffort')}
+                  </Label>
+                  <Select
+                    value={formData.reasoning_effort}
+                    onValueChange={(value) =>
+                      handleChange(
+                        'reasoning_effort',
+                        value as ReasoningEffort | 'default',
+                      )
+                    }
+                  >
+                    <SelectTrigger id="cm-reasoning-effort" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="default">
+                        {t(
+                          'settings.customModels.capabilities.reasoningEfforts.default',
+                        )}
+                      </SelectItem>
+                      {(
+                        [
+                          'none',
+                          'minimal',
+                          'low',
+                          'medium',
+                          'high',
+                          'xhigh',
+                        ] as ReasoningEffort[]
+                      ).map((effort) => (
+                        <SelectItem key={effort} value={effort}>
+                          {effort}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
               <div className="flex flex-wrap gap-2">
                 <CapabilityChip
                   label={t('settings.customModels.capabilities.chips.tools')}

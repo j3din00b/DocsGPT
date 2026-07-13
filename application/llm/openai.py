@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import logging
 
@@ -135,6 +136,7 @@ class OpenAILLM(BaseLLM):
             effective_base_url = settings.OPENAI_BASE_URL
         else:
             effective_base_url = "https://api.openai.com/v1"
+        self._effective_base_url = effective_base_url
 
         # http_client (set by LLMCreator for BYOM) is a DNS-rebinding-safe
         # httpx.Client; without it the SDK re-resolves DNS per request.
@@ -156,6 +158,64 @@ class OpenAILLM(BaseLLM):
         # chain turns when OPENAI_RESPONSES_STORE is enabled.
         self._reasoning_for_calls = {}
         self._last_response_id = None
+        self._last_reasoning_items = []
+        self._last_usage = None
+        self._imported_response_id = None
+
+    def responses_chain_key(self) -> str:
+        """Return a credential- and endpoint-scoped Responses chain key.
+
+        The digest is safe to persist in conversation metadata and prevents a
+        ``previous_response_id`` from being reused after the user switches
+        model, endpoint, or API credential.
+
+        Returns:
+            A stable hexadecimal digest for the current Responses target.
+        """
+        canonical_model_id = (
+            getattr(self, "_canonical_model_id", None) or self.model_id or ""
+        )
+        material = "\0".join(
+            (
+                self.provider_name,
+                canonical_model_id,
+                self._effective_base_url,
+                self.api_key or "",
+                "store=true" if settings.OPENAI_RESPONSES_STORE else "store=false",
+            )
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def export_responses_state(self) -> dict:
+        """Return serializable Responses continuity state for persistence."""
+        return {
+            "version": 1,
+            "chain_key": self.responses_chain_key(),
+            "response_id": (
+                self._last_response_id if settings.OPENAI_RESPONSES_STORE else None
+            ),
+            "reasoning_items": self._last_reasoning_items,
+            "reasoning_for_calls": self._reasoning_for_calls,
+        }
+
+    def import_responses_state(self, state: dict | None) -> bool:
+        """Restore encrypted/stored Responses state when its target matches."""
+        if not isinstance(state, dict):
+            return False
+        if state.get("chain_key") != self.responses_chain_key():
+            return False
+        self._imported_response_id = state.get("response_id")
+        self._last_reasoning_items = list(state.get("reasoning_items") or [])
+        self._reasoning_for_calls = dict(state.get("reasoning_for_calls") or {})
+        return True
+
+    def start_responses_turn(self) -> None:
+        """Reset continuity accumulated during the preceding user turn."""
+        self._reasoning_for_calls = {}
+        self._last_reasoning_items = []
+        self._last_response_id = None
+        self._imported_response_id = None
+        self._last_finish_reason = None
 
     def _clean_messages_openai(self, messages):
         cleaned_messages = []
@@ -197,6 +257,12 @@ class OpenAILLM(BaseLLM):
                 }
                 if reasoning_content:
                     cleaned_assistant["reasoning_content"] = reasoning_content
+                if self._uses_responses_api() and message.get(
+                    "responses_reasoning_items"
+                ):
+                    cleaned_assistant["responses_reasoning_items"] = message[
+                        "responses_reasoning_items"
+                    ]
                 cleaned_messages.append(cleaned_assistant)
                 continue
 
@@ -215,6 +281,14 @@ class OpenAILLM(BaseLLM):
                     msg_obj: dict = {"role": role, "content": content}
                     if reasoning_content and role == "assistant":
                         msg_obj["reasoning_content"] = reasoning_content
+                    if (
+                        self._uses_responses_api()
+                        and message.get("responses_reasoning_items")
+                        and role == "assistant"
+                    ):
+                        msg_obj["responses_reasoning_items"] = message[
+                            "responses_reasoning_items"
+                        ]
                     cleaned_messages.append(msg_obj)
                 elif isinstance(content, list):
                     content_parts = []
@@ -324,7 +398,11 @@ class OpenAILLM(BaseLLM):
         **kwargs,
     ):
         messages = self._clean_messages_openai(messages)
-        logging.info(f"Cleaned messages: {_truncate_base64_for_logging(messages)}")
+        logging.debug(
+            "Prepared OpenAI request with %d messages and %d tools",
+            len(messages or []),
+            len(tools or []),
+        )
 
         # Convert max_tokens to max_completion_tokens for newer models
         if "max_tokens" in kwargs:
@@ -336,6 +414,9 @@ class OpenAILLM(BaseLLM):
             tools = None
         if response_format and not self._supports_structured_output():
             response_format = None
+        if not tools:
+            kwargs.pop("tool_choice", None)
+            kwargs.pop("parallel_tool_calls", None)
 
         previous_response_id = kwargs.pop("previous_response_id", None)
         if self._uses_responses_api():
@@ -362,7 +443,7 @@ class OpenAILLM(BaseLLM):
         if response_format:
             request_params["response_format"] = response_format
         response = self.client.chat.completions.create(**request_params)
-        logging.info(f"OpenAI response: {response}")
+        logging.debug("OpenAI request completed")
         if tools:
             return response.choices[0]
         else:
@@ -380,7 +461,11 @@ class OpenAILLM(BaseLLM):
         **kwargs,
     ):
         messages = self._clean_messages_openai(messages)
-        logging.info(f"Cleaned messages: {_truncate_base64_for_logging(messages)}")
+        logging.debug(
+            "Prepared OpenAI streaming request with %d messages and %d tools",
+            len(messages or []),
+            len(tools or []),
+        )
 
         # Convert max_tokens to max_completion_tokens for newer models
         if "max_tokens" in kwargs:
@@ -392,6 +477,9 @@ class OpenAILLM(BaseLLM):
             tools = None
         if response_format and not self._supports_structured_output():
             response_format = None
+        if not tools:
+            kwargs.pop("tool_choice", None)
+            kwargs.pop("parallel_tool_calls", None)
 
         previous_response_id = kwargs.pop("previous_response_id", None)
         if self._uses_responses_api():
@@ -510,6 +598,14 @@ class OpenAILLM(BaseLLM):
         emitted_reasoning = set()
         for message in messages:
             role = message.get("role")
+            message_reasoning = message.get("responses_reasoning_items") or []
+            for item in message_reasoning:
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if item_id and item_id in emitted_reasoning:
+                    continue
+                if item_id:
+                    emitted_reasoning.add(item_id)
+                input_items.append(item)
             tool_calls = message.get("tool_calls")
             if tool_calls and role == "assistant":
                 for tc in tool_calls:
@@ -554,9 +650,7 @@ class OpenAILLM(BaseLLM):
         last completed assistant response needs to be sent again."""
         last_assistant = -1
         for i, message in enumerate(messages):
-            if message.get("role") == "assistant" and not message.get(
-                "tool_calls"
-            ):
+            if message.get("role") == "assistant":
                 last_assistant = i
         if last_assistant < 0:
             return messages
@@ -645,6 +739,16 @@ class OpenAILLM(BaseLLM):
 
         if tools:
             params["tools"] = self._to_responses_tools(tools)
+            if kwargs.get("tool_choice") is not None:
+                choice = kwargs["tool_choice"]
+                if isinstance(choice, dict) and choice.get("type") == "function":
+                    choice = {
+                        "type": "function",
+                        "name": (choice.get("function") or {}).get("name", ""),
+                    }
+                params["tool_choice"] = choice
+            if kwargs.get("parallel_tool_calls") is not None:
+                params["parallel_tool_calls"] = bool(kwargs["parallel_tool_calls"])
 
         store = bool(settings.OPENAI_RESPONSES_STORE)
         params["store"] = store
@@ -682,6 +786,49 @@ class OpenAILLM(BaseLLM):
         rid = getattr(response, "id", None)
         if rid:
             self._last_response_id = rid
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            prompt = int(getattr(usage, "input_tokens", 0) or 0)
+            completion = int(getattr(usage, "output_tokens", 0) or 0)
+            input_details = getattr(usage, "input_tokens_details", None)
+            output_details = getattr(usage, "output_tokens_details", None)
+            result = {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": int(getattr(usage, "total_tokens", 0) or prompt + completion),
+            }
+            cached = int(getattr(input_details, "cached_tokens", 0) or 0)
+            reasoning = int(getattr(output_details, "reasoning_tokens", 0) or 0)
+            if cached:
+                result["prompt_tokens_details"] = {"cached_tokens": cached}
+            if reasoning:
+                result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+            self._last_usage = result
+
+    @staticmethod
+    def _responses_status_error(response) -> str | None:
+        """Return a terminal Responses error message, if one is present.
+
+        Args:
+            response: An OpenAI Response object from a non-streaming call or
+                terminal streaming event.
+
+        Returns:
+            A human-readable error string for failed/incomplete responses, or
+            ``None`` for successful and legacy status-less test objects.
+        """
+        if response is None:
+            return None
+        status = getattr(response, "status", None)
+        error = getattr(response, "error", None)
+        if status == "failed" or error is not None:
+            message = getattr(error, "message", None) or str(error or "unknown error")
+            return f"Responses API failed: {message}"
+        details = getattr(response, "incomplete_details", None)
+        if status == "incomplete" or details is not None:
+            reason = getattr(details, "reason", None) or "unknown reason"
+            return f"Responses API incomplete: {reason}"
+        return None
 
     def _remember_reasoning(self, tool_calls, reasoning_items):
         """Key captured reasoning items by each function-call id for replay
@@ -705,6 +852,8 @@ class OpenAILLM(BaseLLM):
                 for part in getattr(item, "content", None) or []:
                     if getattr(part, "type", None) == "output_text":
                         content_parts.append(getattr(part, "text", "") or "")
+                    elif getattr(part, "type", None) == "refusal":
+                        content_parts.append(getattr(part, "refusal", "") or "")
             elif itype == "function_call":
                 tool_calls.append(_RespToolCall(
                     id=getattr(item, "call_id", "") or getattr(item, "id", ""),
@@ -723,6 +872,12 @@ class OpenAILLM(BaseLLM):
         previous_response_id=None,
         **kwargs,
     ):
+        previous_response_id = (
+            self._last_response_id or previous_response_id or self._imported_response_id
+        )
+        self._last_response_id = None
+        self._last_usage = None
+        self._last_finish_reason = None
         if previous_response_id and settings.OPENAI_RESPONSES_STORE:
             messages = self._trim_for_previous_response(messages)
         input_items = self._to_responses_input(messages)
@@ -736,11 +891,35 @@ class OpenAILLM(BaseLLM):
             kwargs=kwargs,
         )
         response = self.client.responses.create(**params)
-        logging.info(f"OpenAI responses output: {getattr(response, 'output', None)}")
+        if response is None:
+            raise RuntimeError("Responses API returned no response object")
+        logging.debug(
+            "OpenAI Responses request completed id=%s",
+            getattr(response, "id", None),
+        )
         self._record_responses_metadata(response)
         content, tool_calls, reasoning_items = self._parse_responses_output(
             response
         )
+        self._last_reasoning_items = reasoning_items
+        details = getattr(response, "incomplete_details", None)
+        incomplete_reason = getattr(details, "reason", None)
+        if getattr(response, "status", None) == "incomplete":
+            if incomplete_reason != "max_output_tokens":
+                raise RuntimeError(
+                    self._responses_status_error(response)
+                    or "Responses API incomplete: unknown reason"
+                )
+            self._last_finish_reason = "length"
+            if tools:
+                return _RespChoice(
+                    finish_reason="length",
+                    message=_RespMessage(content=content or None, tool_calls=None),
+                )
+            return content or ""
+        status_error = self._responses_status_error(response)
+        if status_error:
+            raise RuntimeError(status_error)
         if tools:
             self._remember_reasoning(tool_calls, reasoning_items)
             message = _RespMessage(
@@ -750,6 +929,7 @@ class OpenAILLM(BaseLLM):
                 finish_reason="tool_calls" if tool_calls else "stop",
                 message=message,
             )
+        self._last_finish_reason = "stop"
         return content or ""
 
     def _responses_gen_stream(
@@ -761,6 +941,12 @@ class OpenAILLM(BaseLLM):
         previous_response_id=None,
         **kwargs,
     ):
+        previous_response_id = (
+            self._last_response_id or previous_response_id or self._imported_response_id
+        )
+        self._last_response_id = None
+        self._last_usage = None
+        self._last_finish_reason = None
         if previous_response_id and settings.OPENAI_RESPONSES_STORE:
             messages = self._trim_for_previous_response(messages)
         input_items = self._to_responses_input(messages)
@@ -777,6 +963,7 @@ class OpenAILLM(BaseLLM):
 
         func_calls = {}
         reasoning_items = []
+        refusal_delta_seen = False
         try:
             for event in response:
                 etype = getattr(event, "type", "")
@@ -784,6 +971,15 @@ class OpenAILLM(BaseLLM):
                     delta = getattr(event, "delta", "")
                     if delta:
                         yield delta
+                elif etype == "response.refusal.delta":
+                    delta = getattr(event, "delta", "")
+                    if delta:
+                        refusal_delta_seen = True
+                        yield delta
+                elif etype == "response.refusal.done" and not refusal_delta_seen:
+                    refusal = getattr(event, "refusal", "")
+                    if refusal:
+                        yield refusal
                 elif etype == "response.reasoning_summary_text.delta":
                     delta = getattr(event, "delta", "")
                     if delta:
@@ -819,9 +1015,17 @@ class OpenAILLM(BaseLLM):
                             self._reasoning_item_to_dict(item)
                         )
                 elif etype == "response.completed":
-                    self._record_responses_metadata(
-                        getattr(event, "response", None)
-                    )
+                    completed_response = getattr(event, "response", None)
+                    if completed_response is None:
+                        raise RuntimeError(
+                            "Responses API returned no response object"
+                        )
+                    status_error = self._responses_status_error(completed_response)
+                    if status_error:
+                        raise RuntimeError(status_error)
+                    self._record_responses_metadata(completed_response)
+                    self._last_reasoning_items = reasoning_items
+                    self._last_finish_reason = "tool_calls" if func_calls else "stop"
                     if func_calls:
                         tool_calls = []
                         for position, index in enumerate(sorted(func_calls)):
@@ -837,14 +1041,32 @@ class OpenAILLM(BaseLLM):
                             finish_reason="tool_calls",
                             delta=_RespDelta(tool_calls=tool_calls),
                         )
+                elif etype == "response.incomplete":
+                    incomplete_response = getattr(event, "response", None)
+                    details = getattr(incomplete_response, "incomplete_details", None)
+                    reason = getattr(details, "reason", None)
+                    if reason == "max_output_tokens":
+                        self._record_responses_metadata(incomplete_response)
+                        self._last_reasoning_items = reasoning_items
+                        self._last_finish_reason = "length"
+                        yield _RespChoice(
+                            finish_reason="length",
+                            delta=_RespDelta(tool_calls=None),
+                        )
+                        return
+                    status_error = self._responses_status_error(incomplete_response)
+                    raise RuntimeError(
+                        status_error or "Responses API incomplete: unknown reason"
+                    )
                 elif etype in ("response.failed", "error"):
                     resp = getattr(event, "response", None)
-                    err = (
-                        getattr(resp, "error", None)
-                        or getattr(event, "message", None)
-                        or "Responses stream error"
-                    )
-                    raise RuntimeError(f"Responses API stream error: {err}")
+                    err = self._responses_status_error(resp)
+                    if err is None:
+                        err = (
+                            getattr(event, "message", None)
+                            or "Responses API stream error"
+                        )
+                    raise RuntimeError(err)
         finally:
             if hasattr(response, "close"):
                 response.close()

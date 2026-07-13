@@ -50,6 +50,16 @@ def _responses_caps(reasoning_effort=None):
     )
 
 
+def _bare_agent():
+    from application.agents.base import BaseAgent
+
+    class _Agent(BaseAgent):
+        def _gen_inner(self, query, log_context):
+            yield from ()
+
+    return _Agent.__new__(_Agent)
+
+
 # ── api_flavor gating ────────────────────────────────────────────────────────
 
 
@@ -130,6 +140,154 @@ def test_to_responses_input_reinjects_reasoning(monkeypatch):
     assert items[0] == reasoning_item
     assert items[1]["type"] == "function_call"
     assert items[1]["call_id"] == "call_1"
+
+
+@pytest.mark.unit
+def test_chat_flavor_drops_responses_only_message_fields(monkeypatch):
+    llm = _make_llm(
+        monkeypatch,
+        ModelCapabilities(api_flavor="chat_completions"),
+    )
+    cleaned = llm._clean_messages_openai([{
+        "role": "assistant",
+        "content": "answer",
+        "responses_reasoning_items": [{"type": "reasoning", "id": "rs_1"}],
+    }])
+    assert cleaned == [{"role": "assistant", "content": "answer"}]
+
+
+@pytest.mark.unit
+def test_build_messages_gates_reasoning_and_keeps_tool_chronology(monkeypatch):
+    agent = _bare_agent()
+    agent.compressed_summary = None
+    agent.model_id = "model"
+    agent.model_user_id = None
+    agent.user = "u"
+    agent.multimodal_content = None
+    agent.llm = _ns(
+        _uses_responses_api=lambda: True,
+        responses_chain_key=lambda: "chain-current",
+    )
+    agent.chat_history = [{
+        "prompt": "old question",
+        "response": "final answer",
+        "tool_calls": [{
+            "call_id": "call_1",
+            "action_name": "search",
+            "arguments": {"q": "x"},
+            "result": "found",
+        }],
+        "metadata": {
+            "responses_state": {
+                "chain_key": "chain-other",
+                "reasoning_items": [{"type": "reasoning", "id": "wrong"}],
+            }
+        },
+    }]
+
+    messages = agent._build_messages("system", "new question")
+    assert [message["role"] for message in messages] == [
+        "system", "user", "assistant", "tool", "assistant", "user"
+    ]
+    assert messages[2]["tool_calls"][0]["id"] == "call_1"
+    assert messages[4]["content"] == "final answer"
+    assert "responses_reasoning_items" not in messages[4]
+
+
+@pytest.mark.unit
+def test_build_messages_rewrites_duplicate_tool_call_ids(monkeypatch):
+    agent = _bare_agent()
+    agent.compressed_summary = None
+    agent.model_id = "model"
+    agent.model_user_id = None
+    agent.user = "u"
+    agent.multimodal_content = None
+    agent.llm = _ns(
+        _uses_responses_api=lambda: True,
+        responses_chain_key=lambda: "chain-current",
+    )
+    agent.chat_history = [{
+        "prompt": "old question",
+        "response": "final answer",
+        "tool_calls": [
+            {
+                "call_id": "functions.search:0",
+                "action_name": "search",
+                "arguments": {"q": "first"},
+                "result": "first result",
+            },
+            {
+                "call_id": "functions.search:0",
+                "action_name": "search",
+                "arguments": {"q": "second"},
+                "result": "second result",
+            },
+        ],
+    }]
+
+    messages = agent._build_messages("system", "new question")
+    assistant_calls = messages[2]["tool_calls"]
+    tool_results = [message for message in messages if message["role"] == "tool"]
+
+    replay_ids = [call["id"] for call in assistant_calls]
+    assert replay_ids[0] == "functions.search:0"
+    assert len(set(replay_ids)) == 2
+    assert [message["tool_call_id"] for message in tool_results] == replay_ids
+    assert [message["content"] for message in tool_results] == [
+        "first result",
+        "second result",
+    ]
+
+
+@pytest.mark.unit
+def test_export_import_replays_encrypted_reasoning_on_fresh_instance(monkeypatch):
+    first = _make_llm(monkeypatch, _responses_caps())
+    reasoning = {
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "ciphertext",
+        "summary": [],
+    }
+    first._last_response_id = "resp_1"
+    first._last_reasoning_items = [reasoning]
+    first._reasoning_for_calls = {"call_1": [reasoning]}
+
+    second = _make_llm(monkeypatch, _responses_caps())
+    assert second.import_responses_state(first.export_responses_state()) is True
+    items = second._to_responses_input([{
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "run", "arguments": "{}"},
+        }],
+    }])
+    assert items[0] == reasoning
+    assert items[1]["type"] == "function_call"
+
+
+@pytest.mark.unit
+def test_import_rejects_state_for_different_target(monkeypatch):
+    first = _make_llm(monkeypatch, _responses_caps())
+    state = first.export_responses_state()
+    second = _make_llm(monkeypatch, _responses_caps())
+    second._effective_base_url = "https://different.example/v1"
+    assert second.import_responses_state(state) is False
+
+
+@pytest.mark.unit
+def test_start_responses_turn_drops_prior_turn_call_map(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    llm._reasoning_for_calls = {"old_call": [{"id": "old_reasoning"}]}
+    llm._last_reasoning_items = [{"id": "old_reasoning"}]
+    llm._imported_response_id = "resp_old"
+
+    llm.start_responses_turn()
+
+    assert llm._reasoning_for_calls == {}
+    assert llm._last_reasoning_items == []
+    assert llm._imported_response_id is None
 
 
 @pytest.mark.unit
@@ -228,6 +386,36 @@ def test_build_responses_params_stateless(monkeypatch):
 
 
 @pytest.mark.unit
+def test_chat_path_drops_tool_controls_when_tools_are_unavailable(monkeypatch):
+    caps = ModelCapabilities(
+        supports_tools=False,
+        api_flavor="chat_completions",
+    )
+    llm = _make_llm(monkeypatch, caps)
+    llm.client.chat.completions.create = MagicMock(
+        return_value=_ns(choices=[_ns(message=_ns(content="ok"))])
+    )
+
+    result = llm._raw_gen(
+        llm,
+        "model",
+        [{"role": "user", "content": "hi"}],
+        tools=[{
+            "type": "function",
+            "function": {"name": "search", "parameters": {}},
+        }],
+        tool_choice="required",
+        parallel_tool_calls=True,
+    )
+
+    assert result == "ok"
+    request = llm.client.chat.completions.create.call_args.kwargs
+    assert "tools" not in request
+    assert "tool_choice" not in request
+    assert "parallel_tool_calls" not in request
+
+
+@pytest.mark.unit
 def test_build_responses_params_store_with_previous_id(monkeypatch):
     llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
     params = llm._build_responses_params(
@@ -239,6 +427,50 @@ def test_build_responses_params_store_with_previous_id(monkeypatch):
     # Encrypted reasoning is always requested so in-turn carryover works
     # regardless of server-side retention.
     assert params["include"] == ["reasoning.encrypted_content"]
+
+
+@pytest.mark.unit
+def test_build_responses_params_maps_tool_controls(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    params = llm._build_responses_params(
+        "gpt-5.5",
+        [],
+        tools=[{"type": "function", "function": {"name": "search"}}],
+        response_format=None,
+        previous_response_id=None,
+        stream=False,
+        kwargs={
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "search"},
+            },
+            "parallel_tool_calls": False,
+        },
+    )
+    assert params["tool_choice"] == {"type": "function", "name": "search"}
+    assert params["parallel_tool_calls"] is False
+
+
+@pytest.mark.unit
+def test_record_responses_metadata_captures_usage_details(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    llm._record_responses_metadata(_ns(
+        id="resp_1",
+        usage=_ns(
+            input_tokens=10,
+            output_tokens=7,
+            total_tokens=17,
+            input_tokens_details=_ns(cached_tokens=4),
+            output_tokens_details=_ns(reasoning_tokens=3),
+        ),
+    ))
+    assert llm._last_usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 7,
+        "total_tokens": 17,
+        "prompt_tokens_details": {"cached_tokens": 4},
+        "completion_tokens_details": {"reasoning_tokens": 3},
+    }
 
 
 # ── streaming normalization into the existing handler contract ───────────────
@@ -344,6 +576,67 @@ def test_responses_gen_stream_error_event_raises(monkeypatch):
 
 
 @pytest.mark.unit
+def test_responses_gen_stream_incomplete_returns_partial_length(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    events = [
+        _ns(type="response.output_text.delta", delta="partial"),
+        _ns(
+            type="response.incomplete",
+            response=_ns(
+                id="resp_incomplete",
+                incomplete_details=_ns(reason="max_output_tokens"),
+            ),
+        ),
+    ]
+    llm.client.responses.create = MagicMock(return_value=events)
+
+    out = list(
+        llm._responses_gen_stream(
+            "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+        )
+    )
+    from application.llm.handlers.openai import OpenAILLMHandler
+
+    assert out[0] == "partial"
+    assert OpenAILLMHandler().parse_response(out[-1]).finish_reason == "length"
+    assert llm._last_response_id == "resp_incomplete"
+
+
+@pytest.mark.unit
+def test_responses_gen_stream_surfaces_refusal(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    events = [
+        _ns(type="response.refusal.delta", delta="I cannot"),
+        _ns(type="response.refusal.delta", delta=" help with that."),
+        _ns(type="response.completed", response=_ns(id="resp_refusal")),
+    ]
+    llm.client.responses.create = MagicMock(return_value=events)
+
+    assert list(
+        llm._responses_gen_stream(
+            "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+        )
+    ) == ["I cannot", " help with that."]
+    assert llm._last_response_id == "resp_refusal"
+
+
+@pytest.mark.unit
+def test_responses_gen_stream_surfaces_done_only_refusal(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    events = [
+        _ns(type="response.refusal.done", refusal="I cannot help with that."),
+        _ns(type="response.completed", response=_ns(id="resp_refusal")),
+    ]
+    llm.client.responses.create = MagicMock(return_value=events)
+
+    assert list(
+        llm._responses_gen_stream(
+            "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+        )
+    ) == ["I cannot help with that."]
+
+
+@pytest.mark.unit
 def test_responses_gen_nonstream_tools(monkeypatch):
     from application.llm.handlers.openai import OpenAILLMHandler
 
@@ -374,6 +667,185 @@ def test_responses_gen_nonstream_text(monkeypatch):
     llm.client.responses.create = MagicMock(return_value=response)
     result = llm._responses_gen("gpt-5.5", [{"role": "user", "content": "hi"}], tools=None)
     assert result == "Hi there"
+
+
+@pytest.mark.unit
+def test_responses_gen_nonstream_surfaces_refusal(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    response = _ns(
+        id="resp_refusal",
+        status="completed",
+        output=[
+            _ns(
+                type="message",
+                content=[_ns(type="refusal", refusal="I cannot help with that.")],
+            )
+        ],
+    )
+    llm.client.responses.create = MagicMock(return_value=response)
+
+    result = llm._responses_gen(
+        "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+    )
+    assert result == "I cannot help with that."
+    assert llm._last_response_id == "resp_refusal"
+
+
+@pytest.mark.unit
+def test_responses_gen_nonstream_incomplete_returns_partial_length(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    response = _ns(
+        id="resp_incomplete",
+        status="incomplete",
+        incomplete_details=_ns(reason="max_output_tokens"),
+        output=[
+            _ns(type="message", content=[_ns(type="output_text", text="partial")])
+        ],
+    )
+    llm.client.responses.create = MagicMock(return_value=response)
+
+    result = llm._responses_gen(
+        "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+    )
+    assert result == "partial"
+    assert llm._last_finish_reason == "length"
+    assert llm._last_response_id == "resp_incomplete"
+
+
+@pytest.mark.unit
+def test_public_gen_keeps_plain_string_contract_for_incomplete_text(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    response = _ns(
+        id="resp_incomplete",
+        status="incomplete",
+        incomplete_details=_ns(reason="max_output_tokens"),
+        output=[
+            _ns(type="message", content=[
+                _ns(type="output_text", text="partial title")
+            ])
+        ],
+    )
+    llm.client.responses.create = MagicMock(return_value=response)
+    monkeypatch.setattr("application.cache.get_redis_instance", lambda: None)
+
+    result = llm.gen(
+        model="gpt-5.5",
+        messages=[{"role": "user", "content": "make a title"}],
+    )
+
+    assert result == "partial title"
+    assert isinstance(result, str)
+    assert result.strip() == "partial title"
+    assert llm._last_finish_reason == "length"
+
+
+@pytest.mark.unit
+def test_stream_error_event_preserves_upstream_message(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    llm.client.responses.create = MagicMock(
+        return_value=[_ns(type="error", message="real upstream failure")]
+    )
+    with pytest.raises(RuntimeError, match="real upstream failure"):
+        list(
+            llm._responses_gen_stream(
+                "gpt-5.5", [{"role": "user", "content": "hi"}], tools=None
+            )
+        )
+
+
+@pytest.mark.unit
+def test_previous_response_id_requires_immediately_preceding_matching_chain():
+    agent = _bare_agent()
+    agent.llm = _ns(responses_chain_key=lambda: "chain-current")
+
+    agent.chat_history = [{
+        "metadata": {
+            "response_id": "resp_ok",
+            "response_chain_key": "chain-current",
+        }
+    }]
+    assert agent._previous_response_id() == "resp_ok"
+
+    agent.chat_history.append({"metadata": {}})
+    assert agent._previous_response_id() is None
+
+    agent.chat_history[-1] = {
+        "metadata": {
+            "response_id": "resp_other",
+            "response_chain_key": "chain-other",
+        }
+    }
+    assert agent._previous_response_id() is None
+
+
+@pytest.mark.unit
+def test_responses_chain_key_scopes_model_endpoint_and_credential(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps())
+    llm._canonical_model_id = "model-a"
+    initial = llm.responses_chain_key()
+
+    llm._canonical_model_id = "model-b"
+    different_model = llm.responses_chain_key()
+    llm._canonical_model_id = "model-a"
+    llm._effective_base_url = "https://other.example/v1"
+    different_endpoint = llm.responses_chain_key()
+    llm._effective_base_url = "https://api.openai.com/v1"
+    llm.api_key = "different-key"
+    different_credential = llm.responses_chain_key()
+
+    llm.api_key = "k"
+    monkeypatch.setattr(
+        "application.llm.openai.settings.OPENAI_RESPONSES_STORE", True
+    )
+    different_store_mode = llm.responses_chain_key()
+
+    assert len({
+        initial,
+        different_model,
+        different_endpoint,
+        different_credential,
+        different_store_mode,
+    }) == 5
+    assert "different-key" not in different_credential
+
+
+@pytest.mark.unit
+def test_responses_metadata_persists_chain_key(monkeypatch):
+    monkeypatch.setattr(
+        "application.agents.base.settings.OPENAI_RESPONSES_STORE", True
+    )
+    agent = _bare_agent()
+    agent.llm = _ns(
+        _last_response_id="resp_1",
+        responses_chain_key=lambda: "chain-current",
+    )
+
+    assert list(agent._emit_responses_metadata()) == [{
+        "metadata": {
+            "response_id": "resp_1",
+            "response_chain_key": "chain-current",
+        }
+    }]
+
+
+@pytest.mark.unit
+def test_store_false_metadata_omits_unstored_response_id(monkeypatch):
+    monkeypatch.setattr(
+        "application.agents.base.settings.OPENAI_RESPONSES_STORE", False
+    )
+    agent = _bare_agent()
+    agent.llm = _ns(
+        _last_response_id="resp_unstored",
+        _last_usage=None,
+        _uses_responses_api=lambda: True,
+        responses_chain_key=lambda: "chain-current",
+        export_responses_state=lambda: {"reasoning_items": [{"id": "rs_1"}]},
+    )
+
+    metadata = list(agent._emit_responses_metadata())[0]["metadata"]
+    assert "response_id" not in metadata
+    assert "response_chain_key" not in metadata
+    assert metadata["responses_state"]["reasoning_items"][0]["id"] == "rs_1"
 
 
 # ── capability plumbing / yaml ───────────────────────────────────────────────

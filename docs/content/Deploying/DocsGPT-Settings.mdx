@@ -431,6 +431,8 @@ See [Access Control, Roles & Teams](/Deploying/Access-Control) for the full mode
 | Setting | Default | Description |
 | --- | --- | --- |
 | `OPENAI_RESPONSES_STORE` | `false` | When `true`, allows OpenAI to persist [Responses API](/Models/cloud-providers#openai-responses-api-and-reasoning) state server-side. |
+| `V1_SESSION_TTL_SECONDS` | `86400` | Redis correlation lifetime, in seconds, for OpenAI-compatible client sessions. Raw external session IDs are hashed and never stored. |
+| `TITLE_MODEL_ID` | unset | Optional model ID used for asynchronous first-party conversation titles. When unset, the answer model is used. Hidden API conversations never invoke title generation. |
 
 ## Realtime Events Settings
 

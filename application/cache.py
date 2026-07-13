@@ -176,23 +176,52 @@ def stream_cache(func):
             try:
                 cached_response = redis_client.get(cache_key)
                 if cached_response:
-                    logger.info(f"Cache hit for stream key: {cache_key}")
-                    cached_response = json.loads(cached_response.decode("utf-8"))
-                    for chunk in cached_response:
-                        yield chunk
-                        time.sleep(0.03)  # Simulate streaming delay
-                    return
+                    decoded = json.loads(cached_response.decode("utf-8"))
+                    if (
+                        isinstance(decoded, dict)
+                        and decoded.get("version") == 1
+                        and isinstance(decoded.get("chunks"), list)
+                    ):
+                        cached_chunks = decoded["chunks"]
+                    elif isinstance(decoded, list) and not any(
+                        isinstance(chunk, str)
+                        and "_RespChoice" in chunk
+                        for chunk in decoded
+                    ):
+                        # Backward-compatible read for pre-v1 string-only
+                        # entries. Protocol-object reprs are deliberately
+                        # rejected and refreshed from upstream.
+                        cached_chunks = decoded
+                    else:
+                        cached_chunks = None
+
+                    if cached_chunks is not None:
+                        logger.info(f"Cache hit for stream key: {cache_key}")
+                        for chunk in cached_chunks:
+                            yield chunk
+                            time.sleep(0.03)  # Simulate streaming delay
+                        return
+                    redis_client.delete(cache_key)
             except Exception as e:
                 logger.error(f"Error getting cached stream: {e}", exc_info=True)
 
         stream_cache_data = []
+        cacheable = True
         for chunk in func(self, model, messages, stream, tools, *args, **kwargs):
             yield chunk
-            stream_cache_data.append(str(chunk))
+            if isinstance(chunk, (str, dict, list, int, float, bool, type(None))):
+                try:
+                    json.dumps(chunk)
+                    stream_cache_data.append(chunk)
+                except (TypeError, ValueError):
+                    cacheable = False
+            else:
+                cacheable = False
 
-        if redis_client:
+        if redis_client and cacheable:
             try:
-                redis_client.set(cache_key, json.dumps(stream_cache_data), ex=1800)
+                payload = {"version": 1, "chunks": stream_cache_data}
+                redis_client.set(cache_key, json.dumps(payload), ex=1800)
                 logger.info(f"Stream cache saved for key: {cache_key}")
             except Exception as e:
                 logger.error(f"Error setting stream cache: {e}", exc_info=True)

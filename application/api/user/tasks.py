@@ -15,6 +15,8 @@ from application.worker import (
     sync_worker,
 )
 
+logger = logging.getLogger(__name__)
+
 
 # Shared decorator config for long-running, side-effecting tasks. ``acks_late``
 # is also the celeryconfig default but stays explicit here so each task's
@@ -545,6 +547,30 @@ def cleanup_pending_tool_state(self):
         conversation_id = row.get("conversation_id")
         if not user_id or not conversation_id:
             continue
+        agent_config = row.get("agent_config") or {}
+        reserved_message_id = (
+            agent_config.get("reserved_message_id")
+            if isinstance(agent_config, dict)
+            else None
+        )
+        if reserved_message_id:
+            try:
+                from application.api.answer.services.conversation_service import (
+                    ConversationService,
+                    TERMINATED_RESPONSE_PLACEHOLDER,
+                )
+
+                ConversationService().finalize_message(
+                    str(reserved_message_id),
+                    TERMINATED_RESPONSE_PLACEHOLDER,
+                    status="failed",
+                    error=TimeoutError("Tool continuation expired before resume"),
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to retire expired continuation message %s",
+                    reserved_message_id,
+                )
         publish_user_event(
             str(user_id),
             "tool.approval.cleared",

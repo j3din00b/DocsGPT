@@ -78,6 +78,8 @@ class AvailableModel:
             "supports_structured_output": self.capabilities.supports_structured_output,
             "supports_streaming": self.capabilities.supports_streaming,
             "context_window": self.capabilities.context_window,
+            "api_flavor": self.capabilities.api_flavor,
+            "reasoning_effort": self.capabilities.reasoning_effort,
             "enabled": self.enabled,
             "source": self.source,
         }
