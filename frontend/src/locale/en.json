@@ -189,6 +189,31 @@
           "close": "Close"
         }
       },
+      "testRetrieval": {
+        "action": "Test retrieval",
+        "title": "Test retrieval",
+        "subtitle": "See the chunks a query actually retrieves from \"{{name}}\", using the real retrieval pipeline.",
+        "subtitleGeneric": "See the chunks a query actually retrieves, using the real retrieval pipeline.",
+        "queryPlaceholder": "Ask something this source should answer...",
+        "run": "Run",
+        "notSavedHint": "These settings are only used for this test — they are not saved to the source. Change them in Source settings to make them permanent.",
+        "resultSummary": "{{total}} chunks retrieved · {{retriever}}",
+        "latency": "{{ms}} ms",
+        "empty": "No chunks retrieved for this query.",
+        "emptyWithThreshold": "No chunks scored at or above the score threshold ({{threshold}}). Lower it to see near misses.",
+        "showMore": "Show full chunk",
+        "showLess": "Show less",
+        "noScore": "no score",
+        "noScoreHint": "This retriever ranks chunks without producing a comparable per-chunk score.",
+        "scoreKinds": {
+          "cosine_similarity": "similarity",
+          "l2_distance": "distance",
+          "rrf": "RRF"
+        },
+        "errors": {
+          "failed": "Retrieval test failed. Please try again."
+        }
+      },
       "editConfig": "Source settings",
       "shareWithTeam": "Share with team",
       "deleteWarning": "Are you sure you want to delete \"{{name}}\"?",

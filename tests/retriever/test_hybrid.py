@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from application.retriever.hybrid_rag import HybridRetriever, reciprocal_rank_fusion
+from application.retriever.hybrid_rag import fuse_with_scores, HybridRetriever
 from application.retriever.retriever_creator import RetrieverCreator
 
 
@@ -53,27 +53,27 @@ class TestReciprocalRankFusion:
         vector_hits = [only_vec, shared]
         keyword_hits = [shared, only_kw]
 
-        fused = reciprocal_rank_fusion(vector_hits, keyword_hits)
+        fused = [doc for doc, _ in fuse_with_scores(vector_hits, keyword_hits)]
 
         assert fused[0].page_content == "shared"
         assert {d.page_content for d in fused} == {"shared", "vec_only", "kw_only"}
 
     def test_empty_keyword_is_vector_only_order(self):
         vector_hits = [_make_doc("a", source="a"), _make_doc("b", source="b")]
-        fused = reciprocal_rank_fusion(vector_hits, [])
+        fused = [doc for doc, _ in fuse_with_scores(vector_hits, [])]
         assert [d.page_content for d in fused] == ["a", "b"]
 
     def test_dedupes_same_doc(self):
         d_vec = _make_doc("same", source="same")
         d_kw = _make_doc("same", source="same")
-        fused = reciprocal_rank_fusion([d_vec], [d_kw])
+        fused = [doc for doc, _ in fuse_with_scores([d_vec], [d_kw])]
         assert len(fused) == 1
 
     def test_higher_keyword_rank_can_promote(self):
         # Vector top is "v0"; keyword strongly favours "kw" (rank 0 vs v0's rank 1).
         v0 = _make_doc("v0", source="v0")
         kw = _make_doc("kw", source="kw")
-        fused = reciprocal_rank_fusion([v0, kw], [kw])
+        fused = [doc for doc, _ in fuse_with_scores([v0, kw], [kw])]
         assert fused[0].page_content == "kw"
 
 

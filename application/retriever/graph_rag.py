@@ -39,6 +39,10 @@ def _idf(doc_freq: Any) -> float:
 class GraphRAGRetriever(BaseRetriever):
     """Per-source PPR retriever; falls back to ClassicRAG when a source has no graph."""
 
+    # Set by the Dispatcher (see ClassicRAG.base_chunks); forwarded to the inner
+    # ClassicRAG on the fallback path.
+    base_chunks = None
+
     def __init__(
         self,
         source,
@@ -55,7 +59,11 @@ class GraphRAGRetriever(BaseRetriever):
         model_user_id=None,
         defer_rephrase=False,
         request_id=None,
+        include_scores=False,
     ):
+        # Graph docs are ranked by PPR, which yields no per-chunk similarity, so
+        # they stay unscored; the flag only matters to the classic fallback,
+        # which retrieves the sources that have no graph.
         self._classic = ClassicRAG(
             source=source,
             chat_history=chat_history,
@@ -71,6 +79,7 @@ class GraphRAGRetriever(BaseRetriever):
             model_user_id=model_user_id,
             defer_rephrase=defer_rephrase,
             request_id=request_id,
+            include_scores=include_scores,
         )
         self.original_question = self._classic.original_question
         self.chunks = self._classic.chunks
@@ -129,6 +138,25 @@ class GraphRAGRetriever(BaseRetriever):
         candidates = max(self.chunks * 2, self.chunks + 5)
         return ranked[: max(1, candidates)]
 
+    def _source_top_k(self, source_id) -> int:
+        """How many chunks this source may contribute — its own top-k.
+
+        Mirrors ClassicRAG's resolution: a per-source override wins (raised to
+        candidate_k when it prescreens, so the stage has candidates to filter);
+        otherwise the group's real top-k is split across the sources. Without
+        this, a prescreen source elsewhere in the group inflates ``chunks`` and
+        this source would return that inflated count.
+        """
+        cfg = self.per_source_retrieval.get(source_id)
+        if cfg is not None:
+            top_k = max(1, int(cfg.chunks))
+            ps = cfg.prescreen_config() if hasattr(cfg, "prescreen_config") else None
+            if ps is not None:
+                top_k = max(top_k, int(ps.candidate_k))
+            return top_k
+        base = self.base_chunks if self.base_chunks is not None else self.chunks
+        return max(1, base // max(1, len(self.vectorstores)))
+
     def _graph_docs_for_source(self, store, source_id) -> List[Dict[str, Any]]:
         """Local PPR retrieval for one source (caller guarantees it has a graph)."""
         question = self._classic._get_rephrased_question()
@@ -160,8 +188,9 @@ class GraphRAGRetriever(BaseRetriever):
         docs: List[Dict[str, Any]] = []
         token_budget = max(int(self.doc_token_limit * 0.9), 100)
         cumulative_tokens = 0
+        source_top_k = self._source_top_k(source_id)
         for chunk_id in chunk_ids:
-            if len(docs) >= self.chunks:
+            if len(docs) >= source_top_k:
                 break
             chunk = chunk_data.get(chunk_id)
             text = chunk.get("text") if chunk else None
@@ -179,15 +208,20 @@ class GraphRAGRetriever(BaseRetriever):
         """Reuse the composed ClassicRAG to retrieve one source's chunks."""
         original = self._classic.vectorstores
         original_overrides = self._classic.per_source_retrieval
+        original_base = self._classic.base_chunks
         try:
             self._classic.vectorstores = [source_id]
             self._classic.per_source_retrieval = {
                 k: v for k, v in self.per_source_retrieval.items() if k == source_id
             }
+            # The Dispatcher sets these on *this* object; the inner retriever is
+            # the one that reads them.
+            self._classic.base_chunks = self.base_chunks
             return self._classic._get_data()
         finally:
             self._classic.vectorstores = original
             self._classic.per_source_retrieval = original_overrides
+            self._classic.base_chunks = original_base
 
     def _get_data(self) -> List[Dict[str, Any]]:
         if not self.vectorstores:

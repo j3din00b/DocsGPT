@@ -9,6 +9,10 @@ from application.vectorstore.vector_creator import VectorCreator
 
 
 class ClassicRAG(BaseRetriever):
+    # The group's real top-k, set by the Dispatcher when it inflates ``chunks``
+    # for a prescreen fetch. None → ``chunks`` is already the top-k.
+    base_chunks = None
+
     def __init__(
         self,
         source,
@@ -25,7 +29,9 @@ class ClassicRAG(BaseRetriever):
         model_user_id=None,
         defer_rephrase=False,
         request_id=None,
+        include_scores=False,
     ):
+        self.include_scores = include_scores
         self.original_question = source.get("question", "")
         self.chat_history = chat_history if chat_history is not None else []
         self.prompt = prompt
@@ -147,8 +153,10 @@ class ClassicRAG(BaseRetriever):
     def _fetch_candidates(self, docsearch, question, src_k, score_threshold):
         """Fetch candidate hits for one vector store (vector search).
 
-        Subclasses override this to change candidate sourcing (e.g. RRF fusion)
-        while inheriting the surrounding per-source resolution and budgeting.
+        Returns plain hits, or ``(hit, score)`` pairs when ``include_scores`` is
+        set. Subclasses override this to change candidate sourcing (e.g. RRF
+        fusion) while inheriting the surrounding per-source resolution and
+        budgeting.
         """
         # ``score_threshold`` is honoured by pgvector/mongodb and safely ignored
         # by stores whose ``search`` swallows kwargs. The candidate count is
@@ -157,7 +165,13 @@ class ClassicRAG(BaseRetriever):
         search_kwargs = {"k": k}
         if score_threshold is not None:
             search_kwargs["score_threshold"] = score_threshold
+        if self.include_scores:
+            return docsearch.search_with_scores(question, **search_kwargs)
         return docsearch.search(question, **search_kwargs)
+
+    def _score_kind(self, docsearch):
+        """Label for the scores ``_fetch_candidates`` attaches (None if unscored)."""
+        return getattr(docsearch, "score_kind", None)
 
     def _get_data(self):
         if self.chunks == 0 or not self.vectorstores:
@@ -168,7 +182,13 @@ class ClassicRAG(BaseRetriever):
             return []
 
         all_docs = []
-        chunks_per_source = max(1, self.chunks // len(self.vectorstores))
+        # The Dispatcher inflates ``chunks`` to a prescreen source's candidate_k
+        # so the fetch is large enough for the screening stage. That inflated
+        # number must not become the top-k of the *other* sources in the group,
+        # so the fallback splits the group's real top-k (``base_chunks``) when
+        # the Dispatcher supplied one.
+        base_chunks = self.base_chunks if self.base_chunks is not None else self.chunks
+        chunks_per_source = max(1, base_chunks // len(self.vectorstores))
         token_budget = max(int(self.doc_token_limit * 0.9), 100)
         cumulative_tokens = 0
 
@@ -211,10 +231,24 @@ class ClassicRAG(BaseRetriever):
                     docs_temp = self._fetch_candidates(
                         docsearch, question, src_k, score_threshold
                     )
+                    score_kind = (
+                        self._score_kind(docsearch) if self.include_scores else None
+                    )
+
+                    # ``_fetch_candidates`` over-fetches (k >= 20) so a prescreen
+                    # stage has candidates to filter; trim back to src_k so
+                    # ``chunks`` is the final top-k it claims to be. With
+                    # prescreen on, src_k is already raised to candidate_k above,
+                    # so the stage still sees its full candidate set.
+                    kept = 0
 
                     for doc in docs_temp:
-                        if cumulative_tokens >= token_budget:
+                        if kept >= src_k or cumulative_tokens >= token_budget:
                             break
+
+                        score = None
+                        if isinstance(doc, tuple):
+                            doc, score = doc
 
                         if hasattr(doc, "page_content") and hasattr(doc, "metadata"):
                             page_content = doc.page_content
@@ -231,8 +265,13 @@ class ClassicRAG(BaseRetriever):
                         doc_tokens = num_tokens_from_string(doc_text_with_header)
 
                         if cumulative_tokens + doc_tokens < token_budget:
-                            all_docs.append({"text": page_content, **labels})
+                            entry = {"text": page_content, **labels}
+                            if self.include_scores:
+                                entry["score"] = score
+                                entry["score_kind"] = score_kind
+                            all_docs.append(entry)
                             cumulative_tokens += doc_tokens
+                            kept += 1
 
                     if cumulative_tokens >= token_budget:
                         break

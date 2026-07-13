@@ -52,6 +52,8 @@ class MongoDBVectorStore(BaseVectorStore):
     def _collection(self):
         return self._database[self._collection_name]
 
+    score_kind = "cosine_similarity"
+
     def search(self, question, k=2, *args, score_threshold=None, **kwargs):
         """Search via Atlas ``$vectorSearch``.
 
@@ -60,6 +62,19 @@ class MongoDBVectorStore(BaseVectorStore):
             k: Maximum number of results.
             score_threshold: Optional ``vectorSearchScore`` floor in ``[0, 1]``;
                 results scoring below it are dropped.
+        """
+        return [
+            doc
+            for doc, _ in self.search_with_scores(
+                question, k, *args, score_threshold=score_threshold, **kwargs
+            )
+        ]
+
+    def search_with_scores(self, question, k=2, *args, score_threshold=None, **kwargs):
+        """Same search as :meth:`search`, pairing each hit with its score.
+
+        The score is Atlas' ``vectorSearchScore`` — the same quantity
+        ``score_threshold`` is compared against.
         """
         query_vector = self._embedding.embed_query(question)
 
@@ -73,10 +88,10 @@ class MongoDBVectorStore(BaseVectorStore):
                     "index": self._index_name,
                     "filter": {"source_id": {"$eq": self._source_id}},
                 }
-            }
+            },
+            {"$addFields": {"_score": {"$meta": "vectorSearchScore"}}},
         ]
         if score_threshold is not None:
-            pipeline.append({"$addFields": {"_score": {"$meta": "vectorSearchScore"}}})
             pipeline.append({"$match": {"_score": {"$gte": float(score_threshold)}}})
 
         cursor = self._collection.aggregate(pipeline)
@@ -87,9 +102,11 @@ class MongoDBVectorStore(BaseVectorStore):
             doc.pop("_id")
             doc.pop(self._text_key)
             doc.pop(self._embedding_key)
-            doc.pop("_score", None)
+            score = doc.pop("_score", None)
             metadata = doc
-            results.append(Document(text, metadata))
+            results.append(
+                (Document(text, metadata), None if score is None else float(score))
+            )
         return results
 
     def _insert_texts(self, texts, metadatas):

@@ -59,6 +59,7 @@ import ConvertToWikiModal from './ConvertToWikiModal';
 import EnableGraphRAGModal from './EnableGraphRAGModal';
 import { clearGraphBuild, selectGraphBuilds } from './graphBuildSlice';
 import SourceConfigModal from './SourceConfigModal';
+import TestRetrievalModal from './TestRetrievalModal';
 
 type SourceMenuOption = {
   icon: string | LucideIcon;
@@ -122,6 +123,9 @@ export default function Sources({
     null,
   );
   const [configModalState, setConfigModalState] =
+    useState<ActiveState>('INACTIVE');
+  const [documentToTest, setDocumentToTest] = useState<Doc | null>(null);
+  const [testRetrievalState, setTestRetrievalState] =
     useState<ActiveState>('INACTIVE');
   const [documentToConvert, setDocumentToConvert] = useState<Doc | null>(null);
   const [convertModalState, setConvertModalState] =
@@ -430,6 +434,20 @@ export default function Sources({
       });
     }
 
+    if (document.id) {
+      actions.push({
+        icon: SearchIcon,
+        label: t('settings.sources.testRetrieval.action'),
+        onClick: () => {
+          setDocumentToTest(document);
+          setTestRetrievalState('ACTIVE');
+        },
+        iconWidth: 16,
+        iconHeight: 16,
+        variant: 'default',
+      });
+    }
+
     if (
       document.id &&
       !isWiki &&
@@ -530,6 +548,21 @@ export default function Sources({
     };
   }, [graphRAGAvailable, token]);
 
+  // Rendered inside the open source view's own header row.
+  const testRetrievalAction = documentToView ? (
+    <Button
+      type="button"
+      variant="outline"
+      className="h-[38px] rounded-full px-4 text-sm font-medium whitespace-nowrap"
+      onClick={() => {
+        setDocumentToTest(documentToView);
+        setTestRetrievalState('ACTIVE');
+      }}
+    >
+      {t('settings.sources.testRetrieval.action')}
+    </Button>
+  ) : null;
+
   return documentToView ? (
     <div className="mt-8 flex flex-col">
       {documentToView.config?.kind === 'wiki' ||
@@ -542,12 +575,14 @@ export default function Sources({
             documentToView.team_access === 'editor'
           }
           onBackToDocuments={() => setDocumentToView(undefined)}
+          headerAction={testRetrievalAction}
         />
       ) : documentToView.config?.kind === 'graphrag' ? (
         <GraphView
           docId={documentToView.id || ''}
           sourceName={documentToView.name}
           onBackToDocuments={() => setDocumentToView(undefined)}
+          headerAction={testRetrievalAction}
         />
       ) : documentToView.isNested ? (
         documentToView.type === 'connector:file' ? (
@@ -555,12 +590,14 @@ export default function Sources({
             docId={documentToView.id || ''}
             sourceName={documentToView.name}
             onBackToDocuments={() => setDocumentToView(undefined)}
+            headerAction={testRetrievalAction}
           />
         ) : (
           <FileTree
             docId={documentToView.id || ''}
             sourceName={documentToView.name}
             onBackToDocuments={() => setDocumentToView(undefined)}
+            headerAction={testRetrievalAction}
           />
         )
       ) : (
@@ -568,8 +605,17 @@ export default function Sources({
           documentId={documentToView.id || ''}
           documentName={documentToView.name}
           handleGoBack={() => setDocumentToView(undefined)}
+          headerAction={testRetrievalAction}
         />
       )}
+      <TestRetrievalModal
+        modalState={testRetrievalState}
+        setModalState={setTestRetrievalState}
+        document={documentToTest}
+        hybridAvailable={hybridAvailable}
+        graphRAGAvailable={graphRAGAvailable}
+        availableModels={availableModels}
+      />
     </div>
   ) : (
     <div className="mt-8 flex w-full max-w-full flex-col">
@@ -922,6 +968,20 @@ export default function Sources({
           setDocumentToGraphRAG(doc);
           setGraphRAGModalState('ACTIVE');
         }}
+      />
+
+      <TestRetrievalModal
+        modalState={testRetrievalState}
+        setModalState={(state) => {
+          setTestRetrievalState(state);
+          if (state === 'INACTIVE') {
+            setDocumentToTest(null);
+          }
+        }}
+        document={documentToTest}
+        hybridAvailable={hybridAvailable}
+        graphRAGAvailable={graphRAGAvailable}
+        availableModels={availableModels}
       />
 
       <ConvertToWikiModal

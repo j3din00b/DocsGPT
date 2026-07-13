@@ -218,6 +218,26 @@ class BaseVectorStore(ABC):
         """
         return []
 
+    # What ``search_with_scores`` reports, so a caller can label the number.
+    # ``cosine_similarity`` is higher-is-better in [0, 1]; ``l2_distance`` is
+    # lower-is-better and unbounded. None = this store reports no score.
+    score_kind = None
+
+    def search_with_scores(self, question, k=2, *args, **kwargs):
+        """Search, pairing each hit with its raw relevance score.
+
+        Default pairs every hit from :meth:`search` with ``None`` so stores that
+        surface no score still satisfy the contract. Stores that already compute
+        one override this and set :attr:`score_kind`.
+
+        Returns:
+            A list of ``(Document, score | None)`` in the same rank order
+            :meth:`search` would return.
+        """
+        return [
+            (doc, None) for doc in self.search(question, k, *args, **kwargs) or []
+        ]
+
     @abstractmethod
     def add_texts(self, texts, metadatas=None, *args, **kwargs):
         """Add texts with their embeddings to the vectorstore"""

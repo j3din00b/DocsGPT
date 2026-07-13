@@ -16,12 +16,15 @@ interface ConnectorTreeProps {
   docId: string;
   sourceName: string;
   onBackToDocuments: () => void;
+  /** Extra header control, rendered left of the Sync button. */
+  headerAction?: React.ReactNode;
 }
 
 const ConnectorTree: React.FC<ConnectorTreeProps> = ({
   docId,
   sourceName,
   onBackToDocuments,
+  headerAction,
 }) => {
   const { t } = useTranslation();
   const token = useSelector(selectToken);
@@ -101,33 +104,36 @@ const ConnectorTree: React.FC<ConnectorTreeProps> = ({
   };
 
   const topRightAction = (
-    <button
-      onClick={() => setSyncConfirmationModal('ACTIVE')}
-      disabled={isSyncing}
-      className={`flex h-[38px] min-w-[108px] items-center justify-center rounded-full px-4 text-sm font-medium whitespace-nowrap transition-colors ${
-        isSyncing
-          ? 'dark:bg-muted dark:text-muted-foreground cursor-not-allowed bg-gray-300 text-gray-600'
-          : 'bg-primary hover:bg-primary/90 text-white'
-      }`}
-      title={
-        isSyncing
-          ? `${t('settings.sources.syncing')} ${syncProgress}%`
+    <>
+      {headerAction}
+      <button
+        onClick={() => setSyncConfirmationModal('ACTIVE')}
+        disabled={isSyncing}
+        className={`flex h-[38px] min-w-[108px] items-center justify-center rounded-full px-4 text-sm font-medium whitespace-nowrap transition-colors ${
+          isSyncing
+            ? 'dark:bg-muted dark:text-muted-foreground cursor-not-allowed bg-gray-300 text-gray-600'
+            : 'bg-primary hover:bg-primary/90 text-white'
+        }`}
+        title={
+          isSyncing
+            ? `${t('settings.sources.syncing')} ${syncProgress}%`
+            : syncDone
+              ? 'Done'
+              : t('settings.sources.sync')
+        }
+      >
+        <img
+          src={syncDone ? CheckmarkIcon : SyncIcon}
+          alt={t('settings.sources.sync')}
+          className={`mr-2 h-4 w-4 brightness-0 invert filter ${isSyncing ? 'animate-spin' : ''}`}
+        />
+        {isSyncing
+          ? `${syncProgress}%`
           : syncDone
             ? 'Done'
-            : t('settings.sources.sync')
-      }
-    >
-      <img
-        src={syncDone ? CheckmarkIcon : SyncIcon}
-        alt={t('settings.sources.sync')}
-        className={`mr-2 h-4 w-4 brightness-0 invert filter ${isSyncing ? 'animate-spin' : ''}`}
-      />
-      {isSyncing
-        ? `${syncProgress}%`
-        : syncDone
-          ? 'Done'
-          : t('settings.sources.sync')}
-    </button>
+            : t('settings.sources.sync')}
+      </button>
+    </>
   );
 
   const extraContent = (

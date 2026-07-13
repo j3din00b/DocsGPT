@@ -68,6 +68,8 @@ class Dispatcher(BaseRetriever):
         request_id=None,
         sources: Optional[List[Dict[str, Any]]] = None,
         stages: Optional[List[Stage]] = None,
+        include_scores: bool = False,
+        usage_source: str = "rag_prescreen",
     ):
         """Build the dispatcher.
 
@@ -83,8 +85,15 @@ class Dispatcher(BaseRetriever):
                 falls back to the single classic group over ``source``.
             stages: Optional post-retrieval stages applied to each group's
                 candidates before final budgeting. Default: none (pass-through).
+            include_scores: Ask each group's retriever to attach the raw store
+                score to every doc it returns. Off for the answer pipeline; on
+                for the retrieval-test endpoint.
+            usage_source: Cost-attribution tag for the prescreen stage's LLM
+                calls.
         """
+        self._usage_source = usage_source
         self._ctor_kwargs = dict(
+            include_scores=include_scores,
             chat_history=chat_history,
             prompt=prompt,
             doc_token_limit=doc_token_limit,
@@ -229,9 +238,12 @@ class Dispatcher(BaseRetriever):
             kwargs["defer_rephrase"] = True
         retriever = RetrieverCreator.create_retriever(retriever_key, **kwargs)
         # Hand the per-source retrieval configs to the classic retriever so it
-        # can honour per-source chunks/score_threshold/rephrase in its loop.
+        # can honour per-source chunks/score_threshold/rephrase in its loop, plus
+        # the un-inflated top-k so a prescreen source's candidate_k doesn't
+        # become the top-k of the sources beside it in the group.
         if group["retrievals"]:
             setattr(retriever, "per_source_retrieval", group["retrievals"])
+            setattr(retriever, "base_chunks", self.chunks)
         return retriever
 
     def _group_stages(self, group: Dict[str, Any]) -> List[Stage]:
@@ -251,6 +263,7 @@ class Dispatcher(BaseRetriever):
             agent_id=self._ctor_kwargs.get("agent_id"),
             model_user_id=self._ctor_kwargs.get("model_user_id"),
             request_id=self._ctor_kwargs.get("request_id"),
+            usage_source=self._usage_source,
         )
         return list(self.stages) + prescreen
 

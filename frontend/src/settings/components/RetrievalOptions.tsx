@@ -323,6 +323,12 @@ type RetrievalOptionsProps = {
   graphRAGAvailable?: boolean;
   // Models for the graph extraction-model picker, same shape as the agent form.
   availableModels?: Model[];
+  // Shows only the knobs that change what a query retrieves, hiding the
+  // ingest-time groups (chunking, graph extraction) and `exposure` (which picks
+  // *when* a source is searched at answer time, not what comes back). Used by
+  // the retrieval tester, where those knobs cannot affect the result and
+  // showing them would imply they do.
+  queryOnly?: boolean;
 };
 
 /**
@@ -338,6 +344,7 @@ export default function RetrievalOptions({
   hybridAvailable = false,
   graphRAGAvailable = false,
   availableModels = [],
+  queryOnly = false,
 }: RetrievalOptionsProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -486,50 +493,56 @@ export default function RetrievalOptions({
             </SettingRow>
           )}
 
-          <SettingRow
-            label={tr('retrieval.rephraseQuery')}
-            htmlFor="retrieval-rephrase"
-          >
-            <Switch
-              id="retrieval-rephrase"
-              checked={value.retrieval.rephrase_query}
-              disabled={disabled}
-              onCheckedChange={(checked) =>
-                setRetrieval({ rephrase_query: checked })
-              }
-            />
-          </SettingRow>
-
-          <SettingRow
-            label={tr('retrieval.exposure')}
-            htmlFor="retrieval-exposure"
-            description={tr('retrieval.exposureHint')}
-            alignStart
-          >
-            <Select
-              value={value.retrieval.exposure}
-              disabled={disabled}
-              onValueChange={(v) =>
-                setRetrieval({ exposure: v as RetrievalExposure })
-              }
+          {/* Rephrasing only fires when there is chat history to rephrase
+              against, and a test has none — so the switch would do nothing. */}
+          {!queryOnly && (
+            <SettingRow
+              label={tr('retrieval.rephraseQuery')}
+              htmlFor="retrieval-rephrase"
             >
-              <SelectTrigger
-                id="retrieval-exposure"
-                className="w-52 rounded-md"
-                size="lg"
+              <Switch
+                id="retrieval-rephrase"
+                checked={value.retrieval.rephrase_query}
+                disabled={disabled}
+                onCheckedChange={(checked) =>
+                  setRetrieval({ rephrase_query: checked })
+                }
+              />
+            </SettingRow>
+          )}
+
+          {!queryOnly && (
+            <SettingRow
+              label={tr('retrieval.exposure')}
+              htmlFor="retrieval-exposure"
+              description={tr('retrieval.exposureHint')}
+              alignStart
+            >
+              <Select
+                value={value.retrieval.exposure}
+                disabled={disabled}
+                onValueChange={(v) =>
+                  setRetrieval({ exposure: v as RetrievalExposure })
+                }
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="prefetch">
-                  {tr('retrieval.exposures.prefetch')}
-                </SelectItem>
-                <SelectItem value="agentic_tool">
-                  {tr('retrieval.exposures.agentic_tool')}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </SettingRow>
+                <SelectTrigger
+                  id="retrieval-exposure"
+                  className="w-52 rounded-md"
+                  size="lg"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="prefetch">
+                    {tr('retrieval.exposures.prefetch')}
+                  </SelectItem>
+                  <SelectItem value="agentic_tool">
+                    {tr('retrieval.exposures.agentic_tool')}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingRow>
+          )}
 
           <SettingRow
             label={tr('prescreen.enable')}
@@ -599,7 +612,7 @@ export default function RetrievalOptions({
       </div>
 
       {/* Graph extraction group (graphrag only; re-ingest required to apply) */}
-      {isGraphRAG && (
+      {isGraphRAG && !queryOnly && (
         <div className="flex flex-col gap-3">
           <GroupHeader title={tr('graph.title')} tag={tr('graph.tag')} />
 
@@ -676,7 +689,7 @@ export default function RetrievalOptions({
       )}
 
       {/* Chunking group (re-ingest required) */}
-      <div className="flex flex-col gap-3">
+      <div className={cn('flex flex-col gap-3', queryOnly && 'hidden')}>
         <GroupHeader title={tr('chunking.title')} tag={tr('chunking.tag')} />
 
         <div className="divide-border/50 divide-y">

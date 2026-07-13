@@ -122,6 +122,8 @@ class PGVectorStore(BaseVectorStore):
         finally:
             cursor.close()
 
+    score_kind = "cosine_similarity"
+
     def search(
         self,
         question: str,
@@ -138,6 +140,27 @@ class PGVectorStore(BaseVectorStore):
             score_threshold: Optional cosine-similarity floor in ``[0, 1]``.
                 Cosine distance = ``1 - similarity``; rows with similarity below
                 the threshold (distance above ``1 - threshold``) are dropped.
+        """
+        return [
+            doc
+            for doc, _ in self.search_with_scores(
+                question, k, *args, score_threshold=score_threshold, **kwargs
+            )
+        ]
+
+    def search_with_scores(
+        self,
+        question: str,
+        k: int = 2,
+        *args,
+        score_threshold: float = None,
+        **kwargs,
+    ) -> List[tuple]:
+        """Same search as :meth:`search`, pairing each hit with its similarity.
+
+        The score is the cosine similarity (``1 - cosine_distance``) — the exact
+        quantity ``score_threshold`` is compared against, so a caller can read a
+        result's score and pick a threshold from it directly.
         """
         query_vector = self._embedding.embed_query(question)
 
@@ -167,10 +190,13 @@ class PGVectorStore(BaseVectorStore):
                 if max_distance is not None and distance is not None and distance > max_distance:
                     continue
                 metadata = metadata or {}
-                documents.append(Document(page_content=text, metadata=metadata))
+                score = None if distance is None else 1.0 - float(distance)
+                documents.append(
+                    (Document(page_content=text, metadata=metadata), score)
+                )
 
             return documents
-            
+
         except Exception as e:
             logging.error(f"Error searching documents: {e}", exc_info=True)
             return []
