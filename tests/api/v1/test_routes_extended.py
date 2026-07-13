@@ -195,6 +195,31 @@ def _patch_v1_db(conn):
 
 
 @pytest.mark.unit
+def test_response_usage_reports_cumulative_turn_totals():
+    from types import SimpleNamespace
+
+    from application.api.v1.routes import _response_usage
+
+    # Multi-round tool turns must report the accumulator's turn total,
+    # not the final round's provider snapshot.
+    agent = SimpleNamespace(
+        llm=SimpleNamespace(
+            _last_usage={
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "total_tokens": 6,
+            },
+            token_usage={"prompt_tokens": 30, "generated_tokens": 12},
+        )
+    )
+    assert _response_usage(agent) == {
+        "prompt_tokens": 30,
+        "completion_tokens": 12,
+        "total_tokens": 42,
+    }
+
+
+@pytest.mark.unit
 class TestLookupAgentHappy:
     def test_returns_agent_for_valid_key(self, pg_conn):
         from application.api.v1.routes import _lookup_agent

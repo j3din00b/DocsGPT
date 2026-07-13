@@ -416,6 +416,103 @@ def test_chat_path_drops_tool_controls_when_tools_are_unavailable(monkeypatch):
 
 
 @pytest.mark.unit
+def test_chat_nonstream_records_provider_usage(monkeypatch):
+    llm = _make_llm(monkeypatch, ModelCapabilities(api_flavor="chat_completions"))
+    llm._last_usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    llm.client.chat.completions.create = MagicMock(
+        return_value=_ns(
+            choices=[_ns(message=_ns(content="ok"))],
+            usage=_ns(prompt_tokens=11, completion_tokens=5, total_tokens=16),
+        )
+    )
+
+    result = llm._raw_gen(llm, "model", [{"role": "user", "content": "hi"}])
+
+    assert result == "ok"
+    assert llm._last_usage == {
+        "prompt_tokens": 11,
+        "completion_tokens": 5,
+        "total_tokens": 16,
+    }
+
+
+@pytest.mark.unit
+def test_chat_stream_requests_and_records_terminal_usage(monkeypatch):
+    llm = _make_llm(monkeypatch, ModelCapabilities(api_flavor="chat_completions"))
+    llm._last_usage = {"prompt_tokens": 9, "completion_tokens": 9, "total_tokens": 18}
+    llm.client.chat.completions.create = MagicMock(
+        return_value=[
+            _ns(choices=[_ns(delta=_ns(content="Hi"), finish_reason=None)]),
+            _ns(
+                choices=[],
+                usage=_ns(prompt_tokens=7, completion_tokens=2, total_tokens=9),
+            ),
+        ]
+    )
+
+    out = list(
+        llm._raw_gen_stream(llm, "model", [{"role": "user", "content": "hi"}])
+    )
+
+    assert out == ["Hi"]
+    request = llm.client.chat.completions.create.call_args.kwargs
+    assert request["stream_options"] == {"include_usage": True}
+    assert llm._last_usage == {
+        "prompt_tokens": 7,
+        "completion_tokens": 2,
+        "total_tokens": 9,
+    }
+
+
+@pytest.mark.unit
+def test_chat_stream_without_usage_clears_stale_counts(monkeypatch):
+    llm = _make_llm(monkeypatch, ModelCapabilities(api_flavor="chat_completions"))
+    llm._last_usage = {"prompt_tokens": 9, "completion_tokens": 9, "total_tokens": 18}
+    llm.client.chat.completions.create = MagicMock(
+        return_value=[_ns(choices=[_ns(delta=_ns(content="Hi"), finish_reason=None)])]
+    )
+
+    assert list(
+        llm._raw_gen_stream(llm, "model", [{"role": "user", "content": "hi"}])
+    ) == ["Hi"]
+    assert llm._last_usage is None
+
+
+@pytest.mark.unit
+def test_zeroed_chat_usage_does_not_clobber_estimates(monkeypatch):
+    llm = _make_llm(monkeypatch, ModelCapabilities(api_flavor="chat_completions"))
+    llm.client.chat.completions.create = MagicMock(
+        return_value=_ns(
+            choices=[_ns(message=_ns(content="ok"))],
+            usage=_ns(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+        )
+    )
+
+    llm._raw_gen(llm, "model", [{"role": "user", "content": "hi"}])
+
+    assert llm._last_usage is None
+
+
+@pytest.mark.unit
+def test_record_chat_usage_captures_detail_bins(monkeypatch):
+    llm = _make_llm(monkeypatch, ModelCapabilities(api_flavor="chat_completions"))
+    llm._record_chat_usage(_ns(
+        prompt_tokens=10,
+        completion_tokens=7,
+        total_tokens=17,
+        prompt_tokens_details=_ns(cached_tokens=4),
+        completion_tokens_details=_ns(reasoning_tokens=3),
+    ))
+    assert llm._last_usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 7,
+        "total_tokens": 17,
+        "prompt_tokens_details": {"cached_tokens": 4},
+        "completion_tokens_details": {"reasoning_tokens": 3},
+    }
+
+
+@pytest.mark.unit
 def test_build_responses_params_store_with_previous_id(monkeypatch):
     llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
     params = llm._build_responses_params(

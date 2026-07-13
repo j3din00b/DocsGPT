@@ -121,10 +121,13 @@ def _conversation_belongs_to_agent(
 
 
 def _response_usage(agent: Any) -> Dict[str, Any]:
-    """Return the upstream provider's latest OpenAI-shaped usage object."""
-    usage = getattr(getattr(agent, "llm", None), "_last_usage", None)
-    if isinstance(usage, dict):
-        return usage
+    """Return the turn's cumulative usage in Chat Completions shape.
+
+    Reads the per-instance accumulator so multi-round tool turns report
+    the sum of every LLM call, matching what ``token_usage`` rows bill;
+    the accumulator carries provider-exact counts whenever the upstream
+    reported them (see ``_prefer_provider_usage``).
+    """
     tokens = getattr(getattr(agent, "llm", None), "token_usage", {}) or {}
     prompt = int(tokens.get("prompt_tokens", 0) or 0)
     completion = int(tokens.get("generated_tokens", 0) or 0)

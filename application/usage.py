@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Any, Dict
 
 from application.storage.db.repositories.token_usage import TokenUsageRepository
 from application.storage.db.session import db_session
@@ -140,8 +141,17 @@ def _persist_call_usage(llm, call_usage):
         logger.exception("token_usage persist failed")
 
 
-def _prefer_provider_usage(llm, call_usage):
-    """Replace estimates with upstream counts when a provider reported them."""
+def _prefer_provider_usage(llm: Any, call_usage: Dict[str, int]) -> Dict[str, int]:
+    """Replace estimates with upstream counts when a provider reported them.
+
+    Invariant: provider totals are billing-parity bins. Upstream
+    ``prompt_tokens`` already includes cached-read tokens and
+    ``completion_tokens`` already includes reasoning/refusal tokens, so
+    they map 1:1 onto our two columns. Never subtract the
+    ``*_tokens_details`` breakdowns (``cached_tokens``,
+    ``reasoning_tokens``) back out of these bins — that would break
+    parity with what providers bill.
+    """
     reported = getattr(llm, "_last_usage", None)
     if not isinstance(reported, dict):
         return call_usage

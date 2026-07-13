@@ -442,8 +442,10 @@ class OpenAILLM(BaseLLM):
             request_params["tools"] = tools
         if response_format:
             request_params["response_format"] = response_format
+        self._last_usage = None
         response = self.client.chat.completions.create(**request_params)
         logging.debug("OpenAI request completed")
+        self._record_chat_usage(getattr(response, "usage", None))
         if tools:
             return response.choices[0]
         else:
@@ -506,11 +508,19 @@ class OpenAILLM(BaseLLM):
             request_params["tools"] = tools
         if response_format:
             request_params["response_format"] = response_format
+        # Ask for the terminal usage-only chunk (choices=[]) so token rows
+        # get provider-exact counts; servers that ignore stream_options
+        # leave the tiktoken-estimate fallback in place.
+        stream_options = dict(request_params.get("stream_options") or {})
+        stream_options.setdefault("include_usage", True)
+        request_params["stream_options"] = stream_options
+        self._last_usage = None
         response = self.client.chat.completions.create(**request_params)
 
         try:
             for line in response:
                 logging.debug(f"OpenAI stream line: {line}")
+                self._record_chat_usage(getattr(line, "usage", None))
                 if not getattr(line, "choices", None):
                     continue
 
@@ -781,6 +791,42 @@ class OpenAILLM(BaseLLM):
                 })
         result["summary"] = serialized
         return result
+
+    def _record_chat_usage(self, usage) -> None:
+        """Capture provider-reported Chat Completions usage for this call.
+
+        Counterpart to ``_record_responses_metadata`` for the chat path;
+        provider totals are stored as-is (see ``_prefer_provider_usage``).
+        """
+        if usage is None:
+            return
+        try:
+            prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion = int(getattr(usage, "completion_tokens", 0) or 0)
+            total = int(getattr(usage, "total_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if not prompt and not completion:
+            # A zeroed usage object (some proxies) must not clobber estimates.
+            return
+        result = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total or prompt + completion,
+        }
+        input_details = getattr(usage, "prompt_tokens_details", None)
+        output_details = getattr(usage, "completion_tokens_details", None)
+        try:
+            cached = int(getattr(input_details, "cached_tokens", 0) or 0)
+            reasoning = int(getattr(output_details, "reasoning_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            cached = 0
+            reasoning = 0
+        if cached:
+            result["prompt_tokens_details"] = {"cached_tokens": cached}
+        if reasoning:
+            result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+        self._last_usage = result
 
     def _record_responses_metadata(self, response):
         rid = getattr(response, "id", None)

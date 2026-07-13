@@ -317,10 +317,12 @@ class BaseLLM(ABC):
     ):
         # Non-streaming counterpart to ``_emit_stream_finished_log``. Paired
         # with ``llm_gen_start`` so cost dashboards can join start/finish for
-        # non-streaming calls just as they do for streams. Token counts are
-        # client-side estimates from ``gen_token_usage``; ``status`` is
-        # ``"error"`` when the call raised. A distinct event name keeps
-        # non-stream calls out of stream dashboards.
+        # non-streaming calls just as they do for streams. Token counts come
+        # from ``gen_token_usage``: provider-exact when the vendor reported
+        # usage (OpenAI-family chat + Responses), tiktoken estimates
+        # otherwise; ``status`` is ``"error"`` when the call raised. A
+        # distinct event name keeps non-stream calls out of stream
+        # dashboards.
         extra = {
             "model": model,
             "provider": self.provider_name,
@@ -361,10 +363,10 @@ class BaseLLM(ABC):
         error=None,
     ):
         # Paired with ``llm_stream_start`` so cost dashboards can sum tokens
-        # by user/agent/provider. Token counts are client-side estimates
-        # from ``stream_token_usage``; vendor-reported counts (incl.
-        # ``cached_tokens`` for prompt caching) require per-provider
-        # extraction in each ``_raw_gen_stream`` and aren't wired yet.
+        # by user/agent/provider. Token counts come from
+        # ``stream_token_usage``: provider-exact when the vendor reported
+        # usage (OpenAI-family via ``stream_options.include_usage`` and the
+        # Responses API), tiktoken estimates for providers that don't.
         extra = {
             "model": model,
             "provider": self.provider_name,
