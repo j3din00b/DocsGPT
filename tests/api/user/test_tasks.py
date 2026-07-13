@@ -485,7 +485,11 @@ class TestCleanupPendingToolState:
 
         # Pending but already expired — should be deleted.
         c2 = ConversationsRepository(pg_conn).create("u", "expired-pending")
-        repo.save_state(c2["id"], "u", **_sample(), ttl_seconds=0)
+        expired_state = _sample()
+        expired_state["agent_config"] = {
+            "reserved_message_id": "22222222-2222-2222-2222-222222222222"
+        }
+        repo.save_state(c2["id"], "u", **expired_state, ttl_seconds=0)
 
         # Resuming within grace — should stay 'resuming'.
         c3 = ConversationsRepository(pg_conn).create("u", "fresh-resuming")
@@ -518,16 +522,25 @@ class TestCleanupPendingToolState:
         with patch(
             "application.storage.db.engine.get_engine",
             return_value=fake_engine,
-        ):
+        ), patch(
+            "application.api.answer.services.conversation_service."
+            "ConversationService.finalize_message",
+        ) as finalize_expired:
             result = cleanup_pending_tool_state.run()
 
         assert result["reverted"] == 1
         assert result["deleted"] == 1
+        finalize_expired.assert_called_once()
+        assert finalize_expired.call_args.args[0] == (
+            "22222222-2222-2222-2222-222222222222"
+        )
+        assert finalize_expired.call_args.kwargs["status"] == "failed"
 
         # Final state assertions.
         assert repo.load_state(c1["id"], "u")["status"] == "pending"
         assert repo.load_state(c2["id"], "u") is None
-        assert repo.load_state(c3["id"], "u")["status"] == "resuming"
+        assert repo.load_state(c3["id"], "u") is None
+        assert repo.load_state_any(c3["id"], "u")["status"] == "resuming"
         c4_row = repo.load_state(c4["id"], "u")
         assert c4_row["status"] == "pending"
         assert c4_row["resumed_at"] is None

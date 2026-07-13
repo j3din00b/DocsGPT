@@ -704,6 +704,20 @@ class BaseAnswerResource:
                                     "reasoning_content": continuation.get(
                                         "reasoning_content", ""
                                     ),
+                                    # OpenAI Responses continuity. This contains
+                                    # only upstream ids and encrypted reasoning
+                                    # blobs, never plaintext chain-of-thought.
+                                    "responses_state": (
+                                        agent.llm.export_responses_state()
+                                        if callable(
+                                            getattr(
+                                                agent.llm,
+                                                "export_responses_state",
+                                                None,
+                                            )
+                                        )
+                                        else None
+                                    ),
                                 },
                                 client_tools=getattr(
                                     agent.tool_executor, "client_tools", None
@@ -782,29 +796,34 @@ class BaseAnswerResource:
             if isNoneDoc:
                 for doc in source_log_docs:
                     doc["source"] = "None"
-            # Model-owner scope so title-gen uses owner's BYOM key.
-            provider = (
-                get_provider_from_model_id(
-                    model_id,
-                    user_id=model_user_id
-                    or (decoded_token.get("sub") if decoded_token else None),
+            # Hidden API conversations keep the deterministic fallback title.
+            # Do not put an extra (potentially high-reasoning) LLM request on
+            # their response critical path.
+            llm = None
+            if visibility == "listed":
+                title_model_id = settings.TITLE_MODEL_ID or model_id
+                provider = (
+                    get_provider_from_model_id(
+                        title_model_id,
+                        user_id=model_user_id
+                        or (decoded_token.get("sub") if decoded_token else None),
+                    )
+                    if title_model_id
+                    else settings.LLM_PROVIDER
                 )
-                if model_id
-                else settings.LLM_PROVIDER
-            )
-            system_api_key = get_api_key_for_provider(provider or settings.LLM_PROVIDER)
-
-            llm = LLMCreator.create_llm(
-                provider or settings.LLM_PROVIDER,
-                api_key=system_api_key,
-                user_api_key=user_api_key,
-                decoded_token=decoded_token,
-                model_id=model_id,
-                agent_id=agent_id,
-                model_user_id=model_user_id,
-            )
-            # Title-gen only; agent stream tokens live on ``agent.llm``.
-            llm._token_usage_source = "title"
+                system_api_key = get_api_key_for_provider(
+                    provider or settings.LLM_PROVIDER
+                )
+                llm = LLMCreator.create_llm(
+                    provider or settings.LLM_PROVIDER,
+                    api_key=system_api_key,
+                    user_api_key=user_api_key,
+                    decoded_token=decoded_token,
+                    model_id=title_model_id,
+                    agent_id=agent_id,
+                    model_user_id=model_user_id,
+                )
+                llm._token_usage_source = "title"
 
             if should_persist:
                 if reserved_message_id is not None:
@@ -825,7 +844,8 @@ class BaseAnswerResource:
                             "fallback_name": (
                                 question[:50] if question else "New Conversation"
                             ),
-                        },
+                        } if llm is not None else None,
+                        async_title_generation=llm is not None,
                     )
                 else:
                     conversation_id = self.conversation_service.save_conversation(
@@ -957,34 +977,35 @@ class BaseAnswerResource:
                     if isNoneDoc:
                         for doc in source_log_docs:
                             doc["source"] = "None"
-                    # Resolve under model-owner scope so shared-agent
-                    # title-gen uses owner BYOM, not deployment default.
-                    provider = (
-                        get_provider_from_model_id(
-                            model_id,
-                            user_id=model_user_id
-                            or (
-                                decoded_token.get("sub")
-                                if decoded_token
-                                else None
-                            ),
+                    llm = None
+                    if visibility == "listed":
+                        title_model_id = settings.TITLE_MODEL_ID or model_id
+                        provider = (
+                            get_provider_from_model_id(
+                                title_model_id,
+                                user_id=model_user_id
+                                or (
+                                    decoded_token.get("sub")
+                                    if decoded_token
+                                    else None
+                                ),
+                            )
+                            if title_model_id
+                            else settings.LLM_PROVIDER
                         )
-                        if model_id
-                        else settings.LLM_PROVIDER
-                    )
-                    sys_api_key = get_api_key_for_provider(
-                        provider or settings.LLM_PROVIDER
-                    )
-                    llm = LLMCreator.create_llm(
-                        provider or settings.LLM_PROVIDER,
-                        api_key=sys_api_key,
-                        user_api_key=user_api_key,
-                        decoded_token=decoded_token,
-                        model_id=model_id,
-                        agent_id=agent_id,
-                        model_user_id=model_user_id,
-                    )
-                    llm._token_usage_source = "title"
+                        sys_api_key = get_api_key_for_provider(
+                            provider or settings.LLM_PROVIDER
+                        )
+                        llm = LLMCreator.create_llm(
+                            provider or settings.LLM_PROVIDER,
+                            api_key=sys_api_key,
+                            user_api_key=user_api_key,
+                            decoded_token=decoded_token,
+                            model_id=title_model_id,
+                            agent_id=agent_id,
+                            model_user_id=model_user_id,
+                        )
+                        llm._token_usage_source = "title"
                     if reserved_message_id is not None:
                         outcome = self.conversation_service.finalize_message(
                             reserved_message_id,
@@ -1003,7 +1024,8 @@ class BaseAnswerResource:
                                 "fallback_name": (
                                     question[:50] if question else "New Conversation"
                                 ),
-                            },
+                            } if llm is not None else None,
+                            async_title_generation=llm is not None,
                         )
                         # ``ALREADY_COMPLETE`` means the normal-path
                         # finalize at line 632 won the race: the DB row

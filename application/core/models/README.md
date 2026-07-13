@@ -111,6 +111,7 @@ defaults:                              # optional, applied to every model below
   input_cost_per_token: float          # default null
   output_cost_per_token: float         # default null
   reasoning_effort: <string>           # default null; none|minimal|low|medium|high|xhigh (subset is model-dependent)
+  api_flavor: <string>                  # chat_completions (default) or responses
 
 models:                                # required
   - id: <string, required>             # unique registry key; persisted in agent records

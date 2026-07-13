@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Any, Dict
 
 from application.storage.db.repositories.token_usage import TokenUsageRepository
 from application.storage.db.session import db_session
@@ -140,6 +141,30 @@ def _persist_call_usage(llm, call_usage):
         logger.exception("token_usage persist failed")
 
 
+def _prefer_provider_usage(llm: Any, call_usage: Dict[str, int]) -> Dict[str, int]:
+    """Replace estimates with upstream counts when a provider reported them.
+
+    Invariant: provider totals are billing-parity bins. Upstream
+    ``prompt_tokens`` already includes cached-read tokens and
+    ``completion_tokens`` already includes reasoning/refusal tokens, so
+    they map 1:1 onto our two columns. Never subtract the
+    ``*_tokens_details`` breakdowns (``cached_tokens``,
+    ``reasoning_tokens``) back out of these bins — that would break
+    parity with what providers bill.
+    """
+    reported = getattr(llm, "_last_usage", None)
+    if not isinstance(reported, dict):
+        return call_usage
+    prompt = reported.get("prompt_tokens")
+    completion = reported.get("completion_tokens")
+    if prompt is None or completion is None:
+        return call_usage
+    return {
+        "prompt_tokens": int(prompt or 0),
+        "generated_tokens": int(completion or 0),
+    }
+
+
 def gen_token_usage(func):
     """Accumulate per-call token counts and write a ``token_usage`` row.
 
@@ -172,6 +197,7 @@ def gen_token_usage(func):
             error = exc
             raise
         finally:
+            call_usage = _prefer_provider_usage(self, call_usage)
             self.token_usage["prompt_tokens"] += call_usage["prompt_tokens"]
             self.token_usage["generated_tokens"] += call_usage["generated_tokens"]
             _persist_call_usage(self, call_usage)
@@ -219,6 +245,7 @@ def stream_token_usage(func):
         finally:
             for line in batch:
                 call_usage["generated_tokens"] += _count_tokens(line)
+            call_usage = _prefer_provider_usage(self, call_usage)
             self.token_usage["prompt_tokens"] += call_usage["prompt_tokens"]
             self.token_usage["generated_tokens"] += call_usage["generated_tokens"]
             _persist_call_usage(self, call_usage)

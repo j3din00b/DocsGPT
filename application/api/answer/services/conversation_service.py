@@ -6,6 +6,7 @@ than held for the duration of a stream.
 """
 
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -151,16 +152,13 @@ class ConversationService:
             # records). The LLM's own ``model_id`` is the upstream name
             # LLMCreator resolved at construction time — that's what
             # the provider's API expects. Built-ins are unaffected.
-            completion = llm.gen(
-                model=getattr(llm, "model_id", None) or model_id,
-                messages=messages_summary,
-                # Reasoning-capable default models spend the whole budget inside
-                # reasoning_content before emitting any title, so 500 came back
-                # empty (finish_reason=length). Give enough room to finish
-                # thinking and still produce the 3-word title; non-reasoning
-                # models stop far short of this cap.
-                max_tokens=2000,
-            )
+            completion = None
+            if llm is not None:
+                completion = llm.gen(
+                    model=getattr(llm, "model_id", None) or model_id,
+                    messages=messages_summary,
+                    max_tokens=2000,
+                )
 
             if not completion or not completion.strip():
                 completion = question[:50] if question else "New Conversation"
@@ -317,6 +315,7 @@ class ConversationService:
         status: str = "complete",
         error: Optional[BaseException] = None,
         title_inputs: Optional[Dict[str, Any]] = None,
+        async_title_generation: bool = False,
     ) -> MessageUpdateOutcome:
         """Commit the response and tool_call confirms in one transaction.
 
@@ -369,15 +368,29 @@ class ConversationService:
 
         # Outside the txn — title-gen is a multi-second LLM round trip.
         if title_inputs and status == "complete":
-            try:
-                with db_session() as conn:
-                    self._maybe_generate_title(conn, message_id, title_inputs)
-            except Exception as e:
-                logger.error(
-                    f"finalize_message title generation failed: {e}",
-                    exc_info=True,
-                )
+            if async_title_generation:
+                threading.Thread(
+                    target=self._generate_title_safely,
+                    args=(message_id, title_inputs),
+                    name="docsgpt-title-generation",
+                    daemon=True,
+                ).start()
+            else:
+                self._generate_title_safely(message_id, title_inputs)
         return MessageUpdateOutcome.UPDATED
+
+    def _generate_title_safely(
+        self, message_id: str, title_inputs: Dict[str, Any]
+    ) -> None:
+        """Generate a title in its own DB transaction without surfacing errors."""
+        try:
+            with db_session() as conn:
+                self._maybe_generate_title(conn, message_id, title_inputs)
+        except Exception as e:
+            logger.error(
+                f"finalize_message title generation failed: {e}",
+                exc_info=True,
+            )
 
     def _maybe_generate_title(
         self,

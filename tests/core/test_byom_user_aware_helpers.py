@@ -791,7 +791,7 @@ class TestContinuationPreservesByomScope:
         )
 
         cont_service = MagicMock()
-        cont_service.load_state.return_value = {
+        cont_service.claim_state.return_value = {
             "messages": [],
             "pending_tool_calls": [],
             "tools_dict": {},

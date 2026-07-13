@@ -16,14 +16,28 @@ from flask import Blueprint, jsonify, make_response, request, Response
 
 from application.api.answer.routes.base import BaseAnswerResource
 from application.api.answer.services.persistence_policy import resolve_persistence
+from application.api.answer.services.continuation_service import (
+    ContinuationService,
+    ResumeInProgressError,
+)
 from application.api.answer.services.stream_processor import StreamProcessor
 from application.api.v1 import idempotency as v1_idempotency
+from application.api.v1.session_store import (
+    V1Session,
+    delete_conversation,
+    identify_session,
+    load_conversation,
+    save_conversation,
+)
 from application.api.v1.translator import (
+    StreamTranslationState,
+    make_usage_chunk,
     translate_request,
     translate_response,
     translate_stream_event,
 )
 from application.storage.db.repositories.agents import AgentsRepository
+from application.storage.db.repositories.conversations import ConversationsRepository
 from application.storage.db.session import db_readonly
 
 logger = logging.getLogger(__name__)
@@ -56,6 +70,80 @@ def _get_model_name(agent: Optional[Dict], api_key: str) -> str:
     return api_key
 
 
+def _invalid_request(message: str, code: Optional[str] = None) -> Response:
+    """Return an OpenAI-shaped invalid-request response."""
+    return make_response(
+        jsonify({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                **({"code": code} if code else {}),
+            }
+        }),
+        400,
+    )
+
+
+def _validate_request_options(data: Dict[str, Any], agent: Dict[str, Any]) -> Optional[Response]:
+    """Reject unsupported options instead of silently changing semantics."""
+    # The API key, not the OpenAI ``model`` placeholder, selects the agent.
+    # Keep accepting arbitrary model strings as documented for compatibility
+    # with clients that require a locally configured model alias.
+    if data.get("n") not in (None, 1):
+        return _invalid_request("DocsGPT currently supports only n=1.")
+    if data.get("logprobs") not in (None, False):
+        return _invalid_request("logprobs is not supported by this endpoint.")
+    stream_options = data.get("stream_options")
+    if stream_options is not None and not isinstance(stream_options, dict):
+        return _invalid_request("stream_options must be an object.")
+    return None
+
+
+def _conversation_belongs_to_agent(
+    conversation_id: str, user_id: str, agent_id: str
+) -> bool:
+    """Return whether a conversation is accessible and bound to this agent."""
+    if not conversation_id or not user_id or not agent_id:
+        return False
+    try:
+        with db_readonly() as conn:
+            conversation = ConversationsRepository(conn).get_any(
+                str(conversation_id), str(user_id)
+            )
+    except Exception:
+        logger.warning("Failed to authorize v1 conversation", exc_info=True)
+        return False
+    return bool(
+        conversation
+        and conversation.get("agent_id")
+        and str(conversation["agent_id"]) == str(agent_id)
+    )
+
+
+def _response_usage(agent: Any) -> Dict[str, Any]:
+    """Return the turn's cumulative usage in Chat Completions shape.
+
+    Reads the per-instance accumulator so multi-round tool turns report
+    the sum of every LLM call, matching what ``token_usage`` rows bill;
+    the accumulator carries provider-exact counts whenever the upstream
+    reported them (see ``_prefer_provider_usage``).
+    """
+    tokens = getattr(getattr(agent, "llm", None), "token_usage", {}) or {}
+    prompt = int(tokens.get("prompt_tokens", 0) or 0)
+    completion = int(tokens.get("generated_tokens", 0) or 0)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def _response_finish_reason(agent: Any) -> str:
+    """Return the upstream terminal reason understood by Chat Completions."""
+    reason = getattr(getattr(agent, "llm", None), "_last_finish_reason", None)
+    return reason if reason in {"stop", "length"} else "stop"
+
+
 class _V1AnswerHelper(BaseAnswerResource):
     """Thin wrapper to access complete_stream / process_response_stream."""
     pass
@@ -80,6 +168,14 @@ def chat_completions():
 
     is_stream = data.get("stream", False)
     agent_doc = _lookup_agent(api_key)
+    if not agent_doc:
+        return make_response(
+            jsonify({"error": {"message": "Invalid API key", "type": "auth_error"}}),
+            401,
+        )
+    options_error = _validate_request_options(data, agent_doc)
+    if options_error is not None:
+        return options_error
     model_name = _get_model_name(agent_doc, api_key)
 
     # ---- Layer-1 idempotency (opt-in, non-streaming only) ----
@@ -113,6 +209,21 @@ def chat_completions():
             400,
         )
 
+    agent_id_value = str(agent_doc.get("id") or agent_doc.get("_id") or "")
+    client_session = identify_session(request.headers, data, agent_id_value)
+    explicit_conversation = (
+        request.headers.get("X-DocsGPT-Conversation-ID")
+        or internal_data.get("conversation_id")
+    )
+    conversation_from_session = False
+    if explicit_conversation:
+        internal_data["conversation_id"] = explicit_conversation
+    elif not internal_data.get("conversation_id"):
+        correlated_conversation = load_conversation(client_session)
+        if correlated_conversation:
+            internal_data["conversation_id"] = correlated_conversation
+            conversation_from_session = True
+
     # Link decoded_token to the agent's owner so continuation state,
     # logs, and tool execution use the correct user identity. The PG
     # ``agents`` row exposes the owner via ``user_id`` (``user`` is the
@@ -124,50 +235,83 @@ def chat_completions():
     )
     decoded_token = {"sub": agent_user or "api_key_user"}
 
+    conversation_id = internal_data.get("conversation_id")
+    if conversation_id and not _conversation_belongs_to_agent(
+        str(conversation_id), str(decoded_token["sub"]), agent_id_value
+    ):
+        if conversation_from_session:
+            # A deleted or reassigned conversation must not poison this client
+            # session for the remainder of its Redis TTL. Start a fresh hidden
+            # conversation and replace the mapping after the request succeeds.
+            delete_conversation(client_session)
+            internal_data.pop("conversation_id", None)
+        else:
+            return _invalid_request(
+                "Conversation not found for the authenticated agent.",
+                code="conversation_not_found",
+            )
+
+    if internal_data.get("tool_actions") and internal_data.get("conversation_id"):
+        internal_data["persist"] = True
+
     try:
         processor = StreamProcessor(internal_data, decoded_token)
 
         if internal_data.get("tool_actions"):
-            # Continuation mode — coherent Option B: the v1 tool round-trip is
-            # fully stateless. The pause finalized the prior turn's row as
-            # ``complete`` and wrote NO ``pending_tool_state`` (see
-            # ``complete_stream(finalize_tool_pause_as_complete=True)``), so we
-            # ALWAYS rebuild the agent + pending calls from the re-POSTed
-            # message history — even when the client threads back the
-            # ``conversation_id`` it got from the first response.
-            #
-            # We deliberately do NOT call ``resume_from_tool_actions`` here:
-            # its ``load_state`` would find no pending state and raise (→ HTTP
-            # 400), since OpenAI clients resume statelessly rather than via a
-            # native resume. ``resume_from_tool_actions`` stays in place for
-            # the native ``/stream`` + ``/api/answer`` routes, which are
-            # unchanged.
             conversation_id = internal_data.get("conversation_id")
-            (
-                agent,
-                messages,
-                tools_dict,
-                pending_tool_calls,
-                tool_actions,
-                reasoning_content,
-            ) = processor.build_continuation_from_messages(
-                internal_data.get("messages", []),
-                internal_data["tool_actions"],
+            pending_state = (
+                ContinuationService().claim_state(
+                    conversation_id, decoded_token["sub"]
+                )
+                if conversation_id
+                else None
             )
-            # When a conversation_id is carried, target it for persistence so
-            # the final answer appends as a NEW terminal turn in that
-            # conversation (``save_conversation`` keys off ``conversation_id``)
-            # rather than creating an orphan sibling. ``build_continuation_from_messages``
-            # leaves the processor's ``conversation_id`` (set from the request
-            # in ``__init__``) intact; pin it explicitly for clarity.
-            if conversation_id:
+            if conversation_id and pending_state:
+                (
+                    agent,
+                    messages,
+                    tools_dict,
+                    pending_tool_calls,
+                    tool_actions,
+                    reasoning_content,
+                ) = processor.resume_from_tool_actions(
+                    internal_data["tool_actions"],
+                    conversation_id,
+                    claimed_state=pending_state,
+                )
                 processor.conversation_id = conversation_id
+            else:
+                # Compatibility fallback for old/completed conversations and
+                # clients that resend the full transcript without resumable
+                # server state. StreamProcessor still enforces conversation
+                # ownership while loading history.
+                (
+                    agent,
+                    messages,
+                    tools_dict,
+                    pending_tool_calls,
+                    tool_actions,
+                    reasoning_content,
+                ) = processor.build_continuation_from_messages(
+                    internal_data.get("messages", []),
+                    internal_data["tool_actions"],
+                )
+                # A missing/expired durable continuation has no reserved WAL
+                # row to finalize. Run it statelessly without appending a blank
+                # sibling turn to the mapped conversation.
+                internal_data["persist"] = False
             continuation = {
                 "messages": messages,
                 "tools_dict": tools_dict,
                 "pending_tool_calls": pending_tool_calls,
                 "tool_actions": tool_actions,
                 "reasoning_content": reasoning_content,
+                # Stateful compatibility resumes must finalize the original
+                # WAL placeholder and keep its request attribution. Omitting
+                # these made OpenCode rounds append an orphan response while
+                # leaving the initial message permanently ``streaming``.
+                "reserved_message_id": processor.reserved_message_id,
+                "request_id": processor.request_id,
             }
             question = ""
         else:
@@ -199,6 +343,9 @@ def chat_completions():
         strip_reasoning_leak = bool(
             internal_data.get("json_schema") or internal_data.get("json_object")
         )
+        finalize_stateless_tool_pause = bool(
+            client_session is None and not internal_data.get("conversation_id")
+        )
 
         if is_stream:
             # Idempotency replay is NOT supported for streaming: there is no
@@ -216,6 +363,9 @@ def chat_completions():
                     should_persist,
                     visibility,
                     strip_reasoning_leak,
+                    bool((data.get("stream_options") or {}).get("include_usage")),
+                    client_session,
+                    finalize_stateless_tool_pause,
                 ),
                 mimetype="text/event-stream",
                 headers={
@@ -247,6 +397,8 @@ def chat_completions():
             should_persist,
             visibility,
             strip_reasoning_leak,
+            client_session,
+            finalize_stateless_tool_pause,
         )
 
         # Cache only successful (2xx) responses; ``finalize`` releases the
@@ -255,6 +407,19 @@ def chat_completions():
             v1_idempotency.finalize(idem_key, response)
         return response
 
+    except ResumeInProgressError:
+        if idem_key:
+            v1_idempotency.release(idem_key)
+        return make_response(
+            jsonify({
+                "error": {
+                    "message": "Resume already in progress for this conversation.",
+                    "type": "conflict_error",
+                    "code": "resume_in_progress",
+                }
+            }),
+            409,
+        )
     except ValueError as e:
         if idem_key:
             v1_idempotency.release(idem_key)
@@ -289,6 +454,9 @@ def _stream_response(
     should_persist: bool,
     visibility: str,
     strip_reasoning_leak: bool = False,
+    include_usage: bool = False,
+    client_session: Optional[V1Session] = None,
+    finalize_stateless_tool_pause: bool = False,
 ) -> Generator[str, None, None]:
     """Generate translated SSE chunks for streaming response."""
     completion_id = f"chatcmpl-{int(time.time())}"
@@ -305,11 +473,10 @@ def _stream_response(
         should_persist=should_persist,
         visibility=visibility,
         _continuation=continuation,
-        # OpenAI clients resume tool calls statelessly (no slot for our
-        # reserved_message_id), so a tool pause must finalize the row as
-        # ``complete`` here rather than stranding it for a native resume.
-        finalize_tool_pause_as_complete=True,
+        finalize_tool_pause_as_complete=finalize_stateless_tool_pause,
     )
+
+    translation_state = StreamTranslationState()
 
     for line in internal_stream:
         if not line.strip():
@@ -339,10 +506,19 @@ def _stream_response(
             conv_id = event_data.get("id", "")
             if conv_id and conv_id != "None":
                 completion_id = f"chatcmpl-{conv_id}"
+                save_conversation(client_session, conv_id)
 
         # Translate to standard format
+        if event_data.get("type") == "end":
+            event_data["finish_reason"] = _response_finish_reason(agent)
+        if event_data.get("type") == "end" and include_usage:
+            yield make_usage_chunk(completion_id, model_name, _response_usage(agent))
         translated = translate_stream_event(
-            event_data, completion_id, model_name, strip_reasoning_leak
+            event_data,
+            completion_id,
+            model_name,
+            strip_reasoning_leak,
+            translation_state,
         )
         for chunk in translated:
             yield chunk
@@ -358,6 +534,8 @@ def _non_stream_response(
     should_persist: bool,
     visibility: str,
     strip_reasoning_leak: bool = False,
+    client_session: Optional[V1Session] = None,
+    finalize_stateless_tool_pause: bool = False,
 ) -> Response:
     """Collect full response and return as single JSON."""
     stream = helper.complete_stream(
@@ -372,10 +550,7 @@ def _non_stream_response(
         should_persist=should_persist,
         visibility=visibility,
         _continuation=continuation,
-        # OpenAI clients resume tool calls statelessly (no slot for our
-        # reserved_message_id), so a tool pause must finalize the row as
-        # ``complete`` here rather than stranding it for a native resume.
-        finalize_tool_pause_as_complete=True,
+        finalize_tool_pause_as_complete=finalize_stateless_tool_pause,
     )
 
     result = helper.process_response_stream(stream)
@@ -388,6 +563,7 @@ def _non_stream_response(
 
     extra = result.get("extra")
     pending = extra.get("pending_tool_calls") if isinstance(extra, dict) else None
+    save_conversation(client_session, result.get("conversation_id"))
 
     response = translate_response(
         conversation_id=result["conversation_id"],
@@ -398,6 +574,8 @@ def _non_stream_response(
         model_name=model_name,
         pending_tool_calls=pending,
         strip_reasoning_leak=strip_reasoning_leak,
+        usage=_response_usage(agent),
+        finish_reason_override=_response_finish_reason(agent),
     )
     return make_response(jsonify(response), 200)
 

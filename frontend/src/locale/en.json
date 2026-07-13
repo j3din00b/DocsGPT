@@ -695,6 +695,15 @@
       "capabilities": {
         "title": "Capabilities",
         "contextWindowShort": "Context window",
+        "apiFlavor": "API protocol",
+        "apiFlavors": {
+          "chatCompletions": "Chat Completions",
+          "responses": "Responses"
+        },
+        "reasoningEffort": "Reasoning effort",
+        "reasoningEfforts": {
+          "default": "Provider default"
+        },
         "chips": {
           "tools": "Tools",
           "structuredOutput": "Structured output",

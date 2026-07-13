@@ -304,6 +304,11 @@ class StreamProcessor:
                             if "metadata" in query
                             else {}
                         ),
+                        **(
+                            {"tool_calls": query["tool_calls"]}
+                            if query.get("tool_calls")
+                            else {}
+                        ),
                     }
                     for query in conversation.get("queries", [])
                 ]
@@ -341,6 +346,11 @@ class StreamProcessor:
                             else {}
                         ),
                         **({"metadata": query["metadata"]} if "metadata" in query else {}),
+                        **(
+                            {"tool_calls": query["tool_calls"]}
+                            if query.get("tool_calls")
+                            else {}
+                        ),
                     }
                     for query in conversation.get("queries", [])
                 ]
@@ -381,6 +391,11 @@ class StreamProcessor:
                         else {}
                     ),
                     **({"metadata": query["metadata"]} if "metadata" in query else {}),
+                    **(
+                        {"tool_calls": query["tool_calls"]}
+                        if query.get("tool_calls")
+                        else {}
+                    ),
                 }
                 for query in conversation.get("queries", [])
             ]
@@ -1326,6 +1341,7 @@ class StreamProcessor:
         self,
         tool_actions: list,
         conversation_id: str,
+        claimed_state: Optional[Dict[str, Any]] = None,
     ):
         """Resume a paused agent from saved continuation state.
 
@@ -1369,23 +1385,11 @@ class StreamProcessor:
                 self.decoded_token = {"sub": owner}
 
         cont_service = ContinuationService()
-        state = cont_service.load_state(conversation_id, self.initial_user_id)
+        state = claimed_state or cont_service.claim_state(
+            conversation_id, self.initial_user_id
+        )
         if not state:
             raise ValueError("No pending tool state found for this conversation")
-
-        # Claim the resume up-front. ``mark_resuming`` only flips ``pending``
-        # → ``resuming``; if it returns False, another resume already
-        # claimed this row (status='resuming') — bail before any further
-        # LLM/tool work to avoid double-execution. The cleanup janitor
-        # reverts a stale ``resuming`` claim back to ``pending`` after the
-        # 10-minute grace window so the user can retry.
-        if not cont_service.mark_resuming(
-            conversation_id, self.initial_user_id,
-        ):
-            raise ValueError(
-                "Resume already in progress for this conversation; "
-                "retry after the grace window if it stalls."
-            )
 
         messages = state["messages"]
         pending_tool_calls = state["pending_tool_calls"]
@@ -1418,6 +1422,9 @@ class StreamProcessor:
             agent_id=agent_id,
             model_user_id=model_user_id,
         )
+        importer = getattr(llm, "import_responses_state", None)
+        if callable(importer):
+            importer(agent_config.get("responses_state"))
         llm_handler = LLMHandlerCreator.create_handler(llm_name or "default")
         tool_executor = ToolExecutor(
             user_api_key=user_api_key,

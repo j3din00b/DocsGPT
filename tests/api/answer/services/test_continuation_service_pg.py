@@ -4,6 +4,8 @@ from contextlib import contextmanager
 from unittest.mock import patch
 from uuid import uuid4
 
+import pytest
+from sqlalchemy import text
 
 
 @contextmanager
@@ -160,6 +162,68 @@ class TestContinuationServiceSaveLoad:
                 "00000000-0000-0000-0000-000000000000", "u",
             )
         assert got is None
+
+    def test_claim_state_is_atomic_and_duplicate_is_conflict(self, pg_conn):
+        from application.api.answer.services.continuation_service import (
+            ContinuationService,
+            ResumeInProgressError,
+        )
+        from application.storage.db.repositories.conversations import (
+            ConversationsRepository,
+        )
+
+        user = "u-claim"
+        conv = ConversationsRepository(pg_conn).create(user, name="c")
+        conv_id = str(conv["id"])
+        service = ContinuationService()
+        with _patch_db(pg_conn):
+            service.save_state(
+                conversation_id=conv_id,
+                user=user,
+                messages=[],
+                pending_tool_calls=[{"call_id": "call-1"}],
+                tools_dict={},
+                tool_schemas=[],
+                agent_config={"agent_id": "agent-a"},
+            )
+            claimed = service.claim_state(conv_id, user)
+            assert claimed is not None
+            assert claimed["status"] == "resuming"
+            with pytest.raises(ResumeInProgressError):
+                service.claim_state(conv_id, user)
+
+    def test_expired_state_is_neither_loaded_nor_claimed(self, pg_conn):
+        from application.api.answer.services.continuation_service import (
+            ContinuationService,
+        )
+        from application.storage.db.repositories.conversations import (
+            ConversationsRepository,
+        )
+
+        user = "u-expired"
+        conv = ConversationsRepository(pg_conn).create(user, name="c")
+        conv_id = str(conv["id"])
+        service = ContinuationService()
+        with _patch_db(pg_conn):
+            service.save_state(
+                conversation_id=conv_id,
+                user=user,
+                messages=[],
+                pending_tool_calls=[{"call_id": "call-1"}],
+                tools_dict={},
+                tool_schemas=[],
+                agent_config={},
+            )
+            pg_conn.execute(
+                text(
+                    "UPDATE pending_tool_state "
+                    "SET expires_at = clock_timestamp() - interval '1 second' "
+                    "WHERE conversation_id = CAST(:conv AS uuid)"
+                ),
+                {"conv": conv_id},
+            )
+            assert service.load_state(conv_id, user) is None
+            assert service.claim_state(conv_id, user) is None
 
     def test_save_state_no_client_tools(self, pg_conn):
         from application.api.answer.services.continuation_service import (

@@ -9,6 +9,7 @@ import json
 import pytest
 
 from application.api.v1.translator import (
+    StreamTranslationState,
     _get_client_tool_name,
     _split_leaked_reasoning,
     _strip_repr_quotes,
@@ -172,13 +173,13 @@ class TestExtractSystemPrompt:
         messages = [{"role": "user", "content": "Hello"}]
         assert extract_system_prompt(messages) is None
 
-    def test_returns_first_of_multiple_system_messages(self):
+    def test_combines_multiple_instruction_messages_in_order(self):
         messages = [
             {"role": "system", "content": "First"},
-            {"role": "system", "content": "Second"},
+            {"role": "developer", "content": "Second"},
             {"role": "user", "content": "Hello"},
         ]
-        assert extract_system_prompt(messages) == "First"
+        assert extract_system_prompt(messages) == "First\n\nSecond"
 
     def test_empty_content_returns_empty_string(self):
         messages = [
@@ -524,6 +525,18 @@ class TestTranslateResponse:
         )
         assert "docsgpt" not in resp
 
+    def test_finish_reason_override(self):
+        resp = translate_response(
+            conversation_id="c1",
+            answer="Partial output",
+            sources=None,
+            tool_calls=None,
+            thought="",
+            model_name="agent",
+            finish_reason_override="length",
+        )
+        assert resp["choices"][0]["finish_reason"] == "length"
+
 
 # ---------------------------------------------------------------------------
 # translate_stream_event
@@ -572,6 +585,14 @@ class TestTranslateStreamEvent:
         assert parsed["choices"][0]["finish_reason"] == "stop"
         # Second chunk: [DONE]
         assert chunks[1].strip() == "data: [DONE]"
+
+    def test_end_event_preserves_length_finish_reason(self):
+        chunks = translate_stream_event(
+            {"type": "end", "finish_reason": "length"},
+            "chatcmpl-1", "agent",
+        )
+        parsed = json.loads(chunks[0].replace("data: ", "").strip())
+        assert parsed["choices"][0]["finish_reason"] == "length"
 
     def test_tool_call_client_execution(self):
         chunks = translate_stream_event(
@@ -644,6 +665,52 @@ class TestTranslateStreamEvent:
         # Extension chunk
         ext = json.loads(chunks[1].replace("data: ", "").strip())
         assert ext["docsgpt"]["type"] == "tool_calls_pending"
+
+    def test_parallel_tool_indices_and_single_terminal_reason(self):
+        state = StreamTranslationState()
+        chunks = []
+        for call_id in ("c1", "c2"):
+            chunks += translate_stream_event(
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "call_id": call_id,
+                        "action_name": "run",
+                        "arguments": {},
+                        "status": "requires_client_execution",
+                    },
+                },
+                "chatcmpl-1",
+                "agent",
+                state=state,
+            )
+        chunks += translate_stream_event(
+            {"type": "tool_calls_pending", "data": {"pending_tool_calls": []}},
+            "chatcmpl-1",
+            "agent",
+            state=state,
+        )
+        chunks += translate_stream_event(
+            {"type": "end"}, "chatcmpl-1", "agent", state=state
+        )
+        decoded = [
+            json.loads(chunk.removeprefix("data: ").strip())
+            for chunk in chunks
+            if "[DONE]" not in chunk
+        ]
+        indices = [
+            item["choices"][0]["delta"]["tool_calls"][0]["index"]
+            for item in decoded
+            if item["choices"][0]["delta"].get("tool_calls")
+        ]
+        finishes = [
+            item["choices"][0]["finish_reason"]
+            for item in decoded
+            if item["choices"][0]["finish_reason"]
+        ]
+        assert indices == [0, 1]
+        assert finishes == ["tool_calls"]
+        assert sum("[DONE]" in chunk for chunk in chunks) == 1
 
     def test_id_event(self):
         chunks = translate_stream_event(
@@ -930,6 +997,21 @@ class TestTranslateRequestStructuredOutputs:
         }
         result = translate_request(data, "key")
         assert result["llm_params"] == {"temperature": 0.2, "top_p": 0.9, "seed": 7}
+
+    def test_tool_controls_are_forwarded(self):
+        choice = {"type": "function", "function": {"name": "read_file"}}
+        data = {
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}},
+            }],
+            "tool_choice": choice,
+            "parallel_tool_calls": False,
+        }
+        result = translate_request(data, "key")
+        assert result["llm_params"]["tool_choice"] == choice
+        assert result["llm_params"]["parallel_tool_calls"] is False
 
     def test_max_tokens_alias_dropped_when_canonical_present(self):
         data = {
