@@ -407,13 +407,13 @@ def chat_completions():
             v1_idempotency.finalize(idem_key, response)
         return response
 
-    except ResumeInProgressError as e:
+    except ResumeInProgressError:
         if idem_key:
             v1_idempotency.release(idem_key)
         return make_response(
             jsonify({
                 "error": {
-                    "message": str(e),
+                    "message": "Resume already in progress for this conversation.",
                     "type": "conflict_error",
                     "code": "resume_in_progress",
                 }
