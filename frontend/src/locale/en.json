@@ -344,6 +344,7 @@
       "stats": {
         "messages": "Messages",
         "tokens": "Tokens",
+        "tokensHint": "All LLM-billed tokens. Agents re-send the conversation context on every tool step, so tool-heavy chats use many times more tokens than the visible messages suggest.",
         "toolCalls": "Tool Calls",
         "runSuccess": "Run Success",
         "feedback": "Feedback"

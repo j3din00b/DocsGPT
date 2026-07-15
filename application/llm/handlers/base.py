@@ -22,6 +22,44 @@ _FINALIZE_INSTRUCTION = (
 )
 
 
+def _bound_tool_response_for_llm(tool_response: Any) -> Any:
+    """Cap a single tool result before it enters the LLM message array.
+
+    One uncapped web page / API response has produced multi-hundred-KB tool
+    results that get re-sent in every subsequent round of the tool loop —
+    blowing conversations past every model's context window (observed in
+    prod up to a 14M-token estimated prompt). The durability journal and
+    the persisted conversation keep the FULL result (bounded separately at
+    persistence); only the copy handed to the model is truncated here.
+    """
+    from application.core.settings import settings
+    from application.utils import num_tokens_from_string
+
+    max_tokens = int(getattr(settings, "TOOL_RESULT_MAX_TOKENS", 20000) or 0)
+    if max_tokens <= 0:
+        return tool_response
+    text = tool_response if isinstance(tool_response, str) else str(tool_response)
+    tokens = num_tokens_from_string(text)
+    if tokens <= max_tokens:
+        return tool_response
+    chars_per_token = len(text) / tokens if tokens > 0 else 4
+    target_chars = int(max_tokens * chars_per_token * 0.95)
+    keep = int(target_chars * 0.4)
+    marker = (
+        f"\n\n[... tool result truncated: {tokens:,} tokens exceeded the "
+        f"{max_tokens:,}-token per-result limit ...]\n\n"
+    )
+    if keep <= 0:
+        # ``text[-0:]`` would return the WHOLE string, not nothing.
+        return marker.strip()
+    logger.warning(
+        "Tool result truncated from %s to ~%s tokens before LLM handoff",
+        tokens,
+        max_tokens,
+    )
+    return text[:keep] + marker + text[-keep:]
+
+
 @dataclass
 class ToolCall:
     """Represents a tool/function call from the LLM."""
@@ -697,13 +735,20 @@ class LLMHandler(ABC):
                 logger.warning("Not enough queries to compress in-memory context")
                 return False, None
 
-            metadata = compression_service.compress_conversation(
-                conversation,
-                compress_up_to_index=compress_up_to,
-            )
+            try:
+                metadata = compression_service.compress_conversation(
+                    conversation,
+                    compress_up_to_index=compress_up_to,
+                )
+            except ValueError:
+                # compress_conversation raises when the summary is not
+                # smaller than the original (negative-savings guard). For
+                # the in-memory path that is not fatal — fall back to
+                # minimal pruning and keep the tool loop running.
+                metadata = None
 
             # If compression doesn't reduce tokens, fall back to minimal pruning
-            if (
+            if metadata is None or (
                 metadata.compressed_token_count
                 >= metadata.original_token_count
             ):
@@ -1014,6 +1059,9 @@ class LLMHandler(ABC):
                     except StopIteration as e:
                         tool_response, call_id = e.value
                         break
+                # The journal / persisted conversation received the full
+                # result inside the executor; the model gets a bounded copy.
+                tool_response = _bound_tool_response_for_llm(tool_response)
 
                 # Standard internal format: assistant message with tool_calls array
                 args_str = (
@@ -1236,8 +1284,58 @@ class LLMHandler(ABC):
         buffer = ""
         tool_calls = {}
         reasoning_buffer = ""
+        finish_reason = None
 
-        for chunk in self._iterate_stream(response):
+        # Consume the provider stream to exhaustion before acting on its
+        # finish reason. Acting mid-iteration (as this loop used to) left
+        # every tool round's generator abandoned until request teardown,
+        # where all their usage-decorator ``finally`` blocks fired at once
+        # and mis-billed each round with the shared ``_last_usage`` of the
+        # final round (duplicate token_usage rows). Exhausting the stream
+        # also delivers the terminal usage-only chunk (Chat Completions
+        # ``stream_options.include_usage``), which arrives *after* the
+        # finish_reason chunk — so provider-exact counts land before the
+        # decorator persists this round's row.
+        stream_iter = self._iterate_stream(response)
+        while True:
+            try:
+                chunk = next(stream_iter)
+            except StopIteration:
+                break
+            except Exception:
+                # A failure in the trailing frames (usage chunk, [DONE])
+                # after the round already finished must not fail — or
+                # fallback-restream — an answer the user has fully
+                # received. GeneratorExit/KeyboardInterrupt are
+                # BaseException and still propagate.
+                #
+                # The handler-local ``finish_reason`` only ever sees
+                # tool-call finishes (providers don't surface a parseable
+                # "stop" chunk — content arrives as bare strings), so the
+                # final answer round is covered by the LLM-level
+                # ``_stream_reached_finish`` flag instead — checked on the
+                # primary AND its fallback (whichever actually served the
+                # stream).
+                llm = getattr(agent, "llm", None)
+                provider_finished = bool(
+                    getattr(llm, "_stream_reached_finish", False)
+                    or getattr(
+                        getattr(llm, "_fallback_llm", None),
+                        "_stream_reached_finish",
+                        False,
+                    )
+                )
+                if finish_reason is not None or provider_finished:
+                    logger.warning(
+                        "Provider stream failed after finish "
+                        "(finish_reason=%s, provider_finished=%s); "
+                        "ignoring trailing-frame failure",
+                        finish_reason,
+                        provider_finished,
+                        exc_info=True,
+                    )
+                    break
+                raise
             if isinstance(chunk, dict) and chunk.get("type") == "thought":
                 reasoning_buffer += chunk.get("thought") or ""
                 yield chunk
@@ -1251,6 +1349,13 @@ class LLMHandler(ABC):
 
             if parsed.tool_calls:
                 for call in parsed.tool_calls:
+                    if call.index is None:
+                        # Providers like Google emit each parallel call as
+                        # a COMPLETE, index-less ToolCall per chunk. They
+                        # must never be merged into one another (dict
+                        # arguments would even raise on ``+=``).
+                        tool_calls[("complete", len(tool_calls))] = call
+                        continue
                     if call.index not in tool_calls:
                         tool_calls[call.index] = call
                     else:
@@ -1262,88 +1367,104 @@ class LLMHandler(ABC):
                         if call.arguments:
                             if existing.arguments is None:
                                 existing.arguments = call.arguments
-                            else:
+                            elif isinstance(existing.arguments, str) and isinstance(
+                                call.arguments, str
+                            ):
                                 existing.arguments += call.arguments
+                            else:
+                                # Complete (non-delta) payloads: latest wins.
+                                existing.arguments = call.arguments
                         # Preserve thought_signature for Google Gemini 3 models
                         if call.thought_signature:
                             existing.thought_signature = call.thought_signature
             if parsed.finish_reason == "tool_calls":
-                tool_handler_gen = self.handle_tool_calls(
-                    agent,
-                    list(tool_calls.values()),
-                    tools_dict,
-                    messages,
-                    reasoning_content=reasoning_buffer,
-                )
-                while True:
-                    try:
-                        yield next(tool_handler_gen)
-                    except StopIteration as e:
-                        messages, pending_actions = e.value
-                        break
-                tool_calls = {}
-                pause_reasoning = reasoning_buffer
-                reasoning_buffer = ""
-
-                # If tools need approval or client execution, pause the loop
-                if pending_actions:
-                    agent._pending_continuation = {
-                        "messages": messages,
-                        "pending_tool_calls": pending_actions,
-                        "tools_dict": tools_dict,
-                        "reasoning_content": pause_reasoning,
-                    }
-                    yield {
-                        "type": "tool_calls_pending",
-                        "data": {"pending_tool_calls": pending_actions},
-                    }
-                    return
-
-                next_iteration = _iteration + 1
-                cap_reached = next_iteration >= MAX_TOOL_ITERATIONS
-
-                # Check if context limit was reached during tool execution
-                if hasattr(agent, 'context_limit_reached') and agent.context_limit_reached:
-                    # Add system message warning about context limit
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "WARNING: Context window limit has been reached. "
-                            "Please provide a final response to the user without making additional tool calls. "
-                            "Summarize the work completed so far."
-                        )
-                    })
-                    logger.info("Context limit reached - instructing agent to wrap up")
-                elif cap_reached:
-                    logger.warning(
-                        "agent tool loop hit cap (%d); forcing finalize",
-                        MAX_TOOL_ITERATIONS,
-                    )
-                    messages.append(
-                        {"role": "system", "content": _FINALIZE_INSTRUCTION},
-                    )
-
-                # See note above on agent.model_id vs llm.model_id.
-                response = agent.llm.gen_stream(
-                    model=getattr(agent.llm, "model_id", None) or agent.model_id,
-                    messages=messages,
-                    tools=(
-                        None
-                        if cap_reached
-                        or getattr(agent, "context_limit_reached", False)
-                        else agent.tools
-                    ),
-                )
-                self.llm_calls.append(build_stack_data(agent.llm))
-
-                yield from self.handle_streaming(
-                    agent, response, tools_dict, messages,
-                    _iteration=next_iteration,
-                )
-                return
+                finish_reason = "tool_calls"
+                continue
             if parsed.content:
                 buffer += parsed.content
                 yield buffer
                 buffer = ""
-            if parsed.finish_reason == "stop":
-                return
+            if parsed.finish_reason == "stop" and finish_reason is None:
+                finish_reason = "stop"
+
+        if finish_reason != "tool_calls":
+            return
+
+        tool_handler_gen = self.handle_tool_calls(
+            agent,
+            list(tool_calls.values()),
+            tools_dict,
+            messages,
+            reasoning_content=reasoning_buffer,
+        )
+        while True:
+            try:
+                yield next(tool_handler_gen)
+            except StopIteration as e:
+                messages, pending_actions = e.value
+                break
+        pause_reasoning = reasoning_buffer
+
+        # If tools need approval or client execution, pause the loop
+        if pending_actions:
+            agent._pending_continuation = {
+                "messages": messages,
+                "pending_tool_calls": pending_actions,
+                "tools_dict": tools_dict,
+                "reasoning_content": pause_reasoning,
+            }
+            yield {
+                "type": "tool_calls_pending",
+                "data": {"pending_tool_calls": pending_actions},
+            }
+            return
+
+        next_iteration = _iteration + 1
+        cap_reached = next_iteration >= MAX_TOOL_ITERATIONS
+
+        # Check if context limit was reached during tool execution
+        if hasattr(agent, 'context_limit_reached') and agent.context_limit_reached:
+            # Add system message warning about context limit
+            messages.append({
+                "role": "system",
+                "content": (
+                    "WARNING: Context window limit has been reached. "
+                    "Please provide a final response to the user without making additional tool calls. "
+                    "Summarize the work completed so far."
+                )
+            })
+            logger.info("Context limit reached - instructing agent to wrap up")
+        elif cap_reached:
+            logger.warning(
+                "agent tool loop hit cap (%d); forcing finalize",
+                MAX_TOOL_ITERATIONS,
+            )
+            messages.append(
+                {"role": "system", "content": _FINALIZE_INSTRUCTION},
+            )
+
+        # Hard pre-send gate: tool results appended this round may have
+        # pushed the payload past the model's window — shrink or refuse
+        # BEFORE the usage decorators run (a rejected dispatch would still
+        # bill its full estimated prompt).
+        enforce = getattr(agent, "_enforce_context_window", None)
+        if callable(enforce):
+            messages = enforce(messages)
+
+        # See note above on agent.model_id vs llm.model_id.
+        response = agent.llm.gen_stream(
+            model=getattr(agent.llm, "model_id", None) or agent.model_id,
+            messages=messages,
+            tools=(
+                None
+                if cap_reached
+                or getattr(agent, "context_limit_reached", False)
+                else agent.tools
+            ),
+        )
+        self.llm_calls.append(build_stack_data(agent.llm))
+
+        yield from self.handle_streaming(
+            agent, response, tools_dict, messages,
+            _iteration=next_iteration,
+        )

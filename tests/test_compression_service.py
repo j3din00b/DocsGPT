@@ -210,6 +210,17 @@ class TestCompressionService:
         """
         compression_service.llm.gen.return_value = mock_summary
 
+        # Real compressions run near a context-window threshold, so the
+        # original is always far larger than the summary. Pad the fixture
+        # accordingly — a summary bigger than the original is rejected by
+        # the negative-savings guard.
+        sample_conversation["queries"][0]["response"] = (
+            "Python is a high-level programming language. " * 40
+        )
+        sample_conversation["queries"][1]["response"] = (
+            "You can install Python from python.org. " * 40
+        )
+
         # Compress first 2 queries
         result = compression_service.compress_conversation(
             conversation=sample_conversation, compress_up_to_index=1

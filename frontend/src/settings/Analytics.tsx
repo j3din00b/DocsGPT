@@ -336,7 +336,7 @@ export default function Analytics({ agentId }: AnalyticsProps) {
       ? `${Math.round((scheduleTotals.completed / scheduleRunsTotal) * 100)}%`
       : '—';
 
-  const statCards = [
+  const statCards: { label: string; value: string; hint?: string }[] = [
     {
       label: t('settings.analytics.stats.messages'),
       value: totalMessages.toLocaleString(),
@@ -344,6 +344,7 @@ export default function Analytics({ agentId }: AnalyticsProps) {
     {
       label: t('settings.analytics.stats.tokens'),
       value: totalTokens.toLocaleString(),
+      hint: t('settings.analytics.stats.tokensHint'),
     },
     {
       label: t('settings.analytics.stats.toolCalls'),
@@ -410,7 +411,8 @@ export default function Analytics({ agentId }: AnalyticsProps) {
         {statCards.map((card) => (
           <div
             key={card.label}
-            className="border-border dark:border-border rounded-2xl border px-6 py-5"
+            title={card.hint}
+            className={`border-border dark:border-border rounded-2xl border px-6 py-5${card.hint ? ' cursor-help' : ''}`}
           >
             <p className="text-muted-foreground text-sm">{card.label}</p>
             <p className="text-foreground dark:text-foreground mt-1 text-2xl font-bold">

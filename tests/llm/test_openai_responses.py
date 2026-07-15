@@ -126,15 +126,20 @@ def test_to_responses_input_reinjects_reasoning(monkeypatch):
         "encrypted_content": "enc", "summary": [],
     }
     llm._reasoning_for_calls = {"call_1": [reasoning_item]}
-    messages = [{
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "t", "arguments": "{}"},
-        }],
-    }]
+    # The call must be paired with its output — unpaired calls are dropped
+    # (the API rejects them with "No tool output found for function call").
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "t", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
     items = llm._to_responses_input(messages)
     # Reasoning item is emitted immediately before its function call.
     assert items[0] == reasoning_item
@@ -254,15 +259,19 @@ def test_export_import_replays_encrypted_reasoning_on_fresh_instance(monkeypatch
 
     second = _make_llm(monkeypatch, _responses_caps())
     assert second.import_responses_state(first.export_responses_state()) is True
-    items = second._to_responses_input([{
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": "call_1",
-            "type": "function",
-            "function": {"name": "run", "arguments": "{}"},
-        }],
-    }])
+    # Paired with its output: unpaired calls are dropped by the builder.
+    items = second._to_responses_input([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "run", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ])
     assert items[0] == reasoning
     assert items[1]["type"] == "function_call"
 
@@ -982,3 +991,117 @@ def test_builtin_default_models_stay_chat_completions():
     catalogs = load_model_yamls([BUILTIN_MODELS_DIR])
     models = {m.id: m for c in catalogs for m in c.models}
     assert models["gpt-5.4-mini"].capabilities.api_flavor == "chat_completions"
+
+
+@pytest.mark.unit
+def test_to_responses_input_drops_unpaired_function_call(monkeypatch):
+    """A function_call with no matching output must not reach the provider
+    (it 400s with "No tool output found for function call ...")."""
+    llm = _make_llm(monkeypatch, _responses_caps())
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_orphan",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                },
+                {
+                    "id": "call_ok",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_ok", "content": "result"},
+    ]
+    items = llm._to_responses_input(messages)
+    calls = [i for i in items if i.get("type") == "function_call"]
+    outputs = [i for i in items if i.get("type") == "function_call_output"]
+    assert [c["call_id"] for c in calls] == ["call_ok"]
+    assert [o["call_id"] for o in outputs] == ["call_ok"]
+
+
+@pytest.mark.unit
+def test_to_responses_input_drops_orphaned_output(monkeypatch):
+    """A function_call_output whose call was never emitted is dropped."""
+    llm = _make_llm(monkeypatch, _responses_caps())
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "call_ghost", "content": "result"},
+        {"role": "assistant", "content": "final"},
+    ]
+    items = llm._to_responses_input(messages)
+    assert not [i for i in items if i.get("type") == "function_call_output"]
+    assert items[-1]["role"] == "assistant"
+
+
+@pytest.mark.unit
+def test_to_responses_input_skips_reasoning_of_dropped_calls(monkeypatch):
+    """When every call on an assistant message is unpaired, its reasoning
+    items are suppressed too — a trailing reasoning item with no following
+    item is itself rejected by the Responses API."""
+    llm = _make_llm(monkeypatch, _responses_caps())
+    llm._reasoning_for_calls = {
+        "call_orphan": [{"type": "reasoning", "id": "rs_1", "summary": []}]
+    }
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "responses_reasoning_items": [
+                {"type": "reasoning", "id": "rs_msg", "summary": []}
+            ],
+            "tool_calls": [{
+                "id": "call_orphan",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }],
+        },
+    ]
+    items = llm._to_responses_input(messages)
+    assert not [i for i in items if i.get("type") == "reasoning"]
+    assert not [i for i in items if i.get("type") == "function_call"]
+
+
+@pytest.mark.unit
+def test_to_responses_input_chained_keeps_bare_tool_output(monkeypatch):
+    """Store-mode chaining (previous_response_id) deliberately sends a bare
+    function_call_output whose call lives server-side — the pairing guard
+    must not drop it (that would 400 every chained tool round)."""
+    llm = _make_llm(monkeypatch, _responses_caps())
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "tool", "tool_call_id": "call_server_side", "content": "result"},
+    ]
+    items = llm._to_responses_input(messages, chained=True)
+    outputs = [i for i in items if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outputs] == ["call_server_side"]
+
+
+@pytest.mark.unit
+def test_to_responses_input_drops_out_of_order_pair_entirely(monkeypatch):
+    """An output that precedes its call is malformed history: BOTH sides
+    are dropped (keeping the call alone would produce the unpaired-call
+    400 the guard exists to prevent)."""
+    llm = _make_llm(monkeypatch, _responses_caps())
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "tool_call_id": "call_x", "content": "early result"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_x",
+                "type": "function",
+                "function": {"name": "t", "arguments": "{}"},
+            }],
+        },
+    ]
+    items = llm._to_responses_input(messages)
+    assert not [i for i in items if i.get("type") == "function_call"]
+    assert not [i for i in items if i.get("type") == "function_call_output"]

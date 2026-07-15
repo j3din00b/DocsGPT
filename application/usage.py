@@ -155,10 +155,23 @@ def _prefer_provider_usage(llm: Any, call_usage: Dict[str, int]) -> Dict[str, in
     reported = getattr(llm, "_last_usage", None)
     if not isinstance(reported, dict):
         return call_usage
+    # ``_last_usage`` is shared instance state overwritten by every call on
+    # this LLM. Each reported usage may be billed to exactly ONE call: the
+    # provider clears ``_last_usage_claimed`` when it records fresh usage,
+    # and the first decorator ``finally`` to read it claims it. Without
+    # this, a generator finalized late (abandoned round, GC) would adopt a
+    # *different* call's provider counts. ``_last_usage`` itself is left in
+    # place for read-only consumers (client-facing usage metadata).
+    if getattr(llm, "_last_usage_claimed", False):
+        return call_usage
     prompt = reported.get("prompt_tokens")
     completion = reported.get("completion_tokens")
     if prompt is None or completion is None:
         return call_usage
+    try:
+        llm._last_usage_claimed = True
+    except AttributeError:
+        pass
     return {
         "prompt_tokens": int(prompt or 0),
         "generated_tokens": int(completion or 0),

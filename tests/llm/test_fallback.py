@@ -811,3 +811,124 @@ class TestRespondingProviderTracking:
         primary = _Google(fail_at=0, backup_models=["backup-model"])
         primary.gen(**CALL_ARGS)
         assert primary._responding_provider == "openai"
+
+
+# Tests — fallback payload size gate
+
+
+@pytest.mark.integration
+class TestFallbackPayloadSizeGate:
+    """A payload that cannot fit the fallback's context window must skip the
+    fallback attempt (it would be a guaranteed second rejection) and
+    propagate the primary's error instead."""
+
+    def _primary_with_backup(self, patch_model_utils, backup):
+        patch_model_utils(
+            get_provider=lambda mid, **_kw: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        return FakeLLM(fail_at=0, backup_models=["backup-model"])
+
+    BIG_ARGS = dict(
+        model="test-model",
+        messages=[{"role": "user", "content": "word " * 300}],
+    )
+
+    def test_gen_skips_fallback_when_payload_cannot_fit(
+        self, monkeypatch, patch_model_utils
+    ):
+        backup = FakeLLM(responses=["backup ok"])
+        primary = self._primary_with_backup(patch_model_utils, backup)
+        monkeypatch.setattr(
+            "application.core.model_utils.get_token_limit",
+            lambda mid, user_id=None: 10,
+        )
+        with pytest.raises(RuntimeError, match="primary model unavailable"):
+            primary.gen(**self.BIG_ARGS)
+        assert backup.gen_called is False
+
+    def test_stream_skips_fallback_when_payload_cannot_fit(
+        self, monkeypatch, patch_model_utils
+    ):
+        backup = FakeLLM(stream_chunks=["backup chunk"])
+        primary = self._primary_with_backup(patch_model_utils, backup)
+        monkeypatch.setattr(
+            "application.core.model_utils.get_token_limit",
+            lambda mid, user_id=None: 10,
+        )
+        with pytest.raises(RuntimeError, match="mid-stream failure"):
+            list(primary.gen_stream(**self.BIG_ARGS))
+        assert backup.gen_stream_called is False
+
+    def test_fallback_proceeds_when_payload_fits(
+        self, monkeypatch, patch_model_utils
+    ):
+        backup = FakeLLM(responses=["backup ok"])
+        primary = self._primary_with_backup(patch_model_utils, backup)
+        monkeypatch.setattr(
+            "application.core.model_utils.get_token_limit",
+            lambda mid, user_id=None: 100000,
+        )
+        assert primary.gen(**self.BIG_ARGS) == "backup ok"
+        assert backup.gen_called is True
+
+    def test_estimation_failure_never_blocks_fallback(
+        self, monkeypatch, patch_model_utils
+    ):
+        backup = FakeLLM(responses=["backup ok"])
+        primary = self._primary_with_backup(patch_model_utils, backup)
+
+        def boom(*a, **kw):
+            raise ValueError("estimator broken")
+
+        monkeypatch.setattr("application.usage._count_prompt_tokens", boom)
+        assert primary.gen(**self.BIG_ARGS) == "backup ok"
+        assert backup.gen_called is True
+
+
+# Tests — no fallback restream after the primary delivered its finish signal
+
+
+@pytest.mark.integration
+class TestNoRestreamAfterFinish:
+    """A trailing-frame failure (between the finish chunk and stream end)
+    must NOT restream the already-delivered answer from the fallback."""
+
+    class FinishThenFailLLM(FakeLLM):
+        def _raw_gen_stream(self, baseself, model, messages, stream, tools=None, **kwargs):
+            self.gen_stream_called = True
+            yield "the full answer"
+            # Provider marked the stream finished (finish_reason arrived)...
+            self._stream_reached_finish = True
+            # ...then the trailing usage/[DONE] frame dies.
+            raise RuntimeError("connection reset in trailing frame")
+
+    def test_trailing_frame_failure_skips_fallback(self, patch_model_utils):
+        backup = FakeLLM(stream_chunks=["fallback chunk"])
+        patch_model_utils(
+            get_provider=lambda mid, **_kw: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = self.FinishThenFailLLM(backup_models=["backup-model"])
+
+        received = []
+        with pytest.raises(RuntimeError, match="trailing frame"):
+            for chunk in primary.gen_stream(**CALL_ARGS):
+                received.append(chunk)
+
+        assert received == ["the full answer"]
+        assert backup.gen_stream_called is False
+
+    def test_pre_finish_failure_still_falls_back(self, patch_model_utils):
+        backup = FakeLLM(stream_chunks=["fallback chunk"])
+        patch_model_utils(
+            get_provider=lambda mid, **_kw: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = FakeLLM(fail_at=0, backup_models=["backup-model"])
+        out = list(primary.gen_stream(**CALL_ARGS))
+        assert out == ["fallback chunk"]
+        assert backup.gen_stream_called is True

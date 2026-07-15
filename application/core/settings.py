@@ -272,6 +272,8 @@ class Settings(BaseSettings):
     COMPRESSION_MODEL_OVERRIDE: Optional[str] = None  # Use different model for compression
     COMPRESSION_PROMPT_VERSION: str = "v1.0"  # Track prompt iterations
     COMPRESSION_MAX_HISTORY_POINTS: int = 3  # Keep only last N compression points to prevent DB bloat
+    COMPRESSION_RECENT_FIELD_MAX_TOKENS: int = 8000  # Per-field cap on the verbatim tail kept after a compression point (0 disables)
+    TOOL_RESULT_MAX_TOKENS: int = 20000  # Cap on a single tool result entering the LLM context (0 disables); journal/DB keep the full result
 
     # Internal SSE push channel (notifications + durable replay journal)
     # Master switch — when False, /api/events emits a "push_disabled" comment

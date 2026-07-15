@@ -14,7 +14,10 @@ from application.core.json_schema_utils import (
     normalize_json_schema_payload,
 )
 from application.core.settings import settings
-from application.llm.handlers.base import ToolCall
+from application.llm.handlers.base import (
+    ToolCall,
+    _bound_tool_response_for_llm,
+)
 from application.llm.handlers.handler_creator import LLMHandlerCreator
 from application.llm.llm_creator import LLMCreator
 from application.logging import build_stack_data, log_activity, LogContext
@@ -316,6 +319,9 @@ class BaseAgent(ABC):
                     except StopIteration as e:
                         tool_response, _ = e.value
                         break
+                # Same per-result cap as the in-loop path
+                # (handle_tool_calls); the journal keeps the full result.
+                tool_response = _bound_tool_response_for_llm(tool_response)
                 messages.append(
                     self.llm_handler.create_tool_message(tc, tool_response)
                 )
@@ -355,7 +361,11 @@ class BaseAgent(ABC):
                     id=call_id, name=pending["name"], arguments=args
                 )
                 messages.append(
-                    self.llm_handler.create_tool_message(tc, result_str)
+                    self.llm_handler.create_tool_message(
+                        # Client-supplied results get the same per-result
+                        # cap as server-side tool executions.
+                        tc, _bound_tool_response_for_llm(result_str)
+                    )
                 )
                 yield {
                     "type": "tool_call",
@@ -483,6 +493,10 @@ class BaseAgent(ABC):
         end_chars = int(target_chars * 0.4)
 
         truncation_marker = "\n\n[... content truncated to fit context limit ...]\n\n"
+        if end_chars <= 0:
+            # ``text[-0:]`` returns the WHOLE string — a "truncation" that
+            # grows the text by the marker length.
+            return truncation_marker.strip()
         truncated = text[:start_chars] + truncation_marker + text[-end_chars:]
 
         logger.info(
@@ -490,6 +504,53 @@ class BaseAgent(ABC):
             f"(removed middle section)"
         )
         return truncated
+
+    def _enforce_context_window(self, messages: List[Dict]) -> List[Dict]:
+        """Hard pre-send gate: never dispatch a payload that cannot fit.
+
+        ``_validate_context_size`` only logs; an over-window payload used to
+        go straight to the provider, get rejected (context-length 400 /
+        capacity cap), take the fallback down with it, and still record its
+        full estimated prompt as usage. Called immediately before an LLM
+        dispatch: progressively middle-truncates the largest tool results
+        (the usual culprit) and raises when even that cannot fit — BEFORE
+        the usage decorators run, so a hopeless payload costs nothing.
+        """
+        from application.core.model_utils import get_token_limit
+        from application.utils import num_tokens_from_string
+
+        context_limit = get_token_limit(
+            self.model_id, user_id=self.model_user_id or self.user
+        )
+        current_tokens = self._calculate_current_context_tokens(messages)
+        if current_tokens < context_limit:
+            return messages
+
+        logger.warning(
+            f"Context ({current_tokens:,} tokens) exceeds the model's window "
+            f"({context_limit:,}). Shrinking tool results before dispatch."
+        )
+        for per_message_cap in (8000, 2000, 500):
+            for message in messages:
+                content = message.get("content")
+                if (
+                    message.get("role") == "tool"
+                    and isinstance(content, str)
+                    and num_tokens_from_string(content) > per_message_cap
+                ):
+                    message["content"] = self._truncate_text_middle(
+                        content, per_message_cap
+                    )
+            current_tokens = self._calculate_current_context_tokens(messages)
+            if current_tokens < context_limit:
+                return messages
+
+        raise ValueError(
+            f"Conversation context ({current_tokens:,} tokens) exceeds the "
+            f"model's context window ({context_limit:,} tokens) even after "
+            f"shrinking tool results. Start a new conversation or remove "
+            f"large attachments."
+        )
 
     # ---- Message building ----
 
@@ -695,6 +756,9 @@ class BaseAgent(ABC):
         preserve_responses_state: bool = False,
     ):
         self._validate_context_size(messages)
+        # Hard gate: refuse/shrink instead of dispatching a payload the
+        # provider is guaranteed to reject (see _enforce_context_window).
+        messages = self._enforce_context_window(messages)
 
         if not preserve_responses_state:
             starter = getattr(self.llm, "start_responses_turn", None)
