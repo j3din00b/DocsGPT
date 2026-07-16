@@ -562,3 +562,67 @@ class TestFaissStoreAssertEmbeddingDimensionsMatch:
         # Should not raise since embedding name is not the huggingface one
         store = FaissStore(source_id="t", embeddings_key="k", docs_init=[Mock()])
         assert store is not None
+
+
+@pytest.mark.unit
+class TestFaissSearchWithScores:
+    @staticmethod
+    def _build(mock_faiss, mock_get_emb, mock_settings, mock_storage_creator, ds):
+        mock_settings.EMBEDDINGS_NAME = "test_model"
+        mock_get_emb.return_value = Mock(dimension=3)
+        mock_faiss.from_documents.return_value = ds
+        mock_storage_creator.get_storage.return_value = Mock()
+
+        from application.vectorstore.faiss import FaissStore
+
+        return FaissStore(source_id="t", embeddings_key="k", docs_init=[Mock()])
+
+    @patch("application.vectorstore.faiss.StorageCreator")
+    @patch("application.vectorstore.faiss.FAISS")
+    @patch.object(
+        __import__("application.vectorstore.base", fromlist=["BaseVectorStore"]).BaseVectorStore,
+        "_get_embeddings",
+    )
+    @patch("application.vectorstore.faiss.settings")
+    def test_reports_l2_distance_and_drops_threshold(
+        self, mock_settings, mock_get_emb, mock_faiss, mock_storage_creator
+    ):
+        doc = Mock(page_content="text1", metadata={"source": "a"})
+        ds = Mock(index=Mock(d=3))
+        ds.similarity_search_with_score.return_value = [(doc, 0.42)]
+        store = self._build(
+            mock_faiss, mock_get_emb, mock_settings, mock_storage_creator, ds
+        )
+
+        results = store.search_with_scores("query", k=5, score_threshold=0.9)
+
+        # LangChain's FAISS ranks by L2 distance, NOT cosine similarity — the
+        # label must say so, and score_threshold must be dropped (FAISS has no
+        # such knob and would crash on it).
+        assert store.score_kind == "l2_distance"
+        ds.similarity_search_with_score.assert_called_once_with("query", k=5)
+        assert results == [(doc, 0.42)]
+
+    @patch("application.vectorstore.faiss.StorageCreator")
+    @patch("application.vectorstore.faiss.FAISS")
+    @patch.object(
+        __import__("application.vectorstore.base", fromlist=["BaseVectorStore"]).BaseVectorStore,
+        "_get_embeddings",
+    )
+    @patch("application.vectorstore.faiss.settings")
+    def test_does_not_mutate_docstore_metadata(
+        self, mock_settings, mock_get_emb, mock_faiss, mock_storage_creator
+    ):
+        # similarity_search_with_score hands back the LIVE docstore Documents;
+        # writing a score into their metadata would pollute the in-memory index
+        # and could be persisted back to storage by a later add_chunk.
+        doc = Mock(page_content="text1", metadata={"source": "a"})
+        ds = Mock(index=Mock(d=3))
+        ds.similarity_search_with_score.return_value = [(doc, 0.42)]
+        store = self._build(
+            mock_faiss, mock_get_emb, mock_settings, mock_storage_creator, ds
+        )
+
+        store.search_with_scores("query", k=1)
+
+        assert doc.metadata == {"source": "a"}

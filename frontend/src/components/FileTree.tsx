@@ -26,12 +26,15 @@ interface FileTreeProps {
   docId: string;
   sourceName: string;
   onBackToDocuments: () => void;
+  /** Extra header control, rendered left of "Add file". */
+  headerAction?: React.ReactNode;
 }
 
 const FileTree: React.FC<FileTreeProps> = ({
   docId,
   sourceName,
   onBackToDocuments,
+  headerAction,
 }) => {
   const { t } = useTranslation();
   const token = useSelector(selectToken);
@@ -231,15 +234,22 @@ const FileTree: React.FC<FileTreeProps> = ({
       : t('settings.sources.deletingTitle')
     : null;
 
-  const topRightAction = !isProcessing ? (
-    <button
-      onClick={handleAddFile}
-      className="bg-primary hover:bg-primary/90 flex h-[38px] min-w-[108px] items-center justify-center rounded-full px-4 text-sm font-medium whitespace-nowrap text-white"
-      title={t('settings.sources.addFile')}
-    >
-      {t('settings.sources.addFile')}
-    </button>
-  ) : null;
+  // headerAction stays visible while an upload/delete is in flight — only the
+  // Add file button is suppressed then.
+  const topRightAction = (
+    <>
+      {headerAction}
+      {!isProcessing ? (
+        <button
+          onClick={handleAddFile}
+          className="bg-primary hover:bg-primary/90 flex h-[38px] min-w-[108px] items-center justify-center rounded-full px-4 text-sm font-medium whitespace-nowrap text-white"
+          title={t('settings.sources.addFile')}
+        >
+          {t('settings.sources.addFile')}
+        </button>
+      ) : null}
+    </>
+  );
 
   const extraContent = (
     <ConfirmationModal

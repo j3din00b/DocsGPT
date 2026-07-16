@@ -108,6 +108,8 @@ interface ChunksProps {
   displayPath?: string;
   onFileSearch?: (query: string) => SearchResult[];
   onFileSelect?: (path: string) => void;
+  /** Extra header control, rendered left of the chunk actions. */
+  headerAction?: React.ReactNode;
 }
 
 const Chunks: React.FC<ChunksProps> = ({
@@ -118,6 +120,7 @@ const Chunks: React.FC<ChunksProps> = ({
   displayPath,
   onFileSearch,
   onFileSelect,
+  headerAction,
 }) => {
   const [fileSearchQuery, setFileSearchQuery] = useState('');
   const [fileSearchResults, setFileSearchResults] = useState<SearchResult[]>(
@@ -349,6 +352,7 @@ const Chunks: React.FC<ChunksProps> = ({
         </div>
 
         <div className="mt-2 flex w-full flex-row flex-nowrap items-center justify-end gap-2 overflow-x-auto sm:mt-0 sm:w-auto">
+          {headerAction}
           {editingChunk ? (
             !isEditing ? (
               <>

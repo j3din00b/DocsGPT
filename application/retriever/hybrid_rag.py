@@ -25,13 +25,14 @@ def _doc_key(doc):
     return (source, content)
 
 
-def reciprocal_rank_fusion(vector_hits, keyword_hits, k=RRF_K):
-    """Fuse two ranked hit lists into one by Reciprocal Rank Fusion.
+def fuse_with_scores(vector_hits, keyword_hits, k=RRF_K):
+    """Fuse two ranked hit lists by RRF, keeping each hit's fused score.
 
     Each list contributes ``1 / (k + rank)`` per document (rank 0-based);
-    documents are returned ordered by summed score, highest first. A document
-    present in only one list is ranked solely on that list's contribution, so
-    an empty ``keyword_hits`` yields exactly the vector ordering.
+    documents are returned as ``(doc, fused_score)`` ordered by score, highest
+    first. A document present in only one list is ranked solely on that list's
+    contribution, so an empty ``keyword_hits`` yields exactly the vector
+    ordering.
     """
     scores = {}
     docs = {}
@@ -42,11 +43,17 @@ def reciprocal_rank_fusion(vector_hits, keyword_hits, k=RRF_K):
             if key not in docs:
                 docs[key] = doc
     ordered = sorted(docs.keys(), key=lambda key: scores[key], reverse=True)
-    return [docs[key] for key in ordered]
+    return [(docs[key], scores[key]) for key in ordered]
 
 
 class HybridRetriever(ClassicRAG):
     """ClassicRAG variant that fuses vector + keyword search with RRF."""
+
+    def _score_kind(self, docsearch):
+        """RRF scores rank hits against each other, not against a similarity
+        cutoff — they are not comparable to the store's cosine scores, so they
+        carry their own label."""
+        return "rrf"
 
     def _fetch_candidates(self, docsearch, question, src_k, score_threshold):
         """Return RRF-fused vector+keyword hits for one vector store.
@@ -59,4 +66,7 @@ class HybridRetriever(ClassicRAG):
         candidate_k = min(max(src_k * 2, 20), 500)
         vector_hits = docsearch.search(question, k=candidate_k)
         keyword_hits = docsearch.keyword_search(question, k=candidate_k)
-        return reciprocal_rank_fusion(vector_hits, keyword_hits)
+        fused = fuse_with_scores(vector_hits, keyword_hits)
+        if self.include_scores:
+            return fused
+        return [doc for doc, _ in fused]

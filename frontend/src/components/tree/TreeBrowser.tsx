@@ -633,7 +633,7 @@ const TreeBrowser: React.FC<TreeBrowserProps> = ({
       />
 
       {searchQuery && (
-        <div className="border-border bg-card dark:border-border dark:bg-card absolute top-full right-0 left-0 z-10 max-h-[calc(100vh-200px)] w-full overflow-hidden rounded-b-xl border border-t-0 shadow-lg transition-all duration-200">
+        <div className="border-border bg-card dark:border-border dark:bg-card absolute top-full right-0 left-0 z-20 max-h-[calc(100vh-200px)] w-full overflow-hidden rounded-b-xl border border-t-0 shadow-lg transition-all duration-200">
           <div className="max-h-[calc(100vh-200px)] overflow-x-hidden overflow-y-auto overscroll-contain">
             {searchResults.length === 0 ? (
               <div className="text-muted-foreground py-2 text-center text-sm">
@@ -744,7 +744,7 @@ const TreeBrowser: React.FC<TreeBrowserProps> = ({
           </div>
         </div>
       ) : (
-        <div className="flex w-full max-w-full flex-col overflow-hidden">
+        <div className="flex w-full max-w-full flex-col overflow-x-clip">
           <div className="mb-2">{renderPathNavigation()}</div>
 
           <div className="w-full">

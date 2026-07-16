@@ -403,3 +403,38 @@ class TestPGVectorStoreConnection:
 
         store.__del__()
         mock_conn.close.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPGVectorSearchWithScores:
+    def test_reports_cosine_similarity(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("close", {"source": "a.txt"}, 0.10),
+            ("far", {"source": "b.txt"}, 0.40),
+        ]
+
+        results = store.search_with_scores("query", k=2)
+
+        assert store.score_kind == "cosine_similarity"
+        assert [doc.page_content for doc, _ in results] == ["close", "far"]
+        # similarity = 1 - cosine distance, the quantity score_threshold uses.
+        assert results[0][1] == pytest.approx(0.90)
+        assert results[1][1] == pytest.approx(0.60)
+
+    def test_honours_score_threshold(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("close", {}, 0.10),  # sim 0.90 → kept
+            ("far", {}, 0.40),  # sim 0.60 → dropped
+        ]
+
+        results = store.search_with_scores("query", k=5, score_threshold=0.85)
+
+        assert [doc.page_content for doc, _ in results] == ["close"]
+
+    def test_returns_empty_on_error(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("connection lost")
+
+        assert store.search_with_scores("query") == []

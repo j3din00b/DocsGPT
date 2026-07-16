@@ -56,6 +56,7 @@ const endpoints = {
     SYNC_SOURCE: '/api/sync_source',
     REINGEST_SOURCE: '/api/sources/reingest',
     SOURCE_CONFIG: (id: string) => `/api/sources/${id}/config`,
+    SOURCE_SEARCH: (id: string) => `/api/sources/${id}/search`,
     CREATE_WIKI: '/api/sources/wiki',
     CONVERT_TO_WIKI: (id: string) => `/api/sources/${id}/wiki/convert`,
     ENABLE_GRAPHRAG: (id: string) => `/api/sources/${id}/graphrag/enable`,

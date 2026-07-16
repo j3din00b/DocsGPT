@@ -56,6 +56,7 @@ class PreScreenStage:
         agent_id: Optional[str] = None,
         model_user_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        usage_source: str = "rag_prescreen",
     ):
         """Build the stage.
 
@@ -68,6 +69,7 @@ class PreScreenStage:
             decoded_token: Caller identity for BYOM resolution.
             agent_id: Agent context for BYOM resolution.
             model_user_id: BYOM-resolution scope for shared-agent dispatch.
+            usage_source: Cost-attribution tag for the screening calls.
         """
         self.config = config
         self.llm_name = llm_name
@@ -78,6 +80,7 @@ class PreScreenStage:
         self.agent_id = agent_id
         self.model_user_id = model_user_id
         self.request_id = request_id
+        self.usage_source = usage_source
 
     def _resolve_model(self) -> Optional[str]:
         """Use the configured model, else fall back to the request model."""
@@ -96,7 +99,7 @@ class PreScreenStage:
         )
         # Tag rows so the screening calls land as a distinct cost source, and
         # stamp the originating request so the rows correlate to it.
-        llm._token_usage_source = "rag_prescreen"
+        llm._token_usage_source = self.usage_source
         llm._request_id = self.request_id
         return llm
 
@@ -188,6 +191,7 @@ def build_prescreen_stages(
     agent_id: Optional[str] = None,
     model_user_id: Optional[str] = None,
     request_id: Optional[str] = None,
+    usage_source: str = "rag_prescreen",
 ) -> List[Stage]:
     """Build prescreen stages from a group's per-source retrieval configs.
 
@@ -222,6 +226,7 @@ def build_prescreen_stages(
                 agent_id=agent_id,
                 model_user_id=model_user_id,
                 request_id=request_id,
+                usage_source=usage_source,
             )
         )
     return stages

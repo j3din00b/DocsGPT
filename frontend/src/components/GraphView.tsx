@@ -26,6 +26,8 @@ interface GraphViewProps {
   docId: string;
   sourceName: string;
   onBackToDocuments: () => void;
+  /** Extra header control, right-aligned in the title row. */
+  headerAction?: React.ReactNode;
 }
 
 const GRAPH_LIMIT = 100;
@@ -35,6 +37,7 @@ const GraphView: React.FC<GraphViewProps> = ({
   docId,
   sourceName,
   onBackToDocuments,
+  headerAction,
 }) => {
   const { t } = useTranslation();
   const token = useSelector(selectToken);
@@ -169,6 +172,7 @@ const GraphView: React.FC<GraphViewProps> = ({
         <span className="text-primary font-semibold wrap-break-word">
           {sourceName}
         </span>
+        {headerAction ? <div className="ml-auto">{headerAction}</div> : null}
       </div>
 
       <div className="bg-muted/60 text-muted-foreground dark:bg-accent/40 mb-4 flex items-start gap-2 rounded-xl px-4 py-3 text-xs">

@@ -102,6 +102,12 @@ const userService = {
     token: string | null,
   ): Promise<Response> =>
     apiClient.patch(endpoints.USER.SOURCE_CONFIG(sourceId), config, token),
+  testSourceRetrieval: (
+    sourceId: string,
+    data: { query: string; retrieval?: any },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(endpoints.USER.SOURCE_SEARCH(sourceId), data, token),
   createWiki: (
     data: { name: string; initial_content?: string },
     token: string | null,

@@ -83,11 +83,25 @@ class FaissStore(BaseVectorStore):
 
         self.assert_embedding_dimensions(self.embeddings)
 
+    # LangChain's FAISS wrapper ranks by L2 distance (lower is better), not by
+    # a cosine similarity — so the number here is NOT comparable to the
+    # ``score_threshold`` the other stores honour, and must not be shown as one.
+    score_kind = "l2_distance"
+
     def search(self, *args, **kwargs):
         # FAISS has no relevance-threshold knob; drop it so the per-source
         # score_threshold is safely ignored rather than crashing the forward.
         kwargs.pop("score_threshold", None)
         return self.docsearch.similarity_search(*args, **kwargs)
+
+    def search_with_scores(self, *args, **kwargs):
+        """Same search as :meth:`search`, pairing each hit with its L2 distance."""
+        kwargs.pop("score_threshold", None)
+        results = self.docsearch.similarity_search_with_score(*args, **kwargs)
+        # The Documents come straight from the live in-memory docstore — return
+        # them untouched (the score rides alongside, never in their metadata) so
+        # the index can't be polluted and later persisted back to storage.
+        return [(doc, float(score)) for doc, score in results]
 
     def add_texts(self, *args, **kwargs):
         return self.docsearch.add_texts(*args, **kwargs)

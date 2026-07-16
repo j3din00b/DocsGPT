@@ -384,3 +384,34 @@ class TestBaseVectorStore:
         result = store._get_embeddings("some_custom_embedding")
         assert result is mock_emb
         mock_get_instance.assert_called_with("some_custom_embedding")
+
+
+@pytest.mark.unit
+class TestSearchWithScoresDefault:
+    def test_pairs_hits_with_none(self):
+        """A store that reports no score still satisfies the contract, so the
+        retriever never has to special-case it."""
+        from application.vectorstore.base import BaseVectorStore
+
+        class _Store(BaseVectorStore):
+            def search(self, question, k=2, *args, **kwargs):
+                return ["a", "b"]
+
+            def add_texts(self, texts, metadatas=None, *args, **kwargs):
+                return []
+
+        store = _Store()
+        assert store.score_kind is None
+        assert store.search_with_scores("q", k=2) == [("a", None), ("b", None)]
+
+    def test_handles_store_returning_none(self):
+        from application.vectorstore.base import BaseVectorStore
+
+        class _Store(BaseVectorStore):
+            def search(self, question, k=2, *args, **kwargs):
+                return None
+
+            def add_texts(self, texts, metadatas=None, *args, **kwargs):
+                return []
+
+        assert _Store().search_with_scores("q") == []

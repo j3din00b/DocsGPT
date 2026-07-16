@@ -416,3 +416,36 @@ class TestGetChunkTexts:
         store, cursor = self._store_with_mock_conn()
         assert store.get_chunk_texts("sid", []) == {}
         cursor.execute.assert_not_called()
+
+
+class TestGraphRAGTopK:
+    """A prescreen source elsewhere in the group inflates ``chunks``; a graph
+    source must still contribute only its own top-k."""
+
+    @patch("application.retriever.graph_rag.num_tokens_from_string", return_value=10)
+    @patch("application.retriever.graph_rag.GraphStore")
+    @patch("application.retriever.graph_rag.graphrag_available", return_value=True)
+    def test_inflated_chunks_do_not_raise_a_graph_source_top_k(
+        self, _avail, mock_store_cls, _tok, _patch_llm_creator, _patch_embed
+    ):
+        nodes = [{"id": f"n{i}", "doc_freq": 1} for i in range(1, 5)]
+        edges = [
+            {"src_node_id": "n1", "dst_node_id": "n2", "weight": 1.0},
+            {"src_node_id": "n2", "dst_node_id": "n3", "weight": 1.0},
+            {"src_node_id": "n3", "dst_node_id": "n4", "weight": 1.0},
+        ]
+        node_chunks = {f"n{i}": [f"c{i}"] for i in range(1, 5)}
+        chunk_texts = {f"c{i}": f"text {i}" for i in range(1, 5)}
+        seed_rows = [{"id": "n1", "distance": 0.0}]
+        mock_store_cls.return_value = _store_with_graph(
+            nodes, edges, node_chunks, chunk_texts, seed_rows
+        )
+
+        # What the Dispatcher does when another source in the group prescreens
+        # at candidate_k=40: chunks inflated to 40, base_chunks left at the real 2.
+        rag = _make_retriever(chunks=40)
+        rag.base_chunks = 2
+
+        docs = rag._get_data()
+
+        assert len(docs) == 2
