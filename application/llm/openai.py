@@ -819,7 +819,8 @@ class OpenAILLM(BaseLLM):
             else None
         )
         if effort:
-            params["reasoning"] = {"effort": effort, "summary": "auto"}
+            summary = settings.OPENAI_REASONING_SUMMARY or "auto"
+            params["reasoning"] = {"effort": effort, "summary": summary}
 
         if response_format:
             fmt = self._responses_text_format(response_format)

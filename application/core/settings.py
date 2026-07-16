@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -249,6 +249,13 @@ class Settings(BaseSettings):
     # reasoning items instead.
     OPENAI_RESPONSES_STORE: bool = False
 
+    # Reasoning-summary verbosity requested on the Responses path when a
+    # model has a reasoning_effort configured ("auto" | "concise" |
+    # "detailed"). Some models/gateways reject "detailed", so the default
+    # stays "auto"; stream liveness is handled by the wire-level SSE
+    # keepalive (see SSE_KEEPALIVE_SECONDS) rather than summary verbosity.
+    OPENAI_REASONING_SUMMARY: str = "auto"
+
     # OpenAI-compatible clients can identify a logical chat with session
     # headers even though chat-completions itself has no conversation field.
     V1_SESSION_TTL_SECONDS: int = 24 * 60 * 60
@@ -288,8 +295,10 @@ class Settings(BaseSettings):
     GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: int = 30
     WSGI_THREADPOOL_WORKERS: int = 96
     # SSE keepalive comment cadence. Must sit under Cloudflare's 100s idle
-    # close and iOS Safari's ~60s — 15s gives generous headroom.
-    SSE_KEEPALIVE_SECONDS: int = 15
+    # close and iOS Safari's ~60s — 15s gives generous headroom. ge=1
+    # because a zero/negative interval would busy-loop or crash the
+    # keepalive wrapper's queue timeout.
+    SSE_KEEPALIVE_SECONDS: int = Field(default=15, ge=1)
     # Cap on simultaneous SSE connections per user. Each connection holds
     # one WSGI thread (32 per gunicorn worker) and one Redis pub/sub
     # connection. 8 covers normal multi-tab use without letting one user

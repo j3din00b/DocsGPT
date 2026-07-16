@@ -28,6 +28,7 @@ def _make_llm(monkeypatch, capabilities=None, store_responses=False):
             OPENAI_BASE_URL="",
             AZURE_DEPLOYMENT_NAME="dep",
             OPENAI_RESPONSES_STORE=store_responses,
+            OPENAI_REASONING_SUMMARY="auto",
         ),
     )
     from application.llm.openai import OpenAILLM
@@ -388,10 +389,28 @@ def test_build_responses_params_stateless(monkeypatch):
     assert params["model"] == "gpt-5.5"
     assert params["stream"] is True
     assert params["max_output_tokens"] == 256
+    # Summary verbosity comes from settings.OPENAI_REASONING_SUMMARY
+    # ("auto" unless overridden).
     assert params["reasoning"] == {"effort": "high", "summary": "auto"}
     assert params["store"] is False
     assert params["include"] == ["reasoning.encrypted_content"]
     assert "previous_response_id" not in params
+
+
+@pytest.mark.unit
+def test_build_responses_params_summary_override(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps(reasoning_effort="high"))
+    from application.llm import openai as openai_mod
+
+    monkeypatch.setattr(
+        openai_mod.settings, "OPENAI_REASONING_SUMMARY", "detailed", raising=False
+    )
+    params = llm._build_responses_params(
+        "gpt-5.5", [{"role": "user", "content": []}], tools=None,
+        response_format=None, previous_response_id=None, stream=True,
+        kwargs={},
+    )
+    assert params["reasoning"] == {"effort": "high", "summary": "detailed"}
 
 
 @pytest.mark.unit
