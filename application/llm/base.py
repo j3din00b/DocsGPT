@@ -142,6 +142,44 @@ class BaseLLM(ABC):
             return args_dict
         return {k: v for k, v in args_dict.items() if v is not None}
 
+    @staticmethod
+    def _fallback_payload_fits(fallback, kwargs) -> bool:
+        """Whether the failed request's payload can fit the fallback model.
+
+        A primary rejected for size (context-length 400, capacity cap) hands
+        the *same* oversized payload to the fallback, which then rejects it
+        too — one guaranteed-failed provider call plus one estimated-prompt
+        ``token_usage`` row for nothing. Skip the attempt when the estimated
+        prompt already exceeds the fallback's context window. Estimation
+        errors never block the attempt.
+        """
+        messages = kwargs.get("messages")
+        if not messages:
+            return True
+        try:
+            from application.core.model_utils import get_token_limit
+            from application.usage import _count_prompt_tokens
+
+            estimated = _count_prompt_tokens(messages, tools=kwargs.get("tools"))
+            limit = get_token_limit(
+                fallback.model_id,
+                user_id=getattr(fallback, "model_user_id", None),
+            )
+            # 10% slack: the tiktoken estimate over-counts vs provider
+            # tokenizers (and ``get_token_limit`` returns a conservative
+            # default for unregistered models) — only skip when the payload
+            # is decisively over, never on a borderline estimate.
+            if estimated > int(limit * 1.1):
+                logger.warning(
+                    f"Skipping fallback to {fallback.model_id}: estimated "
+                    f"prompt (~{estimated} tokens) cannot fit its context "
+                    f"window ({limit} tokens)."
+                )
+                return False
+        except Exception:
+            logger.debug("Fallback payload size estimation failed", exc_info=True)
+        return True
+
     def _execute_with_fallback(
         self, method_name: str, decorators: list, *args, **kwargs
     ):
@@ -186,6 +224,8 @@ class BaseLLM(ABC):
                 logger.error(f"Primary LLM failed and no fallback configured: {str(e)}")
                 raise
             fallback = self.fallback_llm
+            if not self._fallback_payload_fits(fallback, kwargs):
+                raise
             self._responding_provider = fallback.provider_name
             logger.warning(
                 f"Primary LLM failed. Falling back to "
@@ -232,12 +272,26 @@ class BaseLLM(ABC):
         try:
             yield from decorated_method()
         except Exception as e:
+            if getattr(self, "_stream_reached_finish", False):
+                # The primary already delivered a finish signal — only
+                # trailing frames (usage chunk, [DONE]) failed. Restreaming
+                # from the fallback would duplicate the entire answer the
+                # user already received (and re-run tool calls). Re-raise;
+                # the streaming handler treats post-finish failures as
+                # non-fatal.
+                logger.warning(
+                    f"Primary LLM failed after delivering its finish signal; "
+                    f"not engaging fallback. Error: {str(e)}"
+                )
+                raise
             if not self.fallback_llm:
                 logger.error(
                     f"Primary LLM failed and no fallback configured: {str(e)}"
                 )
                 raise
             fallback = self.fallback_llm
+            if not self._fallback_payload_fits(fallback, kwargs):
+                raise
             self._responding_provider = fallback.provider_name
             logger.warning(
                 f"Primary LLM failed mid-stream. Falling back to "

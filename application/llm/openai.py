@@ -160,6 +160,14 @@ class OpenAILLM(BaseLLM):
         self._last_response_id = None
         self._last_reasoning_items = []
         self._last_usage = None
+        # One-shot guard consumed by ``_prefer_provider_usage``: fresh
+        # provider usage flips it False, the first billing read flips it
+        # True, so no two token_usage rows share one reported usage.
+        self._last_usage_claimed = False
+        # True once the current stream delivered a finish signal — only
+        # trailing frames remain, so a failure there must not trigger a
+        # fallback restream of the already-delivered answer.
+        self._stream_reached_finish = False
         self._imported_response_id = None
 
     def responses_chain_key(self) -> str:
@@ -443,6 +451,7 @@ class OpenAILLM(BaseLLM):
         if response_format:
             request_params["response_format"] = response_format
         self._last_usage = None
+        self._stream_reached_finish = False
         response = self.client.chat.completions.create(**request_params)
         logging.debug("OpenAI request completed")
         self._record_chat_usage(getattr(response, "usage", None))
@@ -515,6 +524,7 @@ class OpenAILLM(BaseLLM):
         stream_options.setdefault("include_usage", True)
         request_params["stream_options"] = stream_options
         self._last_usage = None
+        self._stream_reached_finish = False
         response = self.client.chat.completions.create(**request_params)
 
         try:
@@ -537,6 +547,12 @@ class OpenAILLM(BaseLLM):
 
                 has_tool_calls = bool(getattr(delta, "tool_calls", None))
                 finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason:
+                    # The answer is complete; only trailing frames (usage
+                    # chunk, [DONE]) remain. ``_stream_with_fallback`` reads
+                    # this to refuse restreaming a delivered answer when a
+                    # trailing frame fails.
+                    self._stream_reached_finish = True
 
                 # Yield non-content chunks only when needed for tool-call handling.
                 if has_tool_calls or finish_reason == "tool_calls":
@@ -596,29 +612,77 @@ class OpenAILLM(BaseLLM):
                     parts.append(file_part)
         return parts
 
-    def _to_responses_input(self, messages):
+    def _to_responses_input(self, messages, chained=False):
         """Translate cleaned Chat-Completions messages into a Responses
         ``input`` item list.
 
         Reasoning items captured during the in-turn tool loop are re-injected
         ahead of the function calls they belong to (deduped by id) so the
         model keeps its chain-of-thought across the round-trip.
+
+        Pairing invariant: the Responses API 400s on a ``function_call``
+        without a matching ``function_call_output`` ("No tool output found
+        for function call …") and on an output without its call. History
+        rebuilds (compression, pause/resume) can produce either orphan, so
+        both directions are dropped here rather than sent to certain
+        rejection — along with any reasoning items that would then precede
+        a dropped call with no following item. A call is only "paired" when
+        its output appears LATER in the list (an output *before* its call
+        is malformed history; both sides are dropped).
+
+        ``chained=True`` (store-mode ``previous_response_id`` requests)
+        disables the guard entirely: ``_trim_for_previous_response``
+        deliberately sends bare ``function_call_output`` items whose calls
+        live server-side in the previous response — dropping those breaks
+        every tool round.
         """
         input_items = []
         emitted_reasoning = set()
-        for message in messages:
+        # First position (message index) at which each call_id's output
+        # appears — used to require call-before-output ordering.
+        output_positions: dict = {}
+        for position, m in enumerate(messages):
+            if m.get("role") == "tool" and m.get("tool_call_id") is not None:
+                output_positions.setdefault(m["tool_call_id"], position)
+        emitted_call_ids = set()
+        for position, message in enumerate(messages):
             role = message.get("role")
             message_reasoning = message.get("responses_reasoning_items") or []
-            for item in message_reasoning:
-                item_id = item.get("id") if isinstance(item, dict) else None
-                if item_id and item_id in emitted_reasoning:
-                    continue
-                if item_id:
-                    emitted_reasoning.add(item_id)
-                input_items.append(item)
             tool_calls = message.get("tool_calls")
             if tool_calls and role == "assistant":
-                for tc in tool_calls:
+                kept_calls = [
+                    tc
+                    for tc in tool_calls
+                    if chained
+                    or output_positions.get(tc.get("id", ""), -1) > position
+                ]
+                if len(kept_calls) < len(tool_calls):
+                    kept_ids = {id(tc) for tc in kept_calls}
+                    dropped = [
+                        tc.get("id", "")
+                        for tc in tool_calls
+                        if id(tc) not in kept_ids
+                    ]
+                    logging.warning(
+                        "Dropping %d function_call item(s) without a matching "
+                        "later function_call_output (call_ids=%s) from "
+                        "Responses input",
+                        len(dropped),
+                        dropped,
+                    )
+                if not kept_calls:
+                    # Nothing left to emit for this message; its reasoning
+                    # items must not be emitted either (a trailing reasoning
+                    # item with no following item is itself rejected).
+                    continue
+                for item in message_reasoning:
+                    item_id = item.get("id") if isinstance(item, dict) else None
+                    if item_id and item_id in emitted_reasoning:
+                        continue
+                    if item_id:
+                        emitted_reasoning.add(item_id)
+                    input_items.append(item)
+                for tc in kept_calls:
                     call_id = tc.get("id", "")
                     for item in self._reasoning_for_calls.get(call_id, []):
                         item_id = item.get("id")
@@ -634,9 +698,24 @@ class OpenAILLM(BaseLLM):
                         "name": func.get("name", ""),
                         "arguments": func.get("arguments", "") or "{}",
                     })
+                    emitted_call_ids.add(call_id)
                 continue
+            for item in message_reasoning:
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if item_id and item_id in emitted_reasoning:
+                    continue
+                if item_id:
+                    emitted_reasoning.add(item_id)
+                input_items.append(item)
             tool_call_id = message.get("tool_call_id")
             if role == "tool" and tool_call_id is not None:
+                if not chained and tool_call_id not in emitted_call_ids:
+                    logging.warning(
+                        "Dropping orphaned function_call_output (call_id=%s) "
+                        "with no preceding function_call from Responses input",
+                        tool_call_id,
+                    )
+                    continue
                 tool_content = message.get("content")
                 input_items.append({
                     "type": "function_call_output",
@@ -740,7 +819,8 @@ class OpenAILLM(BaseLLM):
             else None
         )
         if effort:
-            params["reasoning"] = {"effort": effort, "summary": "auto"}
+            summary = settings.OPENAI_REASONING_SUMMARY or "auto"
+            params["reasoning"] = {"effort": effort, "summary": summary}
 
         if response_format:
             fmt = self._responses_text_format(response_format)
@@ -827,6 +907,7 @@ class OpenAILLM(BaseLLM):
         if reasoning:
             result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
         self._last_usage = result
+        self._last_usage_claimed = False
 
     def _record_responses_metadata(self, response):
         rid = getattr(response, "id", None)
@@ -850,6 +931,7 @@ class OpenAILLM(BaseLLM):
             if reasoning:
                 result["completion_tokens_details"] = {"reasoning_tokens": reasoning}
             self._last_usage = result
+            self._last_usage_claimed = False
 
     @staticmethod
     def _responses_status_error(response) -> str | None:
@@ -924,9 +1006,10 @@ class OpenAILLM(BaseLLM):
         self._last_response_id = None
         self._last_usage = None
         self._last_finish_reason = None
-        if previous_response_id and settings.OPENAI_RESPONSES_STORE:
+        chained = bool(previous_response_id and settings.OPENAI_RESPONSES_STORE)
+        if chained:
             messages = self._trim_for_previous_response(messages)
-        input_items = self._to_responses_input(messages)
+        input_items = self._to_responses_input(messages, chained=chained)
         params = self._build_responses_params(
             model,
             input_items,
@@ -993,9 +1076,11 @@ class OpenAILLM(BaseLLM):
         self._last_response_id = None
         self._last_usage = None
         self._last_finish_reason = None
-        if previous_response_id and settings.OPENAI_RESPONSES_STORE:
+        self._stream_reached_finish = False
+        chained = bool(previous_response_id and settings.OPENAI_RESPONSES_STORE)
+        if chained:
             messages = self._trim_for_previous_response(messages)
-        input_items = self._to_responses_input(messages)
+        input_items = self._to_responses_input(messages, chained=chained)
         params = self._build_responses_params(
             model,
             input_items,
@@ -1069,6 +1154,7 @@ class OpenAILLM(BaseLLM):
                     status_error = self._responses_status_error(completed_response)
                     if status_error:
                         raise RuntimeError(status_error)
+                    self._stream_reached_finish = True
                     self._record_responses_metadata(completed_response)
                     self._last_reasoning_items = reasoning_items
                     self._last_finish_reason = "tool_calls" if func_calls else "stop"

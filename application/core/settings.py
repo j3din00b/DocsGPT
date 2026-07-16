@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 current_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -248,6 +248,7 @@ class Settings(BaseSettings):
     # reasoning is carried across the in-turn tool loop via encrypted
     # reasoning items instead.
     OPENAI_RESPONSES_STORE: bool = False
+    OPENAI_REASONING_SUMMARY: str = "auto"
 
     # OpenAI-compatible clients can identify a logical chat with session
     # headers even though chat-completions itself has no conversation field.
@@ -272,6 +273,8 @@ class Settings(BaseSettings):
     COMPRESSION_MODEL_OVERRIDE: Optional[str] = None  # Use different model for compression
     COMPRESSION_PROMPT_VERSION: str = "v1.0"  # Track prompt iterations
     COMPRESSION_MAX_HISTORY_POINTS: int = 3  # Keep only last N compression points to prevent DB bloat
+    COMPRESSION_RECENT_FIELD_MAX_TOKENS: int = 8000  # Per-field cap on the verbatim tail kept after a compression point (0 disables)
+    TOOL_RESULT_MAX_TOKENS: int = 20000  # Cap on a single tool result entering the LLM context (0 disables); journal/DB keep the full result
 
     # Internal SSE push channel (notifications + durable replay journal)
     # Master switch — when False, /api/events emits a "push_disabled" comment
@@ -285,9 +288,7 @@ class Settings(BaseSettings):
     # Used by gunicorn_worker.BoundedDrainUvicornWorker.
     GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: int = 30
     WSGI_THREADPOOL_WORKERS: int = 96
-    # SSE keepalive comment cadence. Must sit under Cloudflare's 100s idle
-    # close and iOS Safari's ~60s — 15s gives generous headroom.
-    SSE_KEEPALIVE_SECONDS: int = 15
+    SSE_KEEPALIVE_SECONDS: int = Field(default=15, ge=1)
     # Cap on simultaneous SSE connections per user. Each connection holds
     # one WSGI thread (32 per gunicorn worker) and one Redis pub/sub
     # connection. 8 covers normal multi-tab use without letting one user

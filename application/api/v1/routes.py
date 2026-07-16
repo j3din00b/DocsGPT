@@ -39,6 +39,7 @@ from application.api.v1.translator import (
 from application.storage.db.repositories.agents import AgentsRepository
 from application.storage.db.repositories.conversations import ConversationsRepository
 from application.storage.db.session import db_readonly
+from application.streaming.sse_keepalive import with_sse_keepalive
 
 logger = logging.getLogger(__name__)
 
@@ -353,19 +354,21 @@ def chat_completions():
             # b2b client is non-streaming), so a streaming request never
             # claims a key. This is a known, accepted limitation.
             return Response(
-                _stream_response(
-                    helper,
-                    question,
-                    agent,
-                    processor,
-                    model_name,
-                    continuation,
-                    should_persist,
-                    visibility,
-                    strip_reasoning_leak,
-                    bool((data.get("stream_options") or {}).get("include_usage")),
-                    client_session,
-                    finalize_stateless_tool_pause,
+                with_sse_keepalive(
+                    _stream_response(
+                        helper,
+                        question,
+                        agent,
+                        processor,
+                        model_name,
+                        continuation,
+                        should_persist,
+                        visibility,
+                        strip_reasoning_leak,
+                        bool((data.get("stream_options") or {}).get("include_usage")),
+                        client_session,
+                        finalize_stateless_tool_pause,
+                    ),
                 ),
                 mimetype="text/event-stream",
                 headers={
