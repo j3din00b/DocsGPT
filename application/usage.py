@@ -171,6 +171,8 @@ def _prefer_provider_usage(llm: Any, call_usage: Dict[str, int]) -> Dict[str, in
     try:
         llm._last_usage_claimed = True
     except AttributeError:
+        # Slotted/immutable LLM stand-ins can't record the claim; this
+        # call still gets the provider counts, which is correct for them.
         pass
     return {
         "prompt_tokens": int(prompt or 0),
