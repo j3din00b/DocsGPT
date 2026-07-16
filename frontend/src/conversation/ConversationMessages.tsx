@@ -1,25 +1,27 @@
 import {
   Fragment,
   ReactNode,
-  useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import ArrowDown from '../assets/arrow-down.svg';
 import DocsGPT3 from '../assets/cute_docsgpt3.svg';
 import Retry from '../assets/retry.svg?react';
 import { Button } from '../components/ui/button';
+import {
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+} from '../components/ui/message-scroller';
 import Hero from '../Hero';
 import ConversationBubble from './ConversationBubble';
 import { FEEDBACK, Query, Status } from './conversationModels';
-
-const SCROLL_THRESHOLD = 10;
-const LAST_BUBBLE_MARGIN = 'mb-32';
-const DEFAULT_BUBBLE_MARGIN = 'mb-7';
-const FIRST_QUESTION_BUBBLE_MARGIN_TOP = 'mt-5';
 
 type ConversationMessagesProps = {
   handleQuestion: (params: {
@@ -48,6 +50,12 @@ type ConversationMessagesProps = {
   agentId?: string;
 };
 
+const MS_VIEWPORT_SELECTOR = '[data-slot="message-scroller-viewport"]';
+const STICK_THRESHOLD_PX = 48;
+
+const DEFAULT_BUBBLE_MARGIN = 'mb-7';
+const FIRST_QUESTION_BUBBLE_MARGIN_TOP = 'mt-5';
+
 export default function ConversationMessages({
   handleQuestion,
   handleQuestionSubmission,
@@ -63,184 +71,66 @@ export default function ConversationMessages({
 }: ConversationMessagesProps) {
   const { t } = useTranslation();
 
-  const conversationRef = useRef<HTMLDivElement>(null);
-  const [scrollButtonVisible, setScrollButtonVisible] = useState(false);
-  const userInterruptedRef = useRef(false);
-  const [interrupted, setInterrupted] = useState(false);
-  const lastTouchYRef = useRef<number | null>(null);
-  const isInitialLoad = useRef(true);
-  const prevQueriesRef = useRef(queries);
-  const isAutoScrollingRef = useRef(false);
-  const smoothScrollTimeoutRef =
-    useRef<ReturnType<typeof setTimeout>>(undefined);
-  const showButtonTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-
-  useEffect(() => {
-    return () => {
-      clearTimeout(smoothScrollTimeoutRef.current);
-      clearTimeout(showButtonTimerRef.current);
-    };
-  }, []);
-
-  const isAtBottom = useCallback(() => {
-    const el = conversationRef.current;
-    if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < SCROLL_THRESHOLD;
-  }, []);
-
-  // Arm on upward scroll intent; requiring !isAtBottom() missed small nudges still inside SCROLL_THRESHOLD.
-  const markInterruptedIfLoading = useCallback(() => {
-    if (userInterruptedRef.current || status !== 'loading') return;
-    userInterruptedRef.current = true;
-    setInterrupted(true);
-  }, [status]);
-
-  const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
-      if (e.deltaY < 0) markInterruptedIfLoading();
-    },
-    [markInterruptedIfLoading],
-  );
-
-  const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    lastTouchYRef.current = e.touches[0].clientY;
-  }, []);
-
-  const handleTouchMove = useCallback(
-    (e: React.TouchEvent) => {
-      const y = e.touches[0].clientY;
-      if (lastTouchYRef.current !== null && y > lastTouchYRef.current) {
-        markInterruptedIfLoading();
-      }
-      lastTouchYRef.current = y;
-    },
-    [markInterruptedIfLoading],
-  );
-
-  const setButtonHidden = useCallback(() => {
-    clearTimeout(showButtonTimerRef.current);
-    showButtonTimerRef.current = undefined;
-    setScrollButtonVisible(false);
-  }, []);
-
-  const setButtonVisibleDebounced = useCallback(() => {
-    if (showButtonTimerRef.current) return;
-    showButtonTimerRef.current = setTimeout(() => {
-      setScrollButtonVisible(true);
-      showButtonTimerRef.current = undefined;
-    }, 300);
-  }, []);
-
-  const scrollConversationToBottom = useCallback(
-    (instant?: boolean) => {
-      if (!conversationRef.current) return;
-
-      isAutoScrollingRef.current = true;
-      clearTimeout(smoothScrollTimeoutRef.current);
-
-      requestAnimationFrame(() => {
-        if (!conversationRef?.current) return;
-
-        if (instant) {
-          conversationRef.current.scrollTop =
-            conversationRef.current.scrollHeight;
-          if (isAtBottom()) {
-            setButtonHidden();
-          }
-          isAutoScrollingRef.current = false;
-        } else {
-          conversationRef.current.scrollTo({
-            behavior: 'smooth',
-            top: conversationRef.current.scrollHeight,
-          });
-          smoothScrollTimeoutRef.current = setTimeout(() => {
-            if (isAtBottom()) {
-              setButtonHidden();
-            }
-            isAutoScrollingRef.current = false;
-          }, 500);
-        }
-      });
-    },
-    [isAtBottom, setButtonHidden],
-  );
-
-  const handleScroll = useCallback(() => {
-    const el = conversationRef.current;
-    if (!el) return;
-
-    const atBottom = isAtBottom();
-
-    if (atBottom && userInterruptedRef.current) {
-      userInterruptedRef.current = false;
-      setInterrupted(false);
-    }
-
-    if (atBottom) {
-      setButtonHidden();
-      isAutoScrollingRef.current = false;
-      return;
-    }
-
-    if (isAutoScrollingRef.current) {
-      return;
-    }
-
-    setButtonVisibleDebounced();
-  }, [isAtBottom, setButtonHidden, setButtonVisibleDebounced]);
-
+  const hasMessages = queries.length > 0;
   const lastQuery = queries[queries.length - 1];
-  const lastQueryResponse = lastQuery?.response;
-  const lastQueryError = lastQuery?.error;
-  const lastQueryThought = lastQuery?.thought;
+  const lastTurnContentLength =
+    (lastQuery?.thought?.length ?? 0) + (lastQuery?.response?.length ?? 0);
+  const stickToBottomRef = useRef(true);
 
+  // pin-to-top jump
+  // once the user scrolls up past the pin's reserved spacer, collapse it (via the scroller's
+  // own spacerClassName) so it never lingers as dead space. Re-arms on the next
+  // turn so the following question can pin to the top again.
+  const [spacerCollapsed, setSpacerCollapsed] = useState(false);
+  const spacerCollapsedRef = useRef(false);
+  const prevQueryCountRef = useRef(queries.length);
   useEffect(() => {
-    if (interrupted) return;
-
-    const prevQueries = prevQueriesRef.current;
-    const isConversationSwitch =
-      prevQueries !== queries && prevQueries[0] !== queries[0];
-
-    if (isInitialLoad.current || isConversationSwitch) {
-      isInitialLoad.current = false;
-      scrollConversationToBottom(true);
-      prevQueriesRef.current = queries;
-      return;
+    if (queries.length > prevQueryCountRef.current) {
+      spacerCollapsedRef.current = false;
+      setSpacerCollapsed(false);
     }
-
-    const isNewMessage = queries.length > prevQueries.length;
-    prevQueriesRef.current = queries;
-
-    scrollConversationToBottom(isNewMessage ? false : true);
-  }, [
-    queries.length,
-    lastQueryResponse,
-    lastQueryError,
-    lastQueryThought,
-    interrupted,
-    scrollConversationToBottom,
-  ]);
+    prevQueryCountRef.current = queries.length;
+  }, [queries.length]);
 
   useEffect(() => {
-    if (status === 'idle') {
-      userInterruptedRef.current = false;
-      setInterrupted(false);
-    }
-  }, [status]);
-
-  useEffect(() => {
-    const currentConversationRef = conversationRef.current;
-    currentConversationRef?.addEventListener('scroll', handleScroll);
-    return () => {
-      currentConversationRef?.removeEventListener('scroll', handleScroll);
+    if (!hasMessages) return;
+    const vp = document.querySelector<HTMLElement>(MS_VIEWPORT_SELECTOR);
+    if (!vp) return;
+    const onScroll = () => {
+      const dist = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+      stickToBottomRef.current = dist < STICK_THRESHOLD_PX;
+      // Collapse only once the spacer has scrolled fully below the fold
+      // (dist >= its height) so removing it never shifts the visible content.
+      // Reading style.height (the primitive's inline value) avoids a reflow.
+      if (!spacerCollapsedRef.current) {
+        const spacer = vp.querySelector<HTMLElement>('.msc-spacer');
+        const spacerH = spacer ? parseFloat(spacer.style.height) || 0 : 0;
+        if (spacerH > STICK_THRESHOLD_PX && dist >= spacerH) {
+          spacerCollapsedRef.current = true;
+          setSpacerCollapsed(true);
+        }
+      }
     };
-  }, [handleScroll]);
+    onScroll();
+    vp.addEventListener('scroll', onScroll, { passive: true });
+    return () => vp.removeEventListener('scroll', onScroll);
+  }, [hasMessages]);
+
+  useLayoutEffect(() => {
+    if (status !== 'loading' || !hasMessages) return;
+    const vp = document.querySelector<HTMLElement>(MS_VIEWPORT_SELECTOR);
+    if (!vp) return;
+    const dist = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+    if (stickToBottomRef.current && dist > 0) vp.scrollTop = vp.scrollHeight;
+  }, [status, lastTurnContentLength, hasMessages]);
+
+  const columnClass = isSplitView
+    ? 'w-full max-w-325 px-2'
+    : 'w-full max-w-325 px-2 md:w-9/12 lg:w-8/12 xl:w-8/12 2xl:w-6/12';
 
   const renderResponseView = (query: Query, index: number) => {
     const isLastMessage = index === queries.length - 1;
-    const bubbleMargin = isLastMessage
-      ? LAST_BUBBLE_MARGIN
-      : DEFAULT_BUBBLE_MARGIN;
+    const bubbleMargin = DEFAULT_BUBBLE_MARGIN;
 
     // Error first; reconciler-failed rows may carry partial thought/
     // tool_calls and would otherwise fall into the answer branch.
@@ -328,10 +218,10 @@ export default function ConversationMessages({
       );
     }
 
-    if (status === 'loading' && isLastMessage) {
+    if (status === 'loading' && index === queries.length - 1) {
       return (
         <div
-          className={`fade-in-bubble flex flex-wrap self-start ${bubbleMargin} group dark:text-foreground flex-col`}
+          className={`fade-in-bubble group dark:text-foreground flex flex-col flex-wrap self-start ${bubbleMargin}`}
         >
           <div className="flex max-w-full flex-col flex-wrap items-start self-start lg:flex-nowrap">
             <div className="my-2 flex flex-row items-center justify-center gap-3">
@@ -361,68 +251,57 @@ export default function ConversationMessages({
     return null;
   };
 
-  return (
-    <div
-      ref={conversationRef}
-      onWheel={handleWheel}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      className="flex h-full w-full justify-center overflow-y-auto will-change-scroll sm:pt-6 lg:pt-12"
-    >
-      {queries.length > 0 && (
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          onClick={() => {
-            userInterruptedRef.current = false;
-            setInterrupted(false);
-            scrollConversationToBottom();
-          }}
-          aria-label={t('Scroll to bottom') || 'Scroll to bottom'}
-          className={`bg-card fixed bottom-40 left-1/2 z-10 h-7 w-7 -translate-x-1/2 rounded-full transition-all duration-300 ease-in-out md:right-14 md:left-auto md:h-9 md:w-9 md:translate-x-0 ${
-            scrollButtonVisible
-              ? 'pointer-events-auto scale-100 opacity-100'
-              : 'pointer-events-none scale-75 opacity-0'
-          }`}
-        >
-          <img
-            src={ArrowDown}
-            alt="arrow down"
-            className="h-4 w-4 opacity-50 filter md:h-5 md:w-5 dark:invert"
-          />
-        </Button>
-      )}
-
-      <div
-        className={
-          isSplitView
-            ? 'w-full max-w-325 px-2'
-            : 'w-full max-w-325 px-2 md:w-9/12 lg:w-8/12 xl:w-8/12 2xl:w-6/12'
-        }
-      >
-        {headerContent}
-
-        {queries.length > 0 ? (
-          queries.map((query, index) => (
-            <Fragment key={`${index}-query-fragment`}>
-              <ConversationBubble
-                className={index === 0 ? FIRST_QUESTION_BUBBLE_MARGIN_TOP : ''}
-                key={`${index}-QUESTION`}
-                message={query.prompt}
-                type="QUESTION"
-                handleUpdatedQuestionSubmission={handleQuestionSubmission}
-                questionNumber={index}
-                sources={query.sources}
-                filesAttached={query.attachments}
-              />
-              {renderResponseView(query, index)}
-            </Fragment>
-          ))
-        ) : showHeroOnEmpty ? (
-          <Hero handleQuestion={handleQuestion} />
-        ) : null}
+  if (queries.length === 0) {
+    return (
+      <div className="flex h-full w-full justify-center overflow-y-auto will-change-scroll sm:pt-6 lg:pt-12">
+        <div className={columnClass}>
+          {headerContent}
+          {showHeroOnEmpty ? <Hero handleQuestion={handleQuestion} /> : null}
+        </div>
       </div>
-    </div>
+    );
+  }
+
+  return (
+    <MessageScrollerProvider autoScroll>
+      <MessageScroller>
+        <MessageScrollerViewport className="sm:pt-6 lg:pt-12">
+          <MessageScrollerContent
+            spacerClassName={
+              spacerCollapsed ? 'msc-spacer max-h-0' : 'msc-spacer'
+            }
+            className={`mx-auto pb-7 ${columnClass}`}
+          >
+            {headerContent}
+            {queries.map((query, index) => {
+              const responseView = renderResponseView(query, index);
+              return (
+                <Fragment key={`${index}-query-fragment`}>
+                  <MessageScrollerItem messageId={`q-${index}`} scrollAnchor>
+                    <ConversationBubble
+                      className={
+                        index === 0 ? FIRST_QUESTION_BUBBLE_MARGIN_TOP : ''
+                      }
+                      message={query.prompt}
+                      type="QUESTION"
+                      handleUpdatedQuestionSubmission={handleQuestionSubmission}
+                      questionNumber={index}
+                      sources={query.sources}
+                      filesAttached={query.attachments}
+                    />
+                  </MessageScrollerItem>
+                  {responseView && (
+                    <MessageScrollerItem messageId={`a-${index}`}>
+                      {responseView}
+                    </MessageScrollerItem>
+                  )}
+                </Fragment>
+              );
+            })}
+          </MessageScrollerContent>
+        </MessageScrollerViewport>
+        <MessageScrollerButton />
+      </MessageScroller>
+    </MessageScrollerProvider>
   );
 }
