@@ -1,4 +1,11 @@
-import { Fragment, ReactNode, useEffect, useLayoutEffect, useRef } from 'react';
+import {
+  Fragment,
+  ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { useTranslation } from 'react-i18next';
 
 import DocsGPT3 from '../assets/cute_docsgpt3.svg';
@@ -46,7 +53,6 @@ type ConversationMessagesProps = {
 const MS_VIEWPORT_SELECTOR = '[data-slot="message-scroller-viewport"]';
 const STICK_THRESHOLD_PX = 48;
 
-const LAST_BUBBLE_MARGIN = 'mb-32';
 const DEFAULT_BUBBLE_MARGIN = 'mb-7';
 const FIRST_QUESTION_BUBBLE_MARGIN_TOP = 'mt-5';
 
@@ -70,13 +76,40 @@ export default function ConversationMessages({
   const lastTurnContentLength =
     (lastQuery?.thought?.length ?? 0) + (lastQuery?.response?.length ?? 0);
   const stickToBottomRef = useRef(true);
+
+  // pin-to-top jump
+  // once the user scrolls up past the pin's reserved spacer, collapse it (via the scroller's
+  // own spacerClassName) so it never lingers as dead space. Re-arms on the next
+  // turn so the following question can pin to the top again.
+  const [spacerCollapsed, setSpacerCollapsed] = useState(false);
+  const spacerCollapsedRef = useRef(false);
+  const prevQueryCountRef = useRef(queries.length);
+  useEffect(() => {
+    if (queries.length > prevQueryCountRef.current) {
+      spacerCollapsedRef.current = false;
+      setSpacerCollapsed(false);
+    }
+    prevQueryCountRef.current = queries.length;
+  }, [queries.length]);
+
   useEffect(() => {
     if (!hasMessages) return;
     const vp = document.querySelector<HTMLElement>(MS_VIEWPORT_SELECTOR);
     if (!vp) return;
     const onScroll = () => {
-      stickToBottomRef.current =
-        vp.scrollHeight - vp.scrollTop - vp.clientHeight < STICK_THRESHOLD_PX;
+      const dist = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+      stickToBottomRef.current = dist < STICK_THRESHOLD_PX;
+      // Collapse only once the spacer has scrolled fully below the fold
+      // (dist >= its height) so removing it never shifts the visible content.
+      // Reading style.height (the primitive's inline value) avoids a reflow.
+      if (!spacerCollapsedRef.current) {
+        const spacer = vp.querySelector<HTMLElement>('.msc-spacer');
+        const spacerH = spacer ? parseFloat(spacer.style.height) || 0 : 0;
+        if (spacerH > STICK_THRESHOLD_PX && dist >= spacerH) {
+          spacerCollapsedRef.current = true;
+          setSpacerCollapsed(true);
+        }
+      }
     };
     onScroll();
     vp.addEventListener('scroll', onScroll, { passive: true });
@@ -97,9 +130,7 @@ export default function ConversationMessages({
 
   const renderResponseView = (query: Query, index: number) => {
     const isLastMessage = index === queries.length - 1;
-    const bubbleMargin = isLastMessage
-      ? LAST_BUBBLE_MARGIN
-      : DEFAULT_BUBBLE_MARGIN;
+    const bubbleMargin = DEFAULT_BUBBLE_MARGIN;
 
     // Error first; reconciler-failed rows may carry partial thought/
     // tool_calls and would otherwise fall into the answer branch.
@@ -235,7 +266,12 @@ export default function ConversationMessages({
     <MessageScrollerProvider autoScroll>
       <MessageScroller>
         <MessageScrollerViewport className="sm:pt-6 lg:pt-12">
-          <MessageScrollerContent className={`mx-auto pb-7 ${columnClass}`}>
+          <MessageScrollerContent
+            spacerClassName={
+              spacerCollapsed ? 'msc-spacer max-h-0' : 'msc-spacer'
+            }
+            className={`mx-auto pb-7 ${columnClass}`}
+          >
             {headerContent}
             {queries.map((query, index) => {
               const responseView = renderResponseView(query, index);
