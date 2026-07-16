@@ -389,8 +389,6 @@ def test_build_responses_params_stateless(monkeypatch):
     assert params["model"] == "gpt-5.5"
     assert params["stream"] is True
     assert params["max_output_tokens"] == 256
-    # Summary verbosity comes from settings.OPENAI_REASONING_SUMMARY
-    # ("auto" unless overridden).
     assert params["reasoning"] == {"effort": "high", "summary": "auto"}
     assert params["store"] is False
     assert params["include"] == ["reasoning.encrypted_content"]

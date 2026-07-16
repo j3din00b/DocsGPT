@@ -248,12 +248,6 @@ class Settings(BaseSettings):
     # reasoning is carried across the in-turn tool loop via encrypted
     # reasoning items instead.
     OPENAI_RESPONSES_STORE: bool = False
-
-    # Reasoning-summary verbosity requested on the Responses path when a
-    # model has a reasoning_effort configured ("auto" | "concise" |
-    # "detailed"). Some models/gateways reject "detailed", so the default
-    # stays "auto"; stream liveness is handled by the wire-level SSE
-    # keepalive (see SSE_KEEPALIVE_SECONDS) rather than summary verbosity.
     OPENAI_REASONING_SUMMARY: str = "auto"
 
     # OpenAI-compatible clients can identify a logical chat with session
@@ -294,10 +288,6 @@ class Settings(BaseSettings):
     # Used by gunicorn_worker.BoundedDrainUvicornWorker.
     GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: int = 30
     WSGI_THREADPOOL_WORKERS: int = 96
-    # SSE keepalive comment cadence. Must sit under Cloudflare's 100s idle
-    # close and iOS Safari's ~60s — 15s gives generous headroom. ge=1
-    # because a zero/negative interval would busy-loop or crash the
-    # keepalive wrapper's queue timeout.
     SSE_KEEPALIVE_SECONDS: int = Field(default=15, ge=1)
     # Cap on simultaneous SSE connections per user. Each connection holds
     # one WSGI thread (32 per gunicorn worker) and one Redis pub/sub
