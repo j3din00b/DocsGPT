@@ -15,8 +15,27 @@ from typing import Optional
 
 from application.storage.db.redaction import redact_secrets
 from application.storage.db.serialization import PGNativeJSONEncoder
+from application.utils import strip_null_bytes
 
 from sqlalchemy import Connection, text
+
+# Longest string kept inside ``stacks``. The scalar columns are truncated
+# by the caller, but stacks used to go in whole — one uncapped tool
+# result (634k tokens, 07-17) rode into the activity log through here.
+_STACKS_STRING_MAX_LEN = 10000
+
+
+def _bound_strings(value):
+    """Recursively truncate strings in ``value`` to ``_STACKS_STRING_MAX_LEN``."""
+    if isinstance(value, str):
+        if len(value) <= _STACKS_STRING_MAX_LEN:
+            return value
+        return value[:_STACKS_STRING_MAX_LEN] + "...[truncated]"
+    if isinstance(value, dict):
+        return {k: _bound_strings(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_bound_strings(item) for item in value]
+    return value
 
 
 class StackLogsRepository:
@@ -50,13 +69,16 @@ class StackLogsRepository:
             ),
             {
                 "activity_id": activity_id,
-                "endpoint": endpoint,
-                "level": level,
-                "user_id": user_id,
-                "api_key": api_key,
-                "query": query,
+                "endpoint": strip_null_bytes(endpoint),
+                "level": strip_null_bytes(level),
+                "user_id": strip_null_bytes(user_id),
+                "api_key": strip_null_bytes(api_key),
+                "query": strip_null_bytes(query),
                 "stacks": json.dumps(
-                    redact_secrets(stacks or []), cls=PGNativeJSONEncoder
+                    redact_secrets(
+                        _bound_strings(strip_null_bytes(stacks or []))
+                    ),
+                    cls=PGNativeJSONEncoder,
                 ),
                 "timestamp": timestamp,
             },

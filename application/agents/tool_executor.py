@@ -53,6 +53,47 @@ def truncate_tool_result(value: Any) -> Any:
     return f"{text[:PERSISTED_RESULT_MAX_LEN]}..."
 
 
+# Control characters minus \t \n \r. NULs in particular are rejected by
+# Postgres text/jsonb, so one binary-carrying tool result would otherwise
+# kill every write lane it fans out to (conversation, activity log,
+# tool_call_attempts) at once.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Ceiling on the persisted full copy of a tool result (``result_full`` in
+# the conversation row and the ``tool_call_attempts`` result). Generous —
+# the LLM copy is bounded separately at TOOL_RESULT_MAX_TOKENS — but a
+# ceiling all the same: one uncapped result has reached 634k tokens.
+RESULT_FULL_MAX_CHARS = 400_000
+
+
+def sanitize_tool_result(value: Any) -> Any:
+    """Recursively strip NUL/control characters from strings in ``value``.
+
+    Applied once where a tool result enters the executor, so every
+    downstream consumer — the LLM copy, the conversation row, the
+    ``tool_call_attempts`` journal, the stream event — gets clean text.
+    """
+    if isinstance(value, str):
+        return _CONTROL_CHARS.sub("", value) if _CONTROL_CHARS.search(value) else value
+    if isinstance(value, dict):
+        return {sanitize_tool_result(k): sanitize_tool_result(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_tool_result(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_tool_result(item) for item in value)
+    return value
+
+
+def bound_result_full(text: str) -> str:
+    """Cap the persisted full-result copy at ``RESULT_FULL_MAX_CHARS``."""
+    if len(text) <= RESULT_FULL_MAX_CHARS:
+        return text
+    return (
+        text[:RESULT_FULL_MAX_CHARS]
+        + f"\n[... tool result truncated at persistence: {len(text)} chars ...]"
+    )
+
+
 def result_status(result: Any) -> str:
     """Derive the persisted status from a tool's result payload.
 
@@ -882,6 +923,11 @@ class ToolExecutor:
                 )
             raise
 
+        # Single fan-out point: from here ``result`` reaches the LLM copy,
+        # the conversation row, tool_call_attempts, and the stream event —
+        # sanitize once so every lane gets clean text.
+        result = sanitize_tool_result(result)
+
         get_artifact_id = getattr(tool, "get_artifact_id", None) if tool_data["name"] != "api_tool" else None
 
         artifact_id = None
@@ -898,7 +944,7 @@ class ToolExecutor:
         artifact_id = str(artifact_id).strip() if artifact_id is not None else ""
         if artifact_id:
             tool_call_data["artifact_id"] = artifact_id
-        result_full = str(result)
+        result_full = bound_result_full(str(result))
         tool_call_data["resolved_arguments"] = resolved_arguments
         tool_call_data["result_full"] = result_full
         tool_call_data["result"] = truncate_tool_result(result_full)

@@ -1,6 +1,8 @@
 import logging
 from datetime import timedelta
 
+from sqlalchemy.exc import DataError
+
 from application.api.user.idempotency import with_idempotency
 from application.celery_init import celery
 from application.worker import (
@@ -233,7 +235,10 @@ def _emit_attachment_poison_event(task_name, bound):
     )
 
 
-@celery.task(**DURABLE_TASK)
+# ``dont_autoretry_for``: a DataError is deterministic (poison payload,
+# e.g. NUL bytes or an over-long value) — retrying re-fails identically
+# and multiplies log noise, so it goes straight to the failure path.
+@celery.task(**DURABLE_TASK, dont_autoretry_for=(DataError,))
 @with_idempotency(
     task_name="store_attachment", on_poison=_emit_attachment_poison_event,
 )

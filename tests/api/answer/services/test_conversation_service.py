@@ -474,6 +474,46 @@ class TestFinalizeMessage:
         assert len(msgs[0]["sources"][0]["text"]) == 1000
         assert msgs[0]["metadata"]["foo"] == "bar"
 
+    def test_finalize_strips_null_bytes(self, pg_conn):
+        """A NUL-laden tool result (07-17 PDF incident) must not kill the
+        conversation save — Postgres rejects \\x00 in text and jsonb."""
+        from application.api.answer.services.conversation_service import (
+            ConversationService,
+        )
+        from application.storage.db.repositories.conversations import (
+            ConversationsRepository,
+            MessageUpdateOutcome,
+        )
+
+        user = "u-fin-nul"
+        with _patch_db(pg_conn):
+            svc = ConversationService()
+            res = svc.save_user_question(
+                conversation_id=None,
+                question="q",
+                decoded_token={"sub": user},
+            )
+            assert svc.finalize_message(
+                res["message_id"],
+                "answer\x00with\x00nuls",
+                thought="th\x00ought",
+                sources=[{"text": "s\x00rc", "title": "t\x00itle"}],
+                tool_calls=[
+                    {"name": "read_webpage", "result_full": "pdf\x00garbage\x00"}
+                ],
+                metadata={"k\x00ey": "v\x00al"},
+                status="complete",
+            ) is MessageUpdateOutcome.UPDATED
+
+        msgs = ConversationsRepository(pg_conn).get_messages(
+            res["conversation_id"],
+        )
+        assert msgs[0]["response"] == "answerwithnuls"
+        assert msgs[0]["thought"] == "thought"
+        assert msgs[0]["sources"][0]["text"] == "src"
+        assert msgs[0]["tool_calls"][0]["result_full"] == "pdfgarbage"
+        assert msgs[0]["metadata"] == {"key": "val"}
+
     def test_finalizes_failed_records_error(self, pg_conn):
         from application.api.answer.services.conversation_service import (
             ConversationService,

@@ -126,3 +126,48 @@ class TestInsert:
         assert data["prompt_tokens"] == 10
         assert data["generated_tokens"] == 5
         assert data["token_budget"] == 1000
+
+    def test_strips_null_bytes_from_stacks(self, pg_conn):
+        # Postgres jsonb rejects the NUL escape — a NUL-laden tool result in the
+        # stacks would otherwise kill the whole activity-log INSERT (and
+        # with it the error visibility for the incident that caused it).
+        repo = _repo(pg_conn)
+        repo.insert(
+            activity_id="act-nul",
+            level="error",
+            query="q\x00uery",
+            stacks=[{"component": "tool", "data": {"result": "pdf\x00junk\x00"}}],
+        )
+        row = pg_conn.execute(
+            text("SELECT query, stacks FROM stack_logs WHERE activity_id = 'act-nul'")
+        ).fetchone()
+        mapping = dict(row._mapping)
+        assert mapping["query"] == "query"
+        assert mapping["stacks"][0]["data"]["result"] == "pdfjunk"
+
+    def test_bounds_oversized_strings_in_stacks(self, pg_conn):
+        # The 07-17 incident put a 634k-token tool result into stacks
+        # whole; long strings must be truncated before insert.
+        repo = _repo(pg_conn)
+        repo.insert(
+            activity_id="act-big",
+            level="info",
+            stacks=[{"component": "tool", "data": {"result": "x" * 50000}}],
+        )
+        row = pg_conn.execute(
+            text("SELECT stacks FROM stack_logs WHERE activity_id = 'act-big'")
+        ).fetchone()
+        stored = dict(row._mapping)["stacks"][0]["data"]["result"]
+        assert len(stored) <= 10100  # 10k cap plus a short truncation marker
+
+    def test_short_strings_in_stacks_untouched(self, pg_conn):
+        repo = _repo(pg_conn)
+        repo.insert(
+            activity_id="act-small",
+            level="info",
+            stacks=[{"component": "tool", "data": {"result": "ok"}}],
+        )
+        row = pg_conn.execute(
+            text("SELECT stacks FROM stack_logs WHERE activity_id = 'act-small'")
+        ).fetchone()
+        assert dict(row._mapping)["stacks"][0]["data"]["result"] == "ok"

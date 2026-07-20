@@ -281,6 +281,169 @@ class TestHandleToolCallsIdPairing:
         assert pending is None
 
 
+class _MultiCallStubAgent:
+    """Agent whose executor echoes each call's own id, optionally failing some."""
+
+    def __init__(self, fail_ids=()):
+        self.llm = Mock()
+        self.tool_executor = _StubToolExecutor()
+        self._fail_ids = set(fail_ids)
+
+    def _execute_tool_action(self, tools_dict, call):
+        yield from ()
+        if call.id in self._fail_ids:
+            raise RuntimeError(f"boom:{call.id}")
+        return {"ok": call.id}, call.id
+
+
+class TestHandleToolCallsParallelBatchLayout:
+    """A parallel batch must produce the standard provider layout: ONE
+    assistant message carrying every tool_call, followed by one tool message
+    per call.
+
+    Emitting a separate assistant message per call (the previous behaviour)
+    breaks ``_trim_for_previous_response``, which keeps only what follows the
+    LAST assistant message — so every output except the final one is dropped
+    from a chained Responses request and the provider 400s with
+    "No tool output found for function call ...".
+    """
+
+    def _drain(self, gen):
+        try:
+            while True:
+                next(gen)
+        except StopIteration as e:
+            return e.value
+
+    def _calls(self, n):
+        return [
+            ToolCall(id=f"call_{i}", name="search", arguments={"q": str(i)})
+            for i in range(n)
+        ]
+
+    def test_parallel_batch_produces_single_assistant_message(self):
+        handler = ConcreteHandler()
+        calls = self._calls(3)
+
+        updated, pending = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(), calls, tools_dict={}, messages=[]
+            )
+        )
+
+        assistants = [m for m in updated if m["role"] == "assistant"]
+        assert len(assistants) == 1
+        assert [tc["id"] for tc in assistants[0]["tool_calls"]] == [
+            "call_0",
+            "call_1",
+            "call_2",
+        ]
+        assert pending is None
+
+    def test_parallel_batch_orders_assistant_before_every_result(self):
+        handler = ConcreteHandler()
+        calls = self._calls(3)
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(), calls, tools_dict={}, messages=[]
+            )
+        )
+
+        roles = [m["role"] for m in updated]
+        assert roles == ["assistant", "tool", "tool", "tool"]
+        assert [m["tool_call_id"] for m in updated if m["role"] == "tool"] == [
+            "call_0",
+            "call_1",
+            "call_2",
+        ]
+
+    def test_every_call_in_the_batch_has_its_output(self):
+        """The invariant the provider enforces: every tool_call on the
+        assistant message is answered by a tool message."""
+        handler = ConcreteHandler()
+        calls = self._calls(4)
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(), calls, tools_dict={}, messages=[]
+            )
+        )
+
+        declared = {
+            tc["id"]
+            for m in updated
+            if m["role"] == "assistant"
+            for tc in m["tool_calls"]
+        }
+        answered = {m["tool_call_id"] for m in updated if m["role"] == "tool"}
+        assert declared == answered
+
+    def test_reasoning_content_attached_once_not_per_call(self):
+        handler = ConcreteHandler()
+        calls = self._calls(3)
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(),
+                calls,
+                tools_dict={},
+                messages=[],
+                reasoning_content="thinking",
+            )
+        )
+
+        assistants = [m for m in updated if m["role"] == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0]["reasoning_content"] == "thinking"
+
+    def test_failed_call_shares_the_batch_assistant_message(self):
+        """A tool that raises still contributes its call to the same assistant
+        message and gets an error tool message — pairing must hold."""
+        handler = ConcreteHandler()
+        calls = self._calls(3)
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(fail_ids={"call_1"}),
+                calls,
+                tools_dict={},
+                messages=[],
+            )
+        )
+
+        assistants = [m for m in updated if m["role"] == "assistant"]
+        assert len(assistants) == 1
+        declared = {tc["id"] for tc in assistants[0]["tool_calls"]}
+        answered = {m["tool_call_id"] for m in updated if m["role"] == "tool"}
+        assert declared == {"call_0", "call_1", "call_2"} == answered
+
+    def test_single_call_batch_unchanged(self):
+        handler = ConcreteHandler()
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(), self._calls(1), tools_dict={}, messages=[]
+            )
+        )
+
+        assert [m["role"] for m in updated] == ["assistant", "tool"]
+        assert len(updated[0]["tool_calls"]) == 1
+
+    def test_existing_history_is_preserved(self):
+        handler = ConcreteHandler()
+        history = [{"role": "user", "content": "hi"}]
+
+        updated, _ = self._drain(
+            handler.handle_tool_calls(
+                _MultiCallStubAgent(), self._calls(2), tools_dict={}, messages=history
+            )
+        )
+
+        assert updated[0] == {"role": "user", "content": "hi"}
+        assert [m["role"] for m in updated[1:]] == ["assistant", "tool", "tool"]
+
+
 # ---------------------------------------------------------------------------
 # _append_unsupported_attachments
 # ---------------------------------------------------------------------------
@@ -906,18 +1069,22 @@ class TestHandleToolCalls:
         except StopIteration as e:
             messages, _pending = e.value
 
-        # Each tool message must immediately follow an assistant message that
-        # advertises its tool_call_id.
-        answered_ids = set()
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "tool":
-                assert idx > 0
-                prev = messages[idx - 1]
-                assert prev["role"] == "assistant"
-                advertised = {tc["id"] for tc in prev["tool_calls"]}
-                assert msg["tool_call_id"] in advertised
+        # Every tool message must answer a tool_call declared by an assistant
+        # message EARLIER in the array, and every declared call must be
+        # answered. (Adjacency is deliberately not asserted: the standard
+        # provider layout is one assistant message carrying the whole batch
+        # followed by all its results, so only the first result is adjacent.)
+        declared_ids: set = set()
+        answered_ids: set = set()
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                declared_ids.update(tc["id"] for tc in msg.get("tool_calls", []))
+            elif msg.get("role") == "tool":
+                assert msg["tool_call_id"] in declared_ids, (
+                    "tool result precedes the assistant message declaring it"
+                )
                 answered_ids.add(msg["tool_call_id"])
-        assert answered_ids == {"c1", "c2", "c3"}
+        assert answered_ids == {"c1", "c2", "c3"} == declared_ids
 
     def test_thought_signature_preserved(self):
         handler = ConcreteHandler()
