@@ -182,6 +182,16 @@ class TestStoreAttachmentTask:
         mock_worker.assert_called_once_with(ANY, {"file": "info"}, "user1")
         assert result == {"status": "ok"}
 
+    @pytest.mark.unit
+    def test_data_errors_are_not_autoretried(self):
+        # A DataError is deterministic (poison payload) — retrying it five
+        # times just multiplies log noise for the same terminal failure.
+        from sqlalchemy.exc import DataError
+
+        from application.api.user.tasks import store_attachment
+
+        assert DataError in getattr(store_attachment, "dont_autoretry_for", ())
+
 
 class TestProcessAgentWebhookTask:
     @pytest.mark.unit

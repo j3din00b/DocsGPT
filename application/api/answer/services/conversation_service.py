@@ -21,6 +21,7 @@ from application.storage.db.repositories.conversations import (
     MessageUpdateOutcome,
 )
 from application.storage.db.session import db_readonly, db_session
+from application.utils import strip_null_bytes
 
 
 logger = logging.getLogger(__name__)
@@ -338,14 +339,18 @@ class ConversationService:
                 "error", f"{type(error).__name__}: {str(error)}"
             )
 
-        update_fields: Dict[str, Any] = {
-            "response": response,
-            "status": status,
-            "thought": thought,
-            "sources": sources,
-            "tool_calls": tool_calls or [],
-            "metadata": merged_metadata,
-        }
+        # Postgres rejects NUL in text and jsonb; a NUL-laden tool result
+        # reaching this transaction would lose the whole conversation save.
+        update_fields: Dict[str, Any] = strip_null_bytes(
+            {
+                "response": response,
+                "status": status,
+                "thought": thought,
+                "sources": sources,
+                "tool_calls": tool_calls or [],
+                "metadata": merged_metadata,
+            }
+        )
         if model_id is not None:
             update_fields["model_id"] = model_id
 

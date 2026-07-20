@@ -8,6 +8,12 @@ from typing import Any, Optional
 from sqlalchemy import Connection, text
 
 from application.storage.db.serialization import PGNativeJSONEncoder
+from application.utils import strip_null_bytes
+
+
+def _dump_jsonb(value: Any) -> str:
+    """Serialize for a jsonb CAST, stripping NULs Postgres would reject."""
+    return json.dumps(strip_null_bytes(value), cls=PGNativeJSONEncoder)
 
 
 class ToolCallAttemptsRepository:
@@ -56,7 +62,7 @@ class ToolCallAttemptsRepository:
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "action_name": action_name,
-                "arguments": json.dumps(arguments if arguments is not None else {}, cls=PGNativeJSONEncoder),
+                "arguments": _dump_jsonb(arguments if arguments is not None else {}),
                 "message_id": message_id,
                 "user_id": user_id,
                 "agent_id": agent_id,
@@ -120,8 +126,8 @@ class ToolCallAttemptsRepository:
                 "tool_id": tool_id,
                 "tool_name": tool_name,
                 "action_name": action_name,
-                "arguments": json.dumps(arguments if arguments is not None else {}, cls=PGNativeJSONEncoder),
-                "result": json.dumps(result_payload, cls=PGNativeJSONEncoder),
+                "arguments": _dump_jsonb(arguments if arguments is not None else {}),
+                "result": _dump_jsonb(result_payload),
                 "message_id": message_id,
                 "user_id": user_id,
                 "agent_id": agent_id,
@@ -162,7 +168,7 @@ class ToolCallAttemptsRepository:
         params: dict[str, Any] = {
             "call_id": call_id,
             "status": status,
-            "result": json.dumps(result_payload, cls=PGNativeJSONEncoder),
+            "result": _dump_jsonb(result_payload),
         }
         if message_id is not None:
             sql += ", message_id = CAST(:message_id AS uuid)"
@@ -191,7 +197,10 @@ class ToolCallAttemptsRepository:
             "UPDATE tool_call_attempts SET status = 'failed', error = :error "
             "WHERE call_id = :call_id AND status = 'proposed'"
         )
-        params: dict[str, Any] = {"call_id": call_id, "error": error}
+        params: dict[str, Any] = {
+            "call_id": call_id,
+            "error": strip_null_bytes(error),
+        }
         if user_id is not None:
             sql += " AND user_id IS NOT DISTINCT FROM :user_id"
             params["user_id"] = user_id
