@@ -1100,6 +1100,321 @@ def test_to_responses_input_chained_keeps_bare_tool_output(monkeypatch):
     assert [o["call_id"] for o in outputs] == ["call_server_side"]
 
 
+def _grouped_batch_messages():
+    """Standard layout: one assistant message, N tool_calls, N tool results."""
+    return [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+                for i in range(3)
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0", "content": "r0"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "r2"},
+    ]
+
+
+def _split_batch_messages():
+    """Legacy layout: one assistant message PER call, interleaved with its
+    result. ``_trim_for_previous_response`` must still keep every output."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    for i in range(3):
+        msgs.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"},
+            }],
+        })
+        msgs.append(
+            {"role": "tool", "tool_call_id": f"call_{i}", "content": f"r{i}"}
+        )
+    return msgs
+
+
+@pytest.mark.unit
+def test_trim_keeps_every_output_of_a_grouped_batch(monkeypatch):
+    """Chained requests must carry an output for every call the chained
+    response holds."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    trimmed = llm._trim_for_previous_response(_grouped_batch_messages())
+    items = llm._to_responses_input(trimmed, chained=True)
+    outputs = [i["call_id"] for i in items if i.get("type") == "function_call_output"]
+    assert outputs == ["call_0", "call_1", "call_2"]
+
+
+@pytest.mark.unit
+def test_trim_keeps_every_output_of_a_split_batch(monkeypatch):
+    """Regression: the trim cut at the LAST assistant message, so a batch
+    written as one assistant message per call lost every output but the
+    last — the provider then 400s "No tool output found for function call
+    call_0" (naming the FIRST unpaired call)."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    trimmed = llm._trim_for_previous_response(_split_batch_messages())
+    items = llm._to_responses_input(trimmed, chained=True)
+    outputs = [i["call_id"] for i in items if i.get("type") == "function_call_output"]
+    assert outputs == ["call_0", "call_1", "call_2"]
+
+
+@pytest.mark.unit
+def test_trim_still_drops_prior_completed_turns(monkeypatch):
+    """The trim must keep doing its job: a completed assistant answer ends
+    the replayed region, so earlier turns are not re-sent."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old q"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new q"},
+    ]
+    trimmed = llm._trim_for_previous_response(messages)
+    assert [m.get("content") for m in trimmed] == ["sys", "new q"]
+
+
+@pytest.mark.unit
+def test_chained_input_falls_back_when_an_output_is_missing(monkeypatch):
+    """Coverage guard: if the outputs being sent do not cover the calls held
+    in the chained response, send a full non-chained input instead of a
+    request the provider is certain to reject."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = {"call_0", "call_1", "call_2"}
+    # Only the last output survives — the exact shape the old trim produced.
+    messages = _grouped_batch_messages()[:3] + [
+        {"role": "tool", "tool_call_id": "call_2", "content": "r2"},
+    ]
+
+    items, prev = llm._build_responses_input(messages, "resp_prev")
+
+    assert prev is None, "must drop out of chained mode"
+    # The unchained rebuild is internally consistent: the one call that still
+    # has its output is kept and paired, the two orphans are dropped by the
+    # pairing guard. Either way the provider gets a request it can accept.
+    calls = [i["call_id"] for i in items if i.get("type") == "function_call"]
+    outputs = [i["call_id"] for i in items if i.get("type") == "function_call_output"]
+    assert calls == ["call_2"]
+    assert outputs == ["call_2"]
+
+
+@pytest.mark.unit
+def test_chained_input_stays_chained_when_outputs_are_complete(monkeypatch):
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = {"call_0", "call_1", "call_2"}
+
+    items, prev = llm._build_responses_input(_grouped_batch_messages(), "resp_prev")
+
+    assert prev == "resp_prev"
+    outputs = [i["call_id"] for i in items if i.get("type") == "function_call_output"]
+    assert outputs == ["call_0", "call_1", "call_2"]
+
+
+@pytest.mark.unit
+def test_chained_input_skips_the_check_when_calls_are_unknown(monkeypatch):
+    """After a resume/import we may not know which calls the chained response
+    holds; an unknown set must not be treated as a mismatch."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = set()
+
+    _, prev = llm._build_responses_input(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "tool", "tool_call_id": "call_server_side", "content": "r"},
+        ],
+        "resp_prev",
+    )
+
+    assert prev == "resp_prev"
+
+
+def _multi_round_messages(rounds, calls_per_round=2):
+    """A grouped history of N *consecutive* tool rounds — no user message in
+    between, which is what an agent tool loop actually produces."""
+    out = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    for r in range(rounds):
+        ids = [f"r{r}c{c}" for c in range(calls_per_round)]
+        out.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": i,
+                    "type": "function",
+                    "function": {"name": "t", "arguments": "{}"},
+                }
+                for i in ids
+            ],
+        })
+        out += [
+            {"role": "tool", "tool_call_id": i, "content": "res"} for i in ids
+        ]
+    return out
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rounds", [2, 3, 5])
+def test_chained_input_does_not_resend_earlier_rounds_outputs(monkeypatch, rounds):
+    """Only the chained response's OWN calls get answered.
+
+    The trim's carry loop rescues stray results from a split batch, but the
+    trailing assistant/tool run of a multi-round grouped history has the same
+    shape — so the walk also picked up every earlier round's results, which
+    the server already has. Left unfiltered the payload grows with the round
+    count, defeating the point of chaining.
+    """
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    last = rounds - 1
+    llm._last_response_call_ids = {f"r{last}c0", f"r{last}c1"}
+
+    items, prev = llm._build_responses_input(
+        _multi_round_messages(rounds), "resp_prev"
+    )
+
+    assert prev == "resp_prev"
+    outputs = [
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    ]
+    assert outputs == [f"r{last}c0", f"r{last}c1"], (
+        f"re-sent earlier rounds: {outputs}"
+    )
+
+
+@pytest.mark.unit
+def test_chained_input_still_rescues_a_split_batch(monkeypatch):
+    """The filter must not undo the split-batch rescue: those outputs all
+    answer calls the chained response emitted, so they stay."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = {"call_0", "call_1", "call_2"}
+
+    items, prev = llm._build_responses_input(_split_batch_messages(), "resp_prev")
+
+    assert prev == "resp_prev"
+    outputs = [
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    ]
+    assert outputs == ["call_0", "call_1", "call_2"]
+
+
+@pytest.mark.unit
+def test_chained_input_keeps_a_batch_split_by_compression(monkeypatch):
+    """Mid-batch compression starts a second assistant message for the same
+    round. Both halves answer the chained response's calls, so both stay."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = {"c0", "c1", "c2"}
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c0", "type": "function",
+             "function": {"name": "t", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c0", "content": "r0"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "t", "arguments": "{}"}},
+            {"id": "c2", "type": "function",
+             "function": {"name": "t", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ]
+
+    items, _ = llm._build_responses_input(messages, "resp_prev")
+
+    outputs = [
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    ]
+    assert outputs == ["c0", "c1", "c2"]
+
+
+@pytest.mark.unit
+def test_chained_input_does_not_filter_when_calls_are_unknown(monkeypatch):
+    """With no known call set (import/resume) an extra output cannot be told
+    from a needed one, so nothing is dropped."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_call_ids = set()
+
+    items, prev = llm._build_responses_input(_multi_round_messages(3), "resp_prev")
+
+    assert prev == "resp_prev"
+    outputs = [
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    ]
+    assert len(outputs) == 6
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("entrypoint", ["_responses_gen", "_responses_gen_stream"])
+def test_both_request_builders_route_through_the_coverage_guard(
+    monkeypatch, entrypoint
+):
+    """Regression: the guard was wired into the non-streaming builder only,
+    so the streaming path — the one production actually uses — still sent
+    unchecked chained requests. Both must go through it."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    llm._last_response_id = "resp_prev"
+    seen = {}
+
+    real = llm._build_responses_input
+
+    def spy(messages, previous_response_id):
+        seen["called"] = True
+        return real(messages, previous_response_id)
+
+    monkeypatch.setattr(llm, "_build_responses_input", spy)
+    monkeypatch.setattr(
+        llm, "_build_responses_params", lambda *a, **k: {"model": "m"}
+    )
+    # The streaming path iterates the response; the non-streaming one reads
+    # attributes off it.
+    llm.client.responses.create = MagicMock(
+        return_value=iter([])
+        if entrypoint == "_responses_gen_stream"
+        else types.SimpleNamespace(id="r", usage=None, output=[])
+    )
+
+    result = getattr(llm, entrypoint)("m", [{"role": "user", "content": "hi"}])
+    if entrypoint == "_responses_gen_stream":
+        list(result)  # drain the generator so the body runs
+
+    assert seen.get("called"), f"{entrypoint} bypassed the coverage guard"
+
+
+@pytest.mark.unit
+def test_records_call_ids_emitted_by_a_response(monkeypatch):
+    """The coverage guard needs to know which calls the response emitted."""
+    llm = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    response = _ns(
+        id="resp_1",
+        usage=None,
+        output=[
+            _ns(type="function_call", call_id="call_a"),
+            _ns(type="message", call_id=None),
+            _ns(type="function_call", call_id="call_b"),
+        ],
+    )
+
+    llm._record_responses_metadata(response)
+
+    assert llm._last_response_id == "resp_1"
+    assert llm._last_response_call_ids == {"call_a", "call_b"}
+
+
 @pytest.mark.unit
 def test_to_responses_input_drops_out_of_order_pair_entirely(monkeypatch):
     """An output that precedes its call is malformed history: BOTH sides

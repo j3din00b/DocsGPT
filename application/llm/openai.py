@@ -158,6 +158,9 @@ class OpenAILLM(BaseLLM):
         # chain turns when OPENAI_RESPONSES_STORE is enabled.
         self._reasoning_for_calls = {}
         self._last_response_id = None
+        # call_ids the most recent response emitted; the chained-request
+        # coverage guard checks the next turn answers all of them.
+        self._last_response_call_ids = set()
         self._last_reasoning_items = []
         self._last_usage = None
         # One-shot guard consumed by ``_prefer_provider_usage``: fresh
@@ -222,6 +225,7 @@ class OpenAILLM(BaseLLM):
         self._reasoning_for_calls = {}
         self._last_reasoning_items = []
         self._last_response_id = None
+        self._last_response_call_ids = set()
         self._imported_response_id = None
         self._last_finish_reason = None
 
@@ -735,20 +739,100 @@ class OpenAILLM(BaseLLM):
     @staticmethod
     def _trim_for_previous_response(messages):
         """When chaining via ``previous_response_id`` the server already holds
-        the earlier turns, so only system context plus everything after the
-        last completed assistant response needs to be sent again."""
+        the earlier turns, so only system context plus the tool results
+        answering the chained response's calls need to be sent again.
+
+        The cut is the last assistant message. Any ``tool`` message inside the
+        trailing assistant/tool run *before* that cut is carried over too: a
+        batch written as one assistant message per call — instead of one
+        message carrying the whole batch — would otherwise lose every result
+        but the last, and the provider then rejects the request with "No tool
+        output found for function call <first unpaired call>". The assistant
+        messages in that run are not carried: the server already holds those
+        calls, and chained mode accepts bare ``function_call_output`` items.
+        """
         last_assistant = -1
         for i, message in enumerate(messages):
             if message.get("role") == "assistant":
                 last_assistant = i
         if last_assistant < 0:
             return messages
+        carried = []
+        i = last_assistant - 1
+        while i >= 0:
+            role = messages[i].get("role")
+            if role == "tool":
+                carried.append(messages[i])
+            elif not (role == "assistant" and messages[i].get("tool_calls")):
+                break
+            i -= 1
+        carried.reverse()
         head = [
             m
             for m in messages[: last_assistant + 1]
             if m.get("role") == "system"
         ]
-        return head + messages[last_assistant + 1:]
+        return head + carried + messages[last_assistant + 1:]
+
+    def _build_responses_input(self, messages, previous_response_id):
+        """Build the Responses ``input`` list, honouring store-mode chaining.
+
+        Returns ``(input_items, previous_response_id)``. The id comes back
+        ``None`` when the chained payload would not carry an output for every
+        call the chained response holds — rather than send a request the
+        provider is certain to reject, the full history is sent unchained.
+
+        A chained request answers exactly the calls of the response it chains
+        to, so outputs are checked in BOTH directions against
+        ``_last_response_call_ids``: missing ones abandon chaining, extra ones
+        are dropped. The extras matter because the trim's carry loop cannot
+        tell a split batch (whose stray results must be rescued) from a
+        multi-round grouped history (whose earlier rounds the server already
+        has) — both end in the same assistant/tool run. Without the filter,
+        round N re-sends every prior round's outputs back to the last user
+        turn and the payload grows with the tool loop.
+        """
+        chained = bool(previous_response_id and settings.OPENAI_RESPONSES_STORE)
+        if not chained:
+            return self._to_responses_input(messages, chained=False), None
+
+        input_items = self._to_responses_input(
+            self._trim_for_previous_response(messages), chained=True
+        )
+        expected = set(self._last_response_call_ids or ())
+        if expected:
+            kept, dropped = [], []
+            for item in input_items:
+                if (
+                    item.get("type") == "function_call_output"
+                    and item.get("call_id") not in expected
+                ):
+                    dropped.append(item.get("call_id"))
+                else:
+                    kept.append(item)
+            if dropped:
+                logging.debug(
+                    "Dropping %d already-answered tool output(s) from the "
+                    "chained Responses input (call_ids=%s)",
+                    len(dropped),
+                    sorted(dropped),
+                )
+                input_items = kept
+            sent = {
+                item.get("call_id")
+                for item in input_items
+                if item.get("type") == "function_call_output"
+            }
+            missing = expected - sent
+            if missing:
+                logging.warning(
+                    "Chained Responses request would omit tool output(s) for "
+                    "%s; sending the full unchained input instead of a "
+                    "request the provider would reject",
+                    sorted(missing),
+                )
+                return self._to_responses_input(messages, chained=False), None
+        return input_items, previous_response_id
 
     @staticmethod
     def _to_responses_tools(tools):
@@ -909,10 +993,33 @@ class OpenAILLM(BaseLLM):
         self._last_usage = result
         self._last_usage_claimed = False
 
+    @staticmethod
+    def _function_call_ids(response):
+        """call_ids of every ``function_call`` item in a Responses output.
+
+        Feeds the chained-request coverage guard in
+        ``_build_responses_input``: these are the calls the server will expect
+        a ``function_call_output`` for on the next chained turn.
+        """
+        output = getattr(response, "output", None)
+        if not isinstance(output, list):
+            return set()
+        call_ids = set()
+        for item in output:
+            if isinstance(item, dict):
+                itype, cid = item.get("type"), item.get("call_id")
+            else:
+                itype = getattr(item, "type", None)
+                cid = getattr(item, "call_id", None)
+            if itype == "function_call" and isinstance(cid, str) and cid:
+                call_ids.add(cid)
+        return call_ids
+
     def _record_responses_metadata(self, response):
         rid = getattr(response, "id", None)
         if rid:
             self._last_response_id = rid
+        self._last_response_call_ids = self._function_call_ids(response)
         usage = getattr(response, "usage", None)
         if usage is not None:
             prompt = int(getattr(usage, "input_tokens", 0) or 0)
@@ -1003,13 +1110,15 @@ class OpenAILLM(BaseLLM):
         previous_response_id = (
             self._last_response_id or previous_response_id or self._imported_response_id
         )
+        # Built before the per-turn state is cleared: the coverage guard reads
+        # the call_ids the chained response emitted.
+        input_items, previous_response_id = self._build_responses_input(
+            messages, previous_response_id
+        )
         self._last_response_id = None
+        self._last_response_call_ids = set()
         self._last_usage = None
         self._last_finish_reason = None
-        chained = bool(previous_response_id and settings.OPENAI_RESPONSES_STORE)
-        if chained:
-            messages = self._trim_for_previous_response(messages)
-        input_items = self._to_responses_input(messages, chained=chained)
         params = self._build_responses_params(
             model,
             input_items,
@@ -1073,14 +1182,16 @@ class OpenAILLM(BaseLLM):
         previous_response_id = (
             self._last_response_id or previous_response_id or self._imported_response_id
         )
+        # Built before the per-turn state is cleared: the coverage guard reads
+        # the call_ids the chained response emitted.
+        input_items, previous_response_id = self._build_responses_input(
+            messages, previous_response_id
+        )
         self._last_response_id = None
+        self._last_response_call_ids = set()
         self._last_usage = None
         self._last_finish_reason = None
         self._stream_reached_finish = False
-        chained = bool(previous_response_id and settings.OPENAI_RESPONSES_STORE)
-        if chained:
-            messages = self._trim_for_previous_response(messages)
-        input_items = self._to_responses_input(messages, chained=chained)
         params = self._build_responses_params(
             model,
             input_items,

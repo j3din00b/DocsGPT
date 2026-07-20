@@ -836,6 +836,35 @@ class LLMHandler(ABC):
         updated_messages = messages.copy()
         pending_actions: List[Dict] = []
 
+        # One assistant message carries the WHOLE parallel batch, followed by
+        # one tool message per call — the layout every provider expects, and
+        # the one the resume (``BaseAgent._resume_*``) and history-replay
+        # (``BaseAgent._build_messages``) paths already emit.
+        #
+        # Emitting a separate assistant message per call breaks chained
+        # Responses requests: ``_trim_for_previous_response`` re-sends only
+        # what follows the LAST assistant message, so every output except the
+        # final one was dropped and the provider rejected the request with
+        # "No tool output found for function call <first unpaired call>".
+        batch_assistant: Optional[Dict[str, Any]] = None
+
+        def _declare_call(tool_call_obj: Dict[str, Any]) -> None:
+            """Add ``tool_call_obj`` to the batch's assistant message,
+            creating (and appending) that message on first use."""
+            nonlocal batch_assistant
+            if batch_assistant is None:
+                batch_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [],
+                }
+                # Reasoning rides once on the batch message; DeepSeek thinking
+                # mode rejects an active-turn assistant message without it.
+                if reasoning_content:
+                    batch_assistant["reasoning_content"] = reasoning_content
+                updated_messages.append(batch_assistant)
+            batch_assistant["tool_calls"].append(tool_call_obj)
+
         for i, call in enumerate(tool_calls):
             # Check context limit before executing tool call
             if hasattr(agent, '_check_context_limit') and agent._check_context_limit(updated_messages):
@@ -865,6 +894,12 @@ class LLMHandler(ABC):
                         if compression_successful and rebuilt_messages is not None:
                             # Update the messages list with rebuilt compressed version
                             updated_messages = rebuilt_messages
+                            # The rebuilt list no longer contains the batch
+                            # message we were appending to, so mutating it
+                            # would be a silent no-op. Start a fresh one for
+                            # the remaining calls; each assistant message
+                            # still owns exactly the results that follow it.
+                            batch_assistant = None
 
                             # Yield compression success message
                             yield {
@@ -969,14 +1004,7 @@ class LLMHandler(ABC):
                     }
                     if getattr(call, "thought_signature", None):
                         tool_call_obj["thought_signature"] = call.thought_signature
-                    assistant_msg: Dict[str, Any] = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [tool_call_obj],
-                    }
-                    if reasoning_content:
-                        assistant_msg["reasoning_content"] = reasoning_content
-                    updated_messages.append(assistant_msg)
+                    _declare_call(tool_call_obj)
                     denial_call = ToolCall(
                         id=pause_info["call_id"],
                         name=call.name,
@@ -1081,19 +1109,7 @@ class LLMHandler(ABC):
                 if call.thought_signature:
                     tool_call_obj["thought_signature"] = call.thought_signature
 
-                assistant_msg: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [tool_call_obj],
-                }
-                # Each call in a parallel batch becomes its own
-                # assistant message here, so the same per-round
-                # reasoning has to ride on every one — DeepSeek
-                # thinking mode rejects any assistant message in the
-                # active turn that's missing reasoning_content.
-                if reasoning_content:
-                    assistant_msg["reasoning_content"] = reasoning_content
-                updated_messages.append(assistant_msg)
+                _declare_call(tool_call_obj)
                 assistant_appended = True
 
                 # The tool result's tool_call_id must match the id put on the
@@ -1110,24 +1126,22 @@ class LLMHandler(ABC):
                 )
             except Exception as e:
                 logger.error(f"Error executing tool: {str(e)}", exc_info=True)
-                # The error tool message's tool_call_id must match the assistant
-                # tool_call id that precedes it. When the success path already
-                # appended one (create_tool_message failed afterwards) that id is
-                # the executor-returned ``call_id``; otherwise the except builds
-                # its own assistant message below from ``call.id``.
+                # The error tool message's tool_call_id must match the
+                # tool_call id declared on the batch assistant message. When
+                # the success path already declared this call that id is the
+                # executor-returned ``call_id``; otherwise the except declares
+                # it below from ``call.id``.
                 error_id = call_id if assistant_appended else call.id
                 error_call = ToolCall(
                     id=error_id, name=call.name, arguments=call.arguments
                 )
                 error_response = f"Error executing tool: {str(e)}"
-                # Mirror the success path: a role:"tool" message must follow
-                # an assistant message carrying its tool_calls, or the next
-                # provider completion 400s ("'tool' must be a response to a
-                # preceding message with 'tool_calls'"). Skip it when the
-                # success path already appended one for this call — a
-                # create_tool_message failure after that append would
-                # otherwise duplicate the assistant message and 400 the
-                # same way an orphan tool message does.
+                # Mirror the success path: every tool message must answer a
+                # call declared on the batch assistant message, or the next
+                # provider completion 400s. Skip re-declaring when the success
+                # path already did it for this call — a create_tool_message
+                # failure after that point would otherwise declare the call
+                # twice and 400 the same way an orphan tool message does.
                 if not assistant_appended:
                     args_str = (
                         json.dumps(call.arguments)
@@ -1144,14 +1158,7 @@ class LLMHandler(ABC):
                     }
                     if call.thought_signature:
                         tool_call_obj["thought_signature"] = call.thought_signature
-                    assistant_msg: Dict[str, Any] = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [tool_call_obj],
-                    }
-                    if reasoning_content:
-                        assistant_msg["reasoning_content"] = reasoning_content
-                    updated_messages.append(assistant_msg)
+                    _declare_call(tool_call_obj)
 
                 error_message = self.create_tool_message(error_call, error_response)
                 updated_messages.append(error_message)
