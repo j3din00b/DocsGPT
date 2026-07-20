@@ -55,6 +55,30 @@ def safe_filename(filename):
     return safe_name
 
 
+def strip_null_bytes(value):
+    """Recursively strip ``\\x00`` from string keys/values in ``value``.
+
+    Postgres rejects NUL in both text and jsonb; one NUL-laden payload
+    (e.g. a binary response mis-decoded to text) would otherwise raise
+    ``DataError`` and lose the whole row. Shared by the message journal,
+    conversation finalize, activity log, tool_call_attempts, and
+    attachments write lanes.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "") if "\x00" in value else value
+    if isinstance(value, dict):
+        return {
+            (k.replace("\x00", "") if isinstance(k, str) and "\x00" in k else k):
+            strip_null_bytes(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [strip_null_bytes(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(strip_null_bytes(item) for item in value)
+    return value
+
+
 def num_tokens_from_string(string: str) -> int:
     encoding = get_encoding()
     if isinstance(string, str):

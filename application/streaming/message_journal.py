@@ -21,6 +21,7 @@ from application.storage.db.session import db_readonly, db_session
 from application.streaming.broadcast_channel import Topic
 from application.streaming.event_replay import encode_pubsub_message
 from application.streaming.keys import message_topic_name
+from application.utils import strip_null_bytes as _strip_null_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -34,29 +35,9 @@ DEFAULT_BATCH_SIZE = 16
 DEFAULT_BATCH_INTERVAL_MS = 100
 
 
-def _strip_null_bytes(value: Any) -> Any:
-    """Recursively strip ``\\x00`` from string keys/values in ``value``.
-
-    Postgres JSONB rejects the NUL escape; an LLM emitting a stray NUL
-    in a chunk would otherwise raise ``DataError`` at INSERT and the row
-    would be lost from the journal (live stream proceeds, reconnect
-    snapshot misses the chunk). Mirrors the strip already done in
-    ``parser/embedding_pipeline.py`` and
-    ``api/user/attachments/routes.py``.
-    """
-    if isinstance(value, str):
-        return value.replace("\x00", "") if "\x00" in value else value
-    if isinstance(value, dict):
-        return {
-            (k.replace("\x00", "") if isinstance(k, str) and "\x00" in k else k):
-            _strip_null_bytes(v)
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [_strip_null_bytes(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_strip_null_bytes(item) for item in value)
-    return value
+# NUL stripping lives in ``application.utils.strip_null_bytes`` (shared
+# with the conversation-finalize, activity-log, tool_call_attempts, and
+# attachments write lanes); imported above as ``_strip_null_bytes``.
 
 
 # Postgres SQLSTATE for a foreign-key violation. ``message_events`` has
