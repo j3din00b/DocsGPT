@@ -100,6 +100,7 @@ import {
 import WorkflowPreview from './WorkflowPreview';
 
 import type { Model } from '../../models/types';
+import { useOutsideAlerter } from '@/hooks';
 
 const PRIMARY_ACTION_SPINNER_DELAY_MS = 180;
 
@@ -774,26 +775,20 @@ function WorkflowBuilderInner() {
     showPreview,
   ]);
 
-  const handlePanelBackdropClick = useCallback(() => {
+  const handlePaneClick = useCallback(() => {
     setShowNodeConfig(false);
     setSelectedNode(null);
+    setShowWorkflowSettings(false);
   }, []);
 
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (
-        workflowSettingsRef.current &&
-        !workflowSettingsRef.current.contains(e.target as HTMLElement)
-      ) {
-        setShowWorkflowSettings(false);
-      }
-    };
-    if (showWorkflowSettings) {
-      document.addEventListener('mousedown', handleClickOutside);
-      return () =>
-        document.removeEventListener('mousedown', handleClickOutside);
-    }
-  }, [showWorkflowSettings]);
+  useOutsideAlerter(
+    workflowSettingsRef,
+    () => {
+      setShowWorkflowSettings(false);
+    },
+    [],
+    false,
+  );
 
   useEffect(() => {
     const loadModelsAndTools = async () => {
@@ -1940,6 +1935,7 @@ function WorkflowBuilderInner() {
               onDrop={onDrop}
               onDragOver={onDragOver}
               onNodeClick={handleNodeClick}
+              onPaneClick={handlePaneClick}
               onNodeDragStart={snapshotBeforeCanvasChange}
               onSelectionDragStart={snapshotBeforeCanvasChange}
               nodeTypes={nodeTypes}
@@ -1979,10 +1975,6 @@ function WorkflowBuilderInner() {
 
             {showNodeConfig && selectedNode && (
               <>
-                <div
-                  className="absolute inset-0 z-10"
-                  onClick={handlePanelBackdropClick}
-                />
                 <div className="border-border bg-card shadow-modal absolute top-4 right-4 z-20 w-96 rounded-2xl border">
                   <div className="border-border flex items-center justify-between border-b p-4">
                     <h3 className="font-semibold text-gray-900 dark:text-white">
