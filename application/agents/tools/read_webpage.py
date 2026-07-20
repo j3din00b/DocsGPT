@@ -138,6 +138,17 @@ class ReadWebpageTool(Tool):
                 headers={'User-Agent': 'DocsGPT-Agent/1.0'},
                 timeout=10,
             )
+            # Redirects are not followed (each hop would need its own SSRF
+            # validation); without this the redirect body comes back as
+            # near-empty markdown with no hint of where the page went.
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location", "")
+                if location:
+                    return (
+                        f"Error: URL redirects to '{location}'. "
+                        "Fetch that URL directly instead."
+                    )
+                return "Error: URL responded with a redirect but no target location."
             response.raise_for_status()
 
             content_type = response.headers.get("Content-Type", "")

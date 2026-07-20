@@ -205,6 +205,10 @@ class OpenAILLM(BaseLLM):
             "response_id": (
                 self._last_response_id if settings.OPENAI_RESPONSES_STORE else None
             ),
+            # Without these the coverage guard in ``_build_responses_input``
+            # is inert after a cross-process resume, and the trim's carry
+            # loop re-sends every earlier round's outputs unfiltered.
+            "call_ids": sorted(self._last_response_call_ids or ()),
             "reasoning_items": self._last_reasoning_items,
             "reasoning_for_calls": self._reasoning_for_calls,
         }
@@ -216,6 +220,9 @@ class OpenAILLM(BaseLLM):
         if state.get("chain_key") != self.responses_chain_key():
             return False
         self._imported_response_id = state.get("response_id")
+        # Tolerant of rows persisted before ``call_ids`` existed: an empty
+        # set keeps the guard disabled rather than rejecting the state.
+        self._last_response_call_ids = set(state.get("call_ids") or ())
         self._last_reasoning_items = list(state.get("reasoning_items") or [])
         self._reasoning_for_calls = dict(state.get("reasoning_for_calls") or {})
         return True

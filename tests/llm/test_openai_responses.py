@@ -287,6 +287,40 @@ def test_import_rejects_state_for_different_target(monkeypatch):
 
 
 @pytest.mark.unit
+def test_export_import_round_trips_call_ids_so_filter_survives_resume(monkeypatch):
+    """Cross-process resume: without the call-id set the coverage guard is
+    inert, and the trim's carry loop re-sends every earlier round's outputs
+    from a grouped multi-round history."""
+    first = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    first._last_response_id = "resp_prev"
+    first._last_response_call_ids = {"r2c0", "r2c1"}
+
+    second = _make_llm(monkeypatch, _responses_caps(), store_responses=True)
+    assert second.import_responses_state(first.export_responses_state()) is True
+    assert second._last_response_call_ids == {"r2c0", "r2c1"}
+
+    items, prev = second._build_responses_input(
+        _multi_round_messages(3), "resp_prev"
+    )
+    assert prev == "resp_prev"
+    outputs = [
+        i["call_id"] for i in items if i.get("type") == "function_call_output"
+    ]
+    assert sorted(outputs) == ["r2c0", "r2c1"]
+
+
+@pytest.mark.unit
+def test_import_tolerates_state_without_call_ids(monkeypatch):
+    """Rows persisted before the call-id key existed must still import."""
+    first = _make_llm(monkeypatch, _responses_caps())
+    state = first.export_responses_state()
+    state.pop("call_ids", None)
+    second = _make_llm(monkeypatch, _responses_caps())
+    assert second.import_responses_state(state) is True
+    assert second._last_response_call_ids == set()
+
+
+@pytest.mark.unit
 def test_start_responses_turn_drops_prior_turn_call_map(monkeypatch):
     llm = _make_llm(monkeypatch, _responses_caps())
     llm._reasoning_for_calls = {"old_call": [{"id": "old_reasoning"}]}

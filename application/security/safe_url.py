@@ -305,6 +305,42 @@ def _url_userinfo_prefix(netloc: str) -> str:
     return f"{netloc.rsplit('@', 1)[0]}@"
 
 
+def _pinned_session(
+    url: str, headers: dict[str, str] | None
+) -> tuple[requests.Session, str, dict[str, str]]:
+    """Run the SSRF guard once and build a session pinned to the chosen IP.
+
+    Single home for the pinning preamble (validate/pick IP, netloc rewrite,
+    ``Host`` header, HTTPS adapter mount) shared by :func:`pinned_request`
+    and :func:`pinned_fetch_bytes`, so the guard cannot drift between them.
+
+    Returns:
+        Tuple of the session (caller must close it), the IP-literal URL,
+        and the request headers carrying the original ``Host``.
+
+    Raises:
+        UnsafeUserUrlError: If the URL fails the SSRF guard.
+    """
+
+    host, ip, parts = _validate_and_pick_ip(url)
+
+    netloc = f"{_url_userinfo_prefix(parts.netloc)}{_ip_to_url_host(ip)}"
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    pinned_url = urlunsplit(
+        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+    )
+
+    request_headers = dict(headers or {})
+    host_header = host if parts.port is None else f"{host}:{parts.port}"
+    request_headers["Host"] = host_header
+
+    session = requests.Session()
+    if parts.scheme == "https":
+        session.mount("https://", _PinnedHostAdapter(host))
+    return session, pinned_url, request_headers
+
+
 def pinned_request(
     method: str,
     url: str,
@@ -324,22 +360,7 @@ def pinned_request(
         requests.RequestException: For network-level failures.
     """
 
-    host, ip, parts = _validate_and_pick_ip(url)
-
-    netloc = f"{_url_userinfo_prefix(parts.netloc)}{_ip_to_url_host(ip)}"
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-    pinned_url = urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-    )
-
-    request_headers = dict(headers or {})
-    host_header = host if parts.port is None else f"{host}:{parts.port}"
-    request_headers["Host"] = host_header
-
-    session = requests.Session()
-    if parts.scheme == "https":
-        session.mount("https://", _PinnedHostAdapter(host))
+    session, pinned_url, request_headers = _pinned_session(url, headers)
     try:
         return session.request(
             method=method.upper(),
@@ -379,22 +400,7 @@ def pinned_fetch_bytes(
         requests.RequestException: For network-level failures.
     """
 
-    host, ip, parts = _validate_and_pick_ip(url)
-
-    netloc = f"{_url_userinfo_prefix(parts.netloc)}{_ip_to_url_host(ip)}"
-    if parts.port is not None:
-        netloc = f"{netloc}:{parts.port}"
-    pinned_url = urlunsplit(
-        (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
-    )
-
-    request_headers = dict(headers or {})
-    host_header = host if parts.port is None else f"{host}:{parts.port}"
-    request_headers["Host"] = host_header
-
-    session = requests.Session()
-    if parts.scheme == "https":
-        session.mount("https://", _PinnedHostAdapter(host))
+    session, pinned_url, request_headers = _pinned_session(url, headers)
     try:
         response = session.request(
             method="GET",

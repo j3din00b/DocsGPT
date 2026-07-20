@@ -19,8 +19,8 @@ class _FakeResponse:
             raise requests.exceptions.HTTPError(str(self.status_code))
 
 
-def _fetch_result(body: bytes, content_type=None, status_code: int = 200):
-    headers = {}
+def _fetch_result(body: bytes, content_type=None, status_code: int = 200, headers=None):
+    headers = dict(headers or {})
     if content_type is not None:
         headers["Content-Type"] = content_type
     return body, _FakeResponse(status_code=status_code, headers=headers)
@@ -235,6 +235,29 @@ class TestReadWebpageContentGuards:
         result = tool.execute_action("read_webpage", url="https://example.com/data.csv")
 
         assert "widget" in result
+
+    @patch("application.agents.tools.read_webpage.pinned_fetch_bytes")
+    def test_redirect_reported_with_target(self, mock_fetch, tool):
+        # allow_redirects=False (SSRF) means a 3xx would otherwise return
+        # the redirect body as near-empty markdown with no hint.
+        mock_fetch.return_value = _fetch_result(
+            b"", status_code=301,
+            headers={"Location": "https://example.com/moved-here"},
+        )
+
+        result = tool.execute_action("read_webpage", url="https://example.com/old")
+
+        assert result.startswith("Error")
+        assert "https://example.com/moved-here" in result
+
+    @patch("application.agents.tools.read_webpage.pinned_fetch_bytes")
+    def test_redirect_without_location_reported(self, mock_fetch, tool):
+        mock_fetch.return_value = _fetch_result(b"", status_code=302)
+
+        result = tool.execute_action("read_webpage", url="https://example.com/old")
+
+        assert result.startswith("Error")
+        assert "redirect" in result.lower()
 
     @patch("application.agents.tools.read_webpage.pinned_fetch_bytes")
     def test_rss_feed_allowed(self, mock_fetch, tool):
