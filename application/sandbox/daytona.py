@@ -376,13 +376,43 @@ class DaytonaSandbox(CodeSandbox):
                     return self._to_result(handle.sandbox.process.code_run(wrapped, timeout=wall))
                 except Exception:  # noqa: BLE001 - second failure -> error result below
                     pass
-            return ExecResult(
+            result = ExecResult(
                 status="error",
                 error_name=type(exc).__name__,
                 error_value=str(exc) or "code_run failed",
                 exit_code=-1,
             )
+            # An auto-DELETED sandbox (vs a merely stopped one, handled above) can't be
+            # woken and would fail every retry on this cached handle. Drop the dead
+            # handle and flag the runtime invalid so SandboxManager cold-starts a fresh
+            # sandbox on the next call, rather than looping on the tombstone until the
+            # idle-TTL reap. Mirrors the Jupyter backend's kernel-death handling.
+            if self._sandbox_gone(handle):
+                self._forget_handle(session_id, handle)
+                result.runtime_invalidated = True
+            return result
         return self._to_result(response)
+
+    def _sandbox_gone(self, handle: "_Handle") -> bool:
+        """True when the sandbox behind ``handle`` no longer exists in the cloud.
+
+        Separates an auto-DELETED sandbox (unrecoverable — a fresh one must be created)
+        from a transient transport blip on a still-live sandbox (retryable on the same
+        handle). A ``get`` that cannot resolve the id, or a terminal state, means gone.
+        """
+        try:
+            fresh = self._client.get(handle.sandbox_id)
+        except Exception:  # noqa: BLE001 - unresolvable id => the sandbox is gone
+            return True
+        state = getattr(fresh, "state", None)
+        state_value = getattr(state, "value", state)
+        return state_value in (None, "destroyed", "deleted", "error", "archived")
+
+    def _forget_handle(self, session_id: str, handle: "_Handle") -> None:
+        """Drop the cached handle if it is still the registered one (ABA-safe)."""
+        with self._lock:
+            if self._handles.get(session_id) is handle:
+                self._handles.pop(session_id, None)
 
     @staticmethod
     def _with_workspace_cwd(workspace: str, code: str) -> str:
