@@ -33,6 +33,25 @@ TERMINATED_RESPONSE_PLACEHOLDER = (
 )
 
 
+def _final_finish_reason(llm: Any) -> Optional[str]:
+    """Best-effort finish_reason of the round that actually produced the answer.
+
+    Read from the responding provider — the fallback instance when a fallback
+    served the stream, else the primary. Set by the Responses path, the
+    non-streaming path, and (now) the chat-completions stream. ``None`` when
+    unavailable (e.g. the stream was cut before any finish frame).
+    """
+    if llm is None:
+        return None
+    fallback = getattr(llm, "_fallback_llm", None)
+    responding = getattr(llm, "_responding_provider", None)
+    if fallback is not None and responding == getattr(fallback, "provider_name", None):
+        fr = getattr(fallback, "_last_finish_reason", None)
+        if fr is not None:
+            return fr
+    return getattr(llm, "_last_finish_reason", None)
+
+
 class ConversationService:
     def get_conversation(
         self, conversation_id: str, user_id: str
@@ -111,6 +130,25 @@ class ConversationService:
         }
         if metadata:
             message_payload["metadata"] = metadata
+
+        # Classify empty answers at the point of persistence. A tool-request
+        # turn (finish_reason=tool_calls — the /v1 client-tool loop) and a
+        # genuine dead-end (finish_reason=stop with no visible content) both
+        # persist an empty ``response`` and are otherwise indistinguishable in
+        # the stored row; log the discriminators so they can be told apart.
+        if not (response or "").strip():
+            logger.info(
+                "empty_answer_persisted",
+                extra={
+                    "model": model_id,
+                    "finish_reason": _final_finish_reason(llm),
+                    "has_tool_calls": bool(tool_calls),
+                    "tool_call_count": len(tool_calls or []),
+                    "thought_len": len(thought or ""),
+                    "responding_provider": getattr(llm, "_responding_provider", None),
+                    "conversation_id": conversation_id,
+                },
+            )
 
         if conversation_id is not None and index is not None:
             with db_session() as conn:
