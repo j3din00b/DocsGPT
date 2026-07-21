@@ -246,6 +246,13 @@ class BaseAnswerResource:
         structured_chunks = []
         query_metadata: Dict[str, Any] = {}
         paused = False
+        # A ``tool_calls_pending`` event is held back and only flushed after
+        # continuation state is committed (or the stateless finalize path is
+        # reached): the v1 translator turns it into ``finish_reason:"tool_calls"``,
+        # and a client that resumes on that signal would otherwise race
+        # ``save_state``, miss the pending state, and fall back to a stateless
+        # ``persist=False`` round that never persists the final answer.
+        pending_pause_event: Optional[dict] = None
 
         # One id shared across the WAL row, primary LLM (token_usage
         # attribution), the SSE event, and resumed continuations.
@@ -543,9 +550,12 @@ class BaseAnswerResource:
                     yield _emit({"type": "thought", "thought": line["thought"]})
                 elif "type" in line:
                     if line.get("type") == "tool_calls_pending":
-                        # Save continuation state and end the stream
+                        # Hold the pause event; it is flushed in the ``paused``
+                        # block below only once continuation state is durable,
+                        # so a fast client's resume can never arrive before
+                        # the state it needs to claim.
                         paused = True
-                        yield _emit(line)
+                        pending_pause_event = line
                     elif line.get("type") == "error":
                         # An event flagged ``user_facing`` already carries a curated,
                         # actionable message (e.g. an artifact-quota notice). Passing it
@@ -594,8 +604,13 @@ class BaseAnswerResource:
                 # ``complete`` here (recording the emitted tool_calls) and end
                 # the stream, so the reconciler never sees a non-terminal row.
                 # The client still gets ``finish_reason:"tool_calls"`` + the
-                # calls from the ``tool_calls_pending`` event yielded above.
+                # calls from the ``tool_calls_pending`` event flushed below.
                 if finalize_tool_pause_as_complete:
+                    # No continuation state is written on this path; flush the
+                    # held pause event now, in its original position ahead of
+                    # the terminal id/end events.
+                    if pending_pause_event is not None:
+                        yield _emit(pending_pause_event)
                     yield from self._finalize_stateless_tool_pause(
                         continuation=continuation,
                         reserved_message_id=reserved_message_id,
@@ -785,6 +800,11 @@ class BaseAnswerResource:
                             },
                         )
 
+                # Continuation state (and any first-turn conversation row) is
+                # committed above; only now flush the held pause event so the
+                # client's resume request can never beat the saved state.
+                if pending_pause_event is not None:
+                    yield _emit(pending_pause_event)
                 yield _emit({"type": "id", "id": str(conversation_id)})
                 yield _emit({"type": "end"})
                 # Drain the terminal ``end`` so a reconnecting client
