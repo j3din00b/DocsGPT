@@ -250,8 +250,11 @@ class BaseAnswerResource:
         # continuation state is committed (or the stateless finalize path is
         # reached): the v1 translator turns it into ``finish_reason:"tool_calls"``,
         # and a client that resumes on that signal would otherwise race
-        # ``save_state``, miss the pending state, and fall back to a stateless
-        # ``persist=False`` round that never persists the final answer.
+        # ``save_state``, miss the pending state, and fall back to the
+        # transcript-rebuild round. That fallback still persists the final
+        # answer when a conversation is mapped, but only as an appended
+        # empty-prompt turn — it cannot finalize the reserved WAL row, which
+        # would be stranded non-terminal for the reconciler.
         pending_pause_event: Optional[dict] = None
 
         # One id shared across the WAL row, primary LLM (token_usage

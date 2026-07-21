@@ -298,9 +298,18 @@ def chat_completions():
                     internal_data["tool_actions"],
                 )
                 # A missing/expired durable continuation has no reserved WAL
-                # row to finalize. Run it statelessly without appending a blank
-                # sibling turn to the mapped conversation.
-                internal_data["persist"] = False
+                # row to finalize, so nothing mid-loop is persisted — but the
+                # FINAL turn of this round must still land in the mapped
+                # conversation, else a loop whose first resume produces the
+                # answer (one pause, then stop — the common single-search
+                # shape) persists only the empty tool-call row and the answer
+                # is lost upstream. With persist on, the finished answer is
+                # APPENDED as a new empty-prompt turn (there is no reserved
+                # row to finalize into); that's the accepted shape here. No
+                # worthless rows appear along the way: continuation rounds
+                # reserve no WAL row and the pause path never appends. Only a
+                # round with no mapped conversation at all stays stateless.
+                internal_data["persist"] = bool(internal_data.get("conversation_id"))
             continuation = {
                 "messages": messages,
                 "tools_dict": tools_dict,

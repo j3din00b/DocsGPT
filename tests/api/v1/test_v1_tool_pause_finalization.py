@@ -711,9 +711,105 @@ class TestV1ContinuationRoutesStatelessly:
         assert continuation["reserved_message_id"] is None
         assert continuation["request_id"] is None
         assert captured.get("finalize_tool_pause_as_complete") is False
-        # Missing durable state runs without appending a blank sibling turn.
+        # A mapped conversation keeps persistence on: the final turn of the
+        # round must land in it (as an appended answer turn — there is no
+        # reserved WAL row to finalize), else the answer is silently lost.
         assert captured.get("conversation_id") == "conv-1"
+        assert captured.get("should_persist") is True
+
+    def test_continuation_without_conversation_id_stays_stateless(self):
+        """No mapped conversation → the round runs with persistence off."""
+        app = self._build_app()
+
+        def _fake_translate(data, api_key):
+            # Translator behavior for a stateless continuation (opencode
+            # et al.): no conversation_id, persist defaults to False.
+            return {
+                "question": "",
+                "tool_actions": [{"call_id": "c1", "result": "r"}],
+                "persist": False,
+                "messages": data["messages"],
+            }
+
+        fake_processor = MagicMock()
+        fake_processor.decoded_token = {"sub": "owner"}
+        fake_processor.conversation_id = None
+        fake_processor.agent_config = {"user_api_key": "k"}
+        fake_processor.agent_id = None
+        fake_processor.model_id = "m"
+        fake_processor.model_user_id = None
+        fake_processor.reserved_message_id = None
+        fake_processor.request_id = None
+        fake_processor.build_continuation_from_messages.return_value = (
+            MagicMock(), [], {}, [{"call_id": "c1"}], [{"call_id": "c1", "result": "r"}], ""
+        )
+
+        captured: Dict[str, Any] = {}
+
+        def _capture_complete_stream(**kw):
+            captured.update(kw)
+            return iter(['data: {"type": "end"}'])
+
+        fake_helper = MagicMock()
+        fake_helper.check_usage.return_value = None
+        fake_helper.complete_stream.side_effect = _capture_complete_stream
+        fake_helper.process_response_stream.return_value = {
+            "error": None,
+            "conversation_id": None,
+            "answer": "done",
+            "sources": [],
+            "tool_calls": [],
+            "thought": "",
+        }
+
+        @contextmanager
+        def _yield_conn():
+            yield MagicMock()
+
+        with patch(
+            "application.api.v1.routes._lookup_agent",
+            return_value={"id": "agent-1", "name": "Agent", "user_id": "owner"},
+        ), patch(
+            "application.api.v1.routes.translate_request",
+            side_effect=_fake_translate,
+        ), patch(
+            "application.api.v1.routes.StreamProcessor",
+            return_value=fake_processor,
+        ), patch(
+            "application.api.v1.routes._V1AnswerHelper",
+            return_value=fake_helper,
+        ), patch(
+            "application.api.v1.routes.db_readonly",
+            _yield_conn,
+        ), patch(
+            "application.api.v1.routes.translate_response",
+            return_value={"id": "x", "choices": []},
+        ):
+            with app.test_client() as c:
+                resp = c.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer x"},
+                    json={
+                        "messages": [
+                            {"role": "user", "content": "hi"},
+                            {
+                                "role": "assistant",
+                                "tool_calls": [{"id": "c1", "function": {}}],
+                            },
+                            {"role": "tool", "tool_call_id": "c1", "content": "r"},
+                        ],
+                    },
+                )
+
+        assert resp.status_code == 200
+        fake_processor.build_continuation_from_messages.assert_called_once()
+        fake_processor.resume_from_tool_actions.assert_not_called()
+        # No mapped conversation: nothing to land the answer in, so the
+        # round stays fully stateless (no orphan empty-question rows), and
+        # a further pause finalizes as complete instead of writing state.
+        assert captured.get("conversation_id") is None
         assert captured.get("should_persist") is False
+        assert captured.get("finalize_tool_pause_as_complete") is True
 
 
 # ---------------------------------------------------------------------------
