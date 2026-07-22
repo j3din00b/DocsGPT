@@ -91,7 +91,7 @@ export default function AgentPageHeader({
           <BreadcrumbItem>
             {currentPage === 'overview' ? (
               <BreadcrumbPage title={displayName} className="w-[16ch] truncate">
-                {displayName}              
+                {displayName}
               </BreadcrumbPage>
             ) : (
               <BreadcrumbLink asChild>

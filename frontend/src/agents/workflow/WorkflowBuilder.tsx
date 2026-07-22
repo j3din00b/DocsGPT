@@ -781,11 +781,13 @@ function WorkflowBuilderInner() {
     setShowWorkflowSettings(false);
   }, []);
 
+  const handleCloseWorkflowSettings = useCallback(() => {
+    setShowWorkflowSettings(false);
+  }, []);
+
   useOutsideAlerter(
     workflowSettingsRef,
-    () => {
-      setShowWorkflowSettings(false);
-    },
+    handleCloseWorkflowSettings,
     [],
     false,
   );
