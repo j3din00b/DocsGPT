@@ -266,7 +266,21 @@ class OpenAILLM(BaseLLM):
         filename = file_obj.get("filename") or "upload.pdf"
         file_data = file_obj.get("file_data")
         if file_data:
-            content_hash = hashlib.sha256(file_data.encode()).hexdigest()
+            payload = file_data
+            if payload.startswith("data:"):
+                _, _, payload = payload.partition(",")
+            # MIME-wrapped encoders (``base64.encodebytes``, some
+            # JSON pretty-printers) insert whitespace/newlines that
+            # ``validate=True`` rejects — strip so recoverable data
+            # doesn't get thrown into the text-note degrade path.
+            payload = "".join(payload.split())
+        else:
+            payload = None
+        if payload:
+            # Hash the canonical payload, not the raw string, so data-URI,
+            # bare-base64, and MIME-wrapped encodings of the same bytes
+            # share one cache entry.
+            content_hash = hashlib.sha256(payload.encode()).hexdigest()
             cached = self._inline_file_ids.get(content_hash)
             if cached:
                 return {"type": "file", "file": {"file_id": cached}}
@@ -275,19 +289,6 @@ class OpenAILLM(BaseLLM):
                 self._inline_file_ids[content_hash] = cached
                 return {"type": "file", "file": {"file_id": cached}}
             try:
-                payload = file_data
-                if payload.startswith("data:"):
-                    _, _, payload = payload.partition(",")
-                # MIME-wrapped encoders (``base64.encodebytes``, some
-                # JSON pretty-printers) insert whitespace/newlines that
-                # ``validate=True`` rejects — strip so recoverable data
-                # doesn't get thrown into the text-note degrade path.
-                payload = "".join(payload.split())
-                if not payload:
-                    # A data URI missing the comma (or one with an empty
-                    # payload) would otherwise decode to zero bytes and
-                    # upload an empty artifact; degrade deliberately.
-                    raise ValueError("empty file_data payload")
                 raw = base64.b64decode(payload, validate=True)
                 file_id = self.client.files.create(
                     file=(filename, io.BytesIO(raw)),
@@ -303,6 +304,15 @@ class OpenAILLM(BaseLLM):
                     filename,
                     e,
                 )
+        elif file_data:
+            # A data URI missing the comma (or one with an empty payload)
+            # would otherwise decode to zero bytes and upload an empty
+            # artifact; degrade deliberately.
+            logging.warning(
+                "File content part '%s' has an empty file_data payload; "
+                "degrading to a text note",
+                filename,
+            )
         else:
             logging.warning(
                 "File content part '%s' has neither file_id nor file_data; "

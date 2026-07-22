@@ -1618,6 +1618,27 @@ class TestInlineFilePartResolution:
         assert len(files.calls) == 1
         assert out2[0]["content"][1]["file"] == {"file_id": "file-1"}
 
+    def test_equivalent_encodings_share_one_cache_entry(self, llm):
+        """Data-URI, bare-base64, and MIME-wrapped forms of the same bytes
+        must hash to one dedup key — the key is derived from the canonical
+        payload, not the raw ``file_data`` string."""
+        files = _CountingFiles()
+        llm.client.files = files
+        variants = [
+            f"data:application/pdf;base64,{_TINY_PDF_B64}",
+            _TINY_PDF_B64,
+            base64.encodebytes(_TINY_PDF_BYTES).decode(),
+        ]
+        for file_data in variants:
+            out = llm._clean_messages_openai(
+                self._msg({"filename": "a.pdf", "file_data": file_data})
+            )
+            assert out[0]["content"][1] == {
+                "type": "file",
+                "file": {"file_id": "file-1"},
+            }
+        assert len(files.calls) == 1
+
     def test_upload_failure_degrades_to_text_note(self, llm):
         llm.client.files = _CountingFiles(fail=True)
         out = llm._clean_messages_openai(
