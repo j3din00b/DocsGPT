@@ -122,7 +122,10 @@ def snapshot_signatures(manager: Any, session_id: str) -> Dict[str, Tuple[int, O
     try:
         files = manager.list_files(session_id)
     except Exception:
-        logger.exception("artifacts_capture: pre-exec listing failed")
+        # Best-effort: a listing failure (sandbox auto-stopped/deleted) just means no
+        # pre-image, so change detection falls back to "capture everything". Swallowed
+        # and recoverable -> WARN, not ERROR (an ERROR here false-alarms monitoring).
+        logger.warning("artifacts_capture: pre-exec listing failed", exc_info=True)
         return signatures
     candidates = sorted(f for f in files if not f.startswith("inputs/") and not _is_scratch(f))
     if len(candidates) > MAX_SCANNED_FILES:
@@ -164,7 +167,9 @@ def capture_artifacts(
     try:
         post_files = set(manager.list_files(session_id))
     except Exception:
-        logger.exception("artifacts_capture: post-exec listing failed")
+        # Best-effort: without a post-image there is nothing to capture, so return
+        # empty. Swallowed and recoverable -> WARN, not ERROR (see snapshot_signatures).
+        logger.warning("artifacts_capture: post-exec listing failed", exc_info=True)
         return []
 
     produced = (f for f in post_files if not f.startswith("inputs/"))

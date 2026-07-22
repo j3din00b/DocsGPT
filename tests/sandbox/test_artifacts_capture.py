@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import pytest
 
@@ -127,3 +128,46 @@ class TestReadSweepCap:
         captured = ac.capture_artifacts(mgr, "sid", pre, user_id="u")
         assert captured == []  # nothing changed -> nothing persisted
         assert mgr.reads == ac.MAX_SCANNED_FILES  # but the sweep is still bounded
+
+
+class _ListingRaisesMgr:
+    """A manager whose workspace listing fails (sandbox auto-stopped/deleted)."""
+
+    def list_files(self, _sid):
+        # Mirrors the generic IOError the Daytona/Jupyter backends raise when the
+        # workspace can't be listed because the runtime is gone.
+        raise IOError("list_files failed: RuntimeError")
+
+
+@pytest.mark.unit
+class TestListingFailureLogLevel:
+    """Regression: a swallowed, recoverable workspace-listing failure must log at
+    WARNING, not ERROR.
+
+    ``snapshot_signatures`` / ``capture_artifacts`` catch a failed listing, log it,
+    and return empty (best-effort — the exec result is still delivered). Logging it
+    via ``logger.exception`` stamps it ERROR, which inflated the production error
+    stream: on 2026-07-20 these two lines were 7 of the day's ~43 real-app ERRORs
+    and false-alarmed the error review (ledger #28, Bug B). A no-op capture is not
+    an error.
+    """
+
+    def test_pre_exec_listing_failure_logs_warning_not_error(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="application.sandbox.artifacts_capture"):
+            sigs = ac.snapshot_signatures(_ListingRaisesMgr(), "sid")
+        assert sigs == {}  # swallowed, best-effort
+        recs = [r for r in caplog.records if "pre-exec listing failed" in r.getMessage()]
+        assert recs, "expected a pre-exec listing-failed log record"
+        assert all(r.levelno == logging.WARNING for r in recs), (
+            "a swallowed, recoverable listing failure must not log at ERROR"
+        )
+
+    def test_post_exec_listing_failure_logs_warning_not_error(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="application.sandbox.artifacts_capture"):
+            captured = ac.capture_artifacts(_ListingRaisesMgr(), "sid", {}, user_id="u")
+        assert captured == []  # swallowed, best-effort
+        recs = [r for r in caplog.records if "post-exec listing failed" in r.getMessage()]
+        assert recs, "expected a post-exec listing-failed log record"
+        assert all(r.levelno == logging.WARNING for r in recs), (
+            "a swallowed, recoverable listing failure must not log at ERROR"
+        )

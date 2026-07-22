@@ -753,3 +753,72 @@ def test_factory_forwards_max_sandboxes(fake_sdk, monkeypatch):
     backend = sc.SandboxCreator.create_backend("daytona")
     assert backend._max_sandboxes == 7
     sc.SandboxCreator.reset()
+
+
+# --- Regression: a DELETED sandbox must invalidate the runtime (Bug A) ----
+#
+# Daytona auto-STOPS an idle sandbox (auto_stop_interval) and later auto-DELETES
+# it (auto_delete_interval). A stop is recoverable — ``_ensure_started`` wakes it
+# and retries (covered above). A delete is NOT: the cached handle points at a
+# tombstone, ``code_run`` raises "container not found", and ``client.get`` can no
+# longer resolve it. The Jupyter backend handles the equivalent kernel-death by
+# dropping its handle and setting ``runtime_invalidated=True`` so the manager
+# cold-starts on the next call; the Daytona backend must do the same.
+#
+# Without this the manager keeps a dead handle and EVERY subsequent call in the
+# session fails until the idle-TTL reap — observed in prod as one sandbox failing
+# five times across ~18 minutes (error-review ledger #28, Bug A).
+
+
+def test_exec_invalidates_runtime_when_sandbox_deleted(sandbox):
+    """A code_run against an auto-DELETED sandbox drops the handle and flags the
+    runtime invalid so the next open cold-starts."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    # Deleted under the still-cached handle: exec fails AND the sandbox can no
+    # longer be resolved (get raises => gone, not merely stopped).
+    created.process.code_run.side_effect = RuntimeError("No such container: sbx-1")
+    sandbox._client.get = mock.Mock(side_effect=KeyError("sbx-1"))
+
+    res = sandbox.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert res.runtime_invalidated is True  # signals the manager to cold-start
+    assert "conv-1" not in sandbox._handles  # tombstone dropped; next open re-creates
+
+
+def test_exec_does_not_invalidate_live_sandbox_on_transient_error(sandbox):
+    """A blip on a still-live (started) sandbox is NOT an invalidation: the warm
+    handle stays so a later call can reuse it."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("transient transport blip")
+
+    res = sandbox.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert res.runtime_invalidated is False
+    assert "conv-1" in sandbox._handles
+
+
+def test_manager_cold_starts_after_daytona_sandbox_deleted(fake_sdk):
+    """End-to-end (SandboxManager + DaytonaSandbox): once the cloud sandbox is
+    deleted, the next run transparently creates a FRESH sandbox instead of reusing
+    the dead handle. This is the user-facing recovery contract Bug A breaks."""
+    from application.sandbox.daytona import DaytonaSandbox
+    from application.sandbox.manager import SandboxManager
+
+    backend = DaytonaSandbox(api_key="k")
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    _, created = backend._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("No such container: sbx-1")
+    backend._client.get = mock.Mock(side_effect=KeyError("sbx-1"))  # deleted => gone
+
+    res = mgr.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert not mgr.has_session("conv-1")  # manager dropped the invalidated session
+
+    mgr.open("conv-1")  # recovery
+    assert backend._client.create.call_count == 2  # a NEW sandbox, not the tombstone

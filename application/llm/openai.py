@@ -536,6 +536,7 @@ class OpenAILLM(BaseLLM):
         request_params["stream_options"] = stream_options
         self._last_usage = None
         self._stream_reached_finish = False
+        self._last_finish_reason = None
         response = self.client.chat.completions.create(**request_params)
 
         try:
@@ -564,6 +565,11 @@ class OpenAILLM(BaseLLM):
                     # this to refuse restreaming a delivered answer when a
                     # trailing frame fails.
                     self._stream_reached_finish = True
+                    # Capture the reason itself (not just the bool) so the save
+                    # path can classify an empty answer: a ``stop`` with no
+                    # content is a genuine dead-end, ``tool_calls`` is a tool
+                    # request. Previously the chat path discarded this.
+                    self._last_finish_reason = finish_reason
 
                 # Yield non-content chunks only when needed for tool-call handling.
                 if has_tool_calls or finish_reason == "tool_calls":
