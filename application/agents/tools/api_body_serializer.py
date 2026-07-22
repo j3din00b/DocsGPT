@@ -128,7 +128,7 @@ class RequestBodySerializer:
     @staticmethod
     def _serialize_form_value(
         value: Any, style: str, explode: bool, content_type: str, key: str
-    ) -> Union[str, list]:
+    ) -> Union[str, list[tuple[str, str]]]:
         """Serialize individual form value with encoding rules.
 
         Returns a raw (unencoded) string, or a list of raw (name, value)
