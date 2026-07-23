@@ -405,8 +405,6 @@ class TestProviderNameRegistry:
         from application.llm.novita import NovitaLLM
         from application.llm.open_router import OpenRouterLLM
         from application.llm.openai import OpenAILLM
-        from application.llm.premai import PremAILLM
-        from application.llm.sagemaker import SagemakerAPILLM
 
         assert OpenAILLM.provider_name == "openai"
         assert GoogleLLM.provider_name == "google"
@@ -415,9 +413,7 @@ class TestProviderNameRegistry:
         assert NovitaLLM.provider_name == "novita"
         assert OpenRouterLLM.provider_name == "openrouter"
         assert DocsGPTAPILLM.provider_name == "docsgpt"
-        assert PremAILLM.provider_name == "premai"
         assert LlamaCpp.provider_name == "llama_cpp"
-        assert SagemakerAPILLM.provider_name == "sagemaker"
 
     @patch("application.llm.base.gen_cache", lambda f: f)
     @patch("application.llm.base.gen_token_usage", lambda f: f)

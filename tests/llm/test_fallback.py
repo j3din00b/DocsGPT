@@ -6,6 +6,7 @@ per-agent backup model is used before the global FALLBACK_* settings.
 
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from application.llm.base import BaseLLM
@@ -22,10 +23,18 @@ class FakeLLM(BaseLLM):
         # signatures work without errors.
         kwargs.pop("api_key", None)
         kwargs.pop("user_api_key", None)
+        # Retry-once tests supply these; strip before BaseLLM.__init__.
+        error_class = kwargs.pop("error_class", RuntimeError)
+        fail_schedule = kwargs.pop("fail_schedule", None)
+        error_schedule = kwargs.pop("error_schedule", None)
         super().__init__(**kwargs)
         self.responses = responses or ["fake response"]
         self.stream_chunks = stream_chunks or ["chunk1", "chunk2"]
         self.fail_at = fail_at  # None = no failure, 0 = immediate, N = after N chunks
+        self.error_class = error_class
+        self.fail_schedule = fail_schedule
+        self.error_schedule = error_schedule
+        self.stream_calls = 0
         self.user_api_key = None
         self.gen_called = False
         self.gen_stream_called = False
@@ -44,11 +53,30 @@ class FakeLLM(BaseLLM):
 
     def _raw_gen_stream(self, baseself, model, messages, stream, tools=None, **kwargs):
         self.gen_stream_called = True
+        self.stream_calls = getattr(self, "stream_calls", 0) + 1
         self.last_model_received = model
         yielded = 0
+        # Per-attempt failure schedule: `fail_schedule[n]` = fail_at value
+        # for the n-th call (0-indexed). Falls back to the constant
+        # ``fail_at`` when the schedule is exhausted or unset. Lets a test
+        # simulate "fail then succeed" without a custom subclass.
+        schedule = getattr(self, "fail_schedule", None)
+        if schedule is not None and self.stream_calls - 1 < len(schedule):
+            local_fail_at = schedule[self.stream_calls - 1]
+        else:
+            local_fail_at = self.fail_at
+        # Per-attempt exception class: same rationale as fail_schedule.
+        error_schedule = getattr(self, "error_schedule", None)
+        if (
+            error_schedule is not None
+            and self.stream_calls - 1 < len(error_schedule)
+        ):
+            local_error_class = error_schedule[self.stream_calls - 1]
+        else:
+            local_error_class = getattr(self, "error_class", RuntimeError)
         for chunk in self.stream_chunks:
-            if self.fail_at is not None and yielded >= self.fail_at:
-                raise RuntimeError("mid-stream failure")
+            if local_fail_at is not None and yielded >= local_fail_at:
+                raise local_error_class("mid-stream failure")
             yield chunk
             yielded += 1
 
@@ -289,6 +317,192 @@ class TestStreamingFallback:
         primary = FakeLLM(stream_chunks=["x"], fail_at=0, backup_models=[])
         with pytest.raises(RuntimeError, match="mid-stream failure"):
             list(primary.gen_stream(**CALL_ARGS))
+
+    def test_stream_transport_error_retries_primary_once(
+        self, patch_model_utils
+    ):
+        """Transport error before any yield → retry same primary once,
+        succeed, and skip the fallback entirely.
+
+        Covers the Azure Responses-API pattern (Front Door reset within
+        seconds, no output produced): the request never reached a
+        content-producing state, so the same primary is safe to replay.
+        """
+        backup = FakeLLM(stream_chunks=["fallback"])
+        patch_model_utils(
+            get_provider=lambda m, **_kwargs: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = FakeLLM(
+            stream_chunks=["ok1", "ok2"],
+            backup_models=["backup-model"],
+        )
+        # First attempt: transport error before yielding. Second attempt:
+        # full stream. The fallback should NEVER be called.
+        primary.fail_schedule = [0, None]
+        primary.error_schedule = [httpx.RemoteProtocolError, RuntimeError]
+
+        chunks = list(primary.gen_stream(**CALL_ARGS))
+
+        assert chunks == ["ok1", "ok2"]
+        assert primary.stream_calls == 2
+        assert not backup.gen_stream_called
+
+    def test_stream_transport_error_retry_then_fails_uses_fallback(
+        self, patch_model_utils
+    ):
+        """Transport error both times → after retry exhausted, fall back."""
+        backup = FakeLLM(stream_chunks=["b1", "b2"])
+        patch_model_utils(
+            get_provider=lambda m, **_kwargs: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = FakeLLM(
+            stream_chunks=["ok1"],
+            backup_models=["backup-model"],
+        )
+        primary.fail_schedule = [0, 0]
+        primary.error_schedule = [
+            httpx.RemoteProtocolError,
+            httpx.RemoteProtocolError,
+        ]
+
+        chunks = list(primary.gen_stream(**CALL_ARGS))
+
+        assert chunks == ["b1", "b2"]
+        assert primary.stream_calls == 2
+        assert backup.gen_stream_called
+
+    def test_stream_transport_error_after_yield_skips_retry(
+        self, patch_model_utils
+    ):
+        """Transport error AFTER a chunk was yielded → don't retry the
+        primary (would duplicate delivered content), go straight to
+        fallback.
+        """
+        backup = FakeLLM(stream_chunks=["b1"])
+        patch_model_utils(
+            get_provider=lambda m, **_kwargs: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = FakeLLM(
+            stream_chunks=["ok1", "ok2", "ok3"],
+            fail_at=2,  # yields ok1, ok2, then RemoteProtocolError
+            error_class=httpx.RemoteProtocolError,
+            backup_models=["backup-model"],
+        )
+        chunks = list(primary.gen_stream(**CALL_ARGS))
+
+        # Primary emitted two chunks, then straight to fallback (no retry).
+        assert chunks == ["ok1", "ok2", "b1"]
+        assert primary.stream_calls == 1
+        assert backup.gen_stream_called
+
+    def test_stream_non_transport_error_skips_retry(self, patch_model_utils):
+        """Non-transport errors (e.g. app-level RuntimeError, 4xx) don't
+        get the retry — repeating won't help — but fallback still runs."""
+        backup = FakeLLM(stream_chunks=["b1"])
+        patch_model_utils(
+            get_provider=lambda m, **_kwargs: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+        primary = FakeLLM(
+            stream_chunks=["x"],
+            fail_at=0,
+            error_class=RuntimeError,
+            backup_models=["backup-model"],
+        )
+        chunks = list(primary.gen_stream(**CALL_ARGS))
+
+        assert chunks == ["b1"]
+        assert primary.stream_calls == 1  # NOT retried
+        assert backup.gen_stream_called
+
+    def test_stream_transport_error_no_fallback_still_retries(
+        self, monkeypatch
+    ):
+        """Retry logic runs even when no fallback is configured — a
+        retryable transport blip should not require a backup to recover.
+        """
+        monkeypatch.setattr(
+            "application.llm.base.settings",
+            MagicMock(FALLBACK_LLM_PROVIDER=None),
+        )
+        primary = FakeLLM(
+            stream_chunks=["ok1"],
+            backup_models=[],
+        )
+        primary.fail_schedule = [0, None]
+        primary.error_schedule = [httpx.RemoteProtocolError, RuntimeError]
+
+        chunks = list(primary.gen_stream(**CALL_ARGS))
+
+        assert chunks == ["ok1"]
+        assert primary.stream_calls == 2
+
+    def test_retry_that_reaches_finish_then_trailing_frame_fails_skips_fallback(
+        self, patch_model_utils
+    ):
+        """The retry may deliver the entire answer, set
+        ``_stream_reached_finish``, and then die on a trailing frame
+        (usage-only chunk, [DONE]). Without a re-check of the flag in
+        the retry's except, we'd fall through to fallback and the user
+        would receive the whole answer twice. This test pins the guard.
+
+        Setup: primary attempt 1 fails immediately with a retryable
+        transport error → retry runs, streams two chunks AND sets
+        ``_stream_reached_finish=True``, then raises on the last frame.
+        Expected: the two retry chunks are yielded, the fallback is
+        NOT engaged, and the trailing-frame exception is re-raised
+        (which the streaming handler treats as non-fatal via its own
+        ``_stream_reached_finish`` guard).
+        """
+        backup = FakeLLM(stream_chunks=["should-not-appear"])
+        patch_model_utils(
+            get_provider=lambda m, **_kwargs: "openai",
+            get_api_key=lambda p: "k",
+            create_llm=lambda type, **kw: backup,
+        )
+
+        # A primary whose retry attempt yields chunks AND flips the
+        # finish flag before raising on the trailing frame. Subclassing
+        # keeps the fixture stubs untouched for the other tests.
+        class FinishThenFailPrimary(FakeLLM):
+            def _raw_gen_stream(
+                self, baseself, model, messages, stream, tools=None, **kwargs
+            ):
+                self.stream_calls = getattr(self, "stream_calls", 0) + 1
+                if self.stream_calls == 1:
+                    # Immediate transport failure to trigger the retry.
+                    raise httpx.RemoteProtocolError("initial reset")
+                # Retry attempt: yield the full stream, then die on a
+                # trailing frame after the finish signal was delivered.
+                for chunk in ("a", "b"):
+                    yield chunk
+                self._stream_reached_finish = True
+                raise httpx.RemoteProtocolError("trailing-frame drop")
+
+        primary = FinishThenFailPrimary(
+            stream_chunks=[],
+            backup_models=["backup-model"],
+        )
+
+        # The trailing-frame RemoteProtocolError propagates because the
+        # guard re-raises. The handler layer swallows it via its own
+        # ``_stream_reached_finish`` check; at the base-LLM layer it's
+        # the correct behaviour.
+        chunks = []
+        with pytest.raises(httpx.RemoteProtocolError, match="trailing-frame"):
+            for chunk in primary.gen_stream(**CALL_ARGS):
+                chunks.append(chunk)
+
+        assert chunks == ["a", "b"]
+        assert primary.stream_calls == 2
+        assert not backup.gen_stream_called
 
     def test_fallback_emits_stream_start_with_fallback_provider(
         self, patch_model_utils, caplog

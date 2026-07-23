@@ -2,12 +2,35 @@ import logging
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
+import httpx
+import openai
+
 from application.cache import gen_cache, stream_cache
 
 from application.core.settings import settings
 from application.usage import gen_token_usage, stream_token_usage
 
 logger = logging.getLogger(__name__)
+
+
+# Errors safe to retry the primary once on: the request either never
+# reached the server (connect), or the peer closed the connection before
+# a proper end-of-stream marker (read/protocol). None of these leave a
+# side effect on the upstream, so a repeat call is cheap and idempotent.
+# Excludes API-level errors (4xx / 5xx status) which are not transport
+# retries — RateLimitError needs backoff, BadRequestError won't get any
+# better on retry, and the existing fallback handles both.
+_STREAM_RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    openai.APIConnectionError,
+)
 
 
 class BaseLLM(ABC):
@@ -267,10 +290,22 @@ class BaseLLM(ABC):
         streaming generators raise exceptions during iteration. This wrapper
         ensures that if the primary LLM fails at any point during streaming
         (creation or mid-stream), we fall back to the backup model.
+
+        Transport errors that fire before any chunk was yielded (Azure
+        Front Door reset, backend deploy hiccup, TLS blip) get one same-
+        primary retry before we engage the fallback — the request never
+        made it to a state the peer produced output for, so a repeat is
+        idempotent. Once we've yielded anything, retrying would duplicate
+        delivered content; those errors go straight to the fallback path
+        as before.
         """
         self._responding_provider = self.provider_name
+        chunks_yielded = 0
         try:
-            yield from decorated_method()
+            for chunk in decorated_method():
+                chunks_yielded += 1
+                yield chunk
+            return
         except Exception as e:
             if getattr(self, "_stream_reached_finish", False):
                 # The primary already delivered a finish signal — only
@@ -284,6 +319,55 @@ class BaseLLM(ABC):
                     f"not engaging fallback. Error: {str(e)}"
                 )
                 raise
+            # Same-primary retry once for transport errors before any chunk
+            # was yielded. Covers the observed Azure Responses-API pattern
+            # where the peer resets the SSE stream within tens of seconds
+            # with a RemoteProtocolError, well before a legitimate fallback
+            # scenario. A yielded chunk = downstream already saw content,
+            # so replaying would duplicate it — skip retry in that case.
+            if (
+                chunks_yielded == 0
+                and isinstance(e, _STREAM_RETRYABLE_TRANSPORT_ERRORS)
+            ):
+                logger.warning(
+                    f"Primary LLM transport error before any output; "
+                    f"retrying once. Error: {str(e)}"
+                )
+                # Emit a fresh stream-start so dashboards get one start/
+                # finish pair per attempt (stream_token_usage fires a
+                # finish per decorated_method invocation).
+                self._emit_stream_start_log(
+                    kwargs.get("model") or getattr(self, "model_id", None),
+                    kwargs.get("messages"),
+                    kwargs.get("tools"),
+                    bool(
+                        kwargs.get("_usage_attachments")
+                        or kwargs.get("attachments")
+                    ),
+                )
+                try:
+                    for chunk in decorated_method():
+                        chunks_yielded += 1
+                        yield chunk
+                    return
+                except Exception as retry_e:
+                    # Retry delivered a full stream but died on a trailing
+                    # frame (usage chunk, [DONE]) — same guard the outer
+                    # except uses. Without this, the fallback would run
+                    # and the user would receive the whole answer twice
+                    # (and any tool calls would be executed twice).
+                    if getattr(self, "_stream_reached_finish", False):
+                        logger.warning(
+                            f"Primary LLM retry delivered its finish "
+                            f"signal, then failed on a trailing frame; "
+                            f"not engaging fallback. Error: {str(retry_e)}"
+                        )
+                        raise
+                    logger.warning(
+                        f"Primary LLM retry also failed; engaging fallback. "
+                        f"Error: {str(retry_e)}"
+                    )
+                    e = retry_e
             if not self.fallback_llm:
                 logger.error(
                     f"Primary LLM failed and no fallback configured: {str(e)}"

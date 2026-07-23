@@ -21,8 +21,6 @@ from application.llm.providers.novita import NovitaProvider
 from application.llm.providers.openai import OpenAIProvider
 from application.llm.providers.openai_compatible import OpenAICompatibleProvider
 from application.llm.providers.openrouter import OpenRouterProvider
-from application.llm.providers.premai import PremAIProvider
-from application.llm.providers.sagemaker import SagemakerProvider
 
 # Order here is the order the registry iterates providers (and therefore
 # the order ``/api/models`` reports them). Match the historical order
@@ -40,8 +38,6 @@ ALL_PROVIDERS: List[Provider] = [
     NovitaProvider(),
     HuggingFaceProvider(),
     LlamaCppProvider(),
-    PremAIProvider(),
-    SagemakerProvider(),
 ]
 
 PROVIDERS_BY_NAME: Dict[str, Provider] = {p.name: p for p in ALL_PROVIDERS}

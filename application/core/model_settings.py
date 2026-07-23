@@ -22,8 +22,6 @@ class ModelProvider(str, Enum):
     HUGGINGFACE = "huggingface"
     LLAMA_CPP = "llama.cpp"
     DOCSGPT = "docsgpt"
-    PREMAI = "premai"
-    SAGEMAKER = "sagemaker"
     NOVITA = "novita"
 
 

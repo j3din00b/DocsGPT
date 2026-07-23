@@ -1275,6 +1275,7 @@ class LLMHandler(ABC):
         tools_dict: Dict,
         messages: List[Dict],
         _iteration: int = 0,
+        _answer_recovered: bool = False,
     ) -> Generator:
         """
         Handle streaming response flow.
@@ -1284,6 +1285,9 @@ class LLMHandler(ABC):
             response: Current LLM response
             tools_dict: Available tools dictionary
             messages: Conversation history
+            _answer_recovered: Set by the recovery branch to bound the
+                empty-answer rescue to one attempt per stream — a recovery
+                that itself ends reasoning-only must not recurse.
 
         Yields:
             Streaming response chunks
@@ -1292,6 +1296,11 @@ class LLMHandler(ABC):
         tool_calls = {}
         reasoning_buffer = ""
         finish_reason = None
+        # Tracks whether any visible content reached the caller this
+        # round. Distinct from ``buffer``/``finish_reason``: providers
+        # emit content as bare strings (yielded straight through) and
+        # also as ``parsed.content`` on choice objects; either counts.
+        answered = False
 
         # Consume the provider stream to exhaustion before acting on its
         # finish reason. Acting mid-iteration (as this loop used to) left
@@ -1348,6 +1357,7 @@ class LLMHandler(ABC):
                 yield chunk
                 continue
             if isinstance(chunk, str):
+                answered = True
                 yield chunk
                 continue
             parsed = self._parse_for_response(agent, chunk)
@@ -1389,12 +1399,90 @@ class LLMHandler(ABC):
                 continue
             if parsed.content:
                 buffer += parsed.content
+                answered = True
                 yield buffer
                 buffer = ""
             if parsed.finish_reason == "stop" and finish_reason is None:
                 finish_reason = "stop"
 
         if finish_reason != "tool_calls":
+            # Silent-loss recovery: the stream ended cleanly (finish=stop
+            # or plain exhaustion) but never yielded a visible answer,
+            # and the model actually did work (thoughts non-empty). One
+            # plain re-send is far cheaper than a message row saved as
+            # status=complete with response="". Deliberately preserves
+            # the model's natural output distribution — no system-message
+            # nudge — since a "produce answer now, no thinking"
+            # instruction measurably shortens the model's reasoning by
+            # ~30% in our A/B, which hurts answer quality more than the
+            # tail failure rate justifies. Bounded to one attempt per
+            # stream by ``_answer_recovered`` so a recovery that itself
+            # reasons-only-stops does not recurse. Skipped when there is
+            # nothing to recover from (no reasoning) since the model
+            # genuinely chose to say nothing.
+            #
+            # Skipped, too, when the agent is running with structured
+            # output (json_schema / json_object). The primary call was
+            # constructed with response_format / response_schema that
+            # this handler cannot safely rebuild here without duplicating
+            # ``BaseAgent._llm_gen``; an unconstrained rescue would
+            # produce non-schema output that downstream consumers reject,
+            # which is worse than the empty-answer failure.
+            structured_output = (
+                getattr(agent, "json_schema", None)
+                or getattr(agent, "json_object", False)
+            )
+            if (
+                not answered
+                and reasoning_buffer
+                and not _answer_recovered
+                and not structured_output
+            ):
+                logger.warning(
+                    "Stream ended reasoning-only (%d chars of thought, "
+                    "0 answer bytes); re-sending once.",
+                    len(reasoning_buffer),
+                )
+                enforce = getattr(agent, "_enforce_context_window", None)
+                if callable(enforce):
+                    messages = enforce(messages)
+                # Mirror the finalize-round contract at the bottom of
+                # this method: when the cap or context limit already
+                # forced ``tools=None`` (with an accompanying "no more
+                # tools" system message), the recovery must not reopen
+                # tools, or the model could run one extra tool call past
+                # the cap. ``_iteration >= MAX_TOOL_ITERATIONS`` catches
+                # the finalize round.
+                recovery_tools = (
+                    None
+                    if _iteration >= MAX_TOOL_ITERATIONS
+                    or getattr(agent, "context_limit_reached", False)
+                    else agent.tools
+                )
+                recovery_kwargs = {
+                    "model": getattr(agent.llm, "model_id", None) or agent.model_id,
+                    "messages": messages,
+                    "tools": recovery_tools,
+                }
+                # Forward the sampling params the primary got
+                # (temperature, max_tokens, top_p, …). ``response_format``
+                # / ``response_schema`` are intentionally NOT forwarded
+                # — the structured_output gate above bails before we get
+                # here. ``previous_response_id`` is Responses-chain state
+                # and belongs to the failed turn, not a fresh recovery.
+                llm_params = getattr(agent, "llm_params", None)
+                if llm_params:
+                    recovery_kwargs.update(llm_params)
+                recovery_response = agent.llm.gen_stream(**recovery_kwargs)
+                self.llm_calls.append(build_stack_data(agent.llm))
+                yield from self.handle_streaming(
+                    agent,
+                    recovery_response,
+                    tools_dict,
+                    messages,
+                    _iteration=_iteration,
+                    _answer_recovered=True,
+                )
             return
 
         tool_handler_gen = self.handle_tool_calls(
@@ -1474,4 +1562,9 @@ class LLMHandler(ABC):
         yield from self.handle_streaming(
             agent, response, tools_dict, messages,
             _iteration=next_iteration,
+            # Carry the recovery guard through tool-loop recursion so a
+            # re-send that emitted tool_calls and then reasons-only-stops
+            # doesn't trigger a second re-send — the bound is per outer
+            # stream, not per tool round.
+            _answer_recovered=_answer_recovered,
         )
