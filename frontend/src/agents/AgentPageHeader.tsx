@@ -90,7 +90,7 @@ export default function AgentPageHeader({
           <BreadcrumbSeparator />
           <BreadcrumbItem>
             {currentPage === 'overview' ? (
-              <BreadcrumbPage className="max-w-[40ch] truncate">
+              <BreadcrumbPage title={displayName} className="w-[16ch] truncate">
                 {displayName}
               </BreadcrumbPage>
             ) : (
