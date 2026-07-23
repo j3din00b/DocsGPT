@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import logging
 
@@ -172,6 +173,12 @@ class OpenAILLM(BaseLLM):
         # fallback restream of the already-delivered answer.
         self._stream_reached_finish = False
         self._imported_response_id = None
+        # Files-API ids for inline ``file_data`` content parts already
+        # uploaded, keyed by content hash. First-line cache for the
+        # in-request tool loop; the Redis-backed cross-request cache
+        # (see ``_inline_file_id_cache_*``) covers /v1 clients that
+        # resend the same ``file_data`` on every turn.
+        self._inline_file_ids = {}
 
     def responses_chain_key(self) -> str:
         """Return a credential- and endpoint-scoped Responses chain key.
@@ -235,6 +242,147 @@ class OpenAILLM(BaseLLM):
         self._last_response_call_ids = set()
         self._imported_response_id = None
         self._last_finish_reason = None
+
+    def _resolve_file_part(self, item):
+        """Resolve a ``file`` content part into a Files-API reference.
+
+        Clients (the /v1 passthrough in particular) may send OpenAI-style
+        file parts carrying an inline ``file_data`` data-URI. Azure's
+        Responses API rejects inline data with ``unsupported_file`` even for
+        valid PDFs, and string-content-only chat deployments 4xx on any file
+        part — so upload the bytes once and swap in the ``file_id`` the
+        deployments do accept. A part with neither ``file_id`` nor decodable
+        ``file_data``, or whose upload fails (e.g. the endpoint has no Files
+        API), degrades to a text note instead of a certain provider 4xx.
+        """
+        file_obj = item.get("file") or {}
+        if file_obj.get("file_id"):
+            # Normalize: a client that sends both ``file_id`` and
+            # ``file_data`` would otherwise leak the inline payload to
+            # ``_responses_content_parts``, which copies every truthy key
+            # into ``input_file`` — and Azure Responses then rejects on
+            # the ``file_data`` regardless of the ``file_id``.
+            return {"type": "file", "file": {"file_id": file_obj["file_id"]}}
+        filename = file_obj.get("filename") or "upload.pdf"
+        file_data = file_obj.get("file_data")
+        if file_data:
+            payload = file_data
+            if payload.startswith("data:"):
+                _, _, payload = payload.partition(",")
+            # MIME-wrapped encoders (``base64.encodebytes``, some
+            # JSON pretty-printers) insert whitespace/newlines that
+            # ``validate=True`` rejects — strip so recoverable data
+            # doesn't get thrown into the text-note degrade path.
+            payload = "".join(payload.split())
+        else:
+            payload = None
+        if payload:
+            # Hash the canonical payload, not the raw string, so data-URI,
+            # bare-base64, and MIME-wrapped encodings of the same bytes
+            # share one cache entry.
+            content_hash = hashlib.sha256(payload.encode()).hexdigest()
+            cached = self._inline_file_ids.get(content_hash)
+            if cached:
+                return {"type": "file", "file": {"file_id": cached}}
+            cached = self._inline_file_id_cache_get(content_hash)
+            if cached:
+                self._inline_file_ids[content_hash] = cached
+                return {"type": "file", "file": {"file_id": cached}}
+            try:
+                raw = base64.b64decode(payload, validate=True)
+                file_id = self.client.files.create(
+                    file=(filename, io.BytesIO(raw)),
+                    purpose="assistants",
+                ).id
+                self._inline_file_ids[content_hash] = file_id
+                self._inline_file_id_cache_set(content_hash, file_id)
+                return {"type": "file", "file": {"file_id": file_id}}
+            except Exception as e:
+                logging.warning(
+                    "Could not resolve inline file_data part '%s' to a "
+                    "file_id (%s); degrading to a text note",
+                    filename,
+                    e,
+                )
+        elif file_data:
+            # A data URI missing the comma (or one with an empty payload)
+            # would otherwise decode to zero bytes and upload an empty
+            # artifact; degrade deliberately.
+            logging.warning(
+                "File content part '%s' has an empty file_data payload; "
+                "degrading to a text note",
+                filename,
+            )
+        else:
+            logging.warning(
+                "File content part '%s' has neither file_id nor file_data; "
+                "degrading to a text note",
+                filename,
+            )
+        return {
+            "type": "text",
+            "text": f"[File '{filename}' could not be processed]",
+        }
+
+    def _inline_file_id_cache_key(self, content_hash: str) -> str:
+        """Redis key for the inline-file-data → file_id cache.
+
+        Scoped by ``(provider_name, base_url, api_key)``: a Files-API
+        ``file_id`` is only valid for the endpoint + credential it was
+        uploaded to, so a shared key across providers would return
+        ids the current call can't use.
+        """
+        creds = "\0".join(
+            (
+                self.provider_name or "",
+                self._effective_base_url or "",
+                self.api_key or "",
+            )
+        )
+        creds_hash = hashlib.sha256(creds.encode("utf-8")).hexdigest()[:16]
+        return f"openai_inline_file:{creds_hash}:{content_hash}"
+
+    def _inline_file_id_cache_get(self, content_hash: str):
+        """Look up a previously-uploaded file_id for this content.
+
+        Returns None on cache miss or on any Redis error — the caller
+        then uploads normally. Never raises.
+        """
+        try:
+            from application.cache import get_redis_instance
+
+            r = get_redis_instance()
+            if r is None:
+                return None
+            value = r.get(self._inline_file_id_cache_key(content_hash))
+            if value is None:
+                return None
+            return value.decode() if isinstance(value, (bytes, bytearray)) else value
+        except Exception as e:
+            logging.debug("inline_file_id cache read failed: %s", e)
+            return None
+
+    def _inline_file_id_cache_set(self, content_hash: str, file_id: str) -> None:
+        """Persist a fresh (content_hash → file_id) mapping.
+
+        24 h TTL: well inside Azure's 30-day retention for
+        ``purpose="assistants"``, long enough to cover multi-turn
+        conversations that resend the same ``file_data`` every turn.
+        Silent on failure.
+        """
+        try:
+            from application.cache import get_redis_instance
+
+            r = get_redis_instance()
+            if r is None:
+                return
+            r.setex(
+                self._inline_file_id_cache_key(content_hash),
+                86400,
+                file_id,
+            )
+        except Exception as e:
+            logging.debug("inline_file_id cache write failed: %s", e)
 
     def _clean_messages_openai(self, messages):
         cleaned_messages = []
@@ -346,7 +494,7 @@ class OpenAILLM(BaseLLM):
                             if "type" in item and item["type"] == "text" and "text" in item:
                                 content_parts.append(item)
                             elif "type" in item and item["type"] == "file" and "file" in item:
-                                content_parts.append(item)
+                                content_parts.append(self._resolve_file_part(item))
                             elif "type" in item and item["type"] == "image_url" and "image_url" in item:
                                 content_parts.append(item)
                             elif "text" in item and "type" not in item:

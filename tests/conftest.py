@@ -138,6 +138,29 @@ def pg_conn(pg_engine):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_real_redis(monkeypatch):
+    """Force the Redis-absent baseline CI has.
+
+    CI runs without a Redis service, so ``get_redis_instance()`` /
+    ``get_pubsub_redis_instance()`` return None there. A dev machine with
+    a live localhost Redis diverges: code under test silently reads and
+    writes real keys, leaking state between tests and between runs (seen
+    with the ``openai_inline_file:*`` upload cache). Flipping the
+    creation-failed flags makes the real accessors return None everywhere
+    regardless of import style — consumers that did ``from
+    application.cache import get_redis_instance`` still hit these module
+    globals at call time. Tests that want Redis behavior keep injecting
+    fakes by patching the accessor at the consumer module, which bypasses
+    this guard. A test targeting the accessor's own construction path
+    must reset the two flags first.
+    """
+    monkeypatch.setattr("application.cache._redis_instance", None)
+    monkeypatch.setattr("application.cache._redis_creation_failed", True)
+    monkeypatch.setattr("application.cache._pubsub_redis_instance", None)
+    monkeypatch.setattr("application.cache._pubsub_redis_creation_failed", True)
+
+
 @pytest.fixture
 def mock_llm():
     llm = Mock()
