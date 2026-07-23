@@ -107,7 +107,7 @@ A more detailed [Quickstart](https://docs.docsgpt.cloud/quickstart) is available
    PowerShell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-Either script will guide you through setting up DocsGPT. Five options available: using the public API, running locally, connecting to a local inference engine, using a cloud API provider, or build the docker image locally. Scripts will automatically configure your `.env` file and handle necessary downloads and installations based on your chosen option.
+Either script will guide you through setting up DocsGPT. Five options are available: using the public API, running locally, connecting to a local inference engine, using a cloud API provider, or building the docker image locally. The scripts will automatically configure your `.env` file and handle necessary downloads and installations based on your chosen option.
 
 **Navigate to http://localhost:5173/**
 
@@ -132,13 +132,13 @@ Please refer to the [CONTRIBUTING.md](CONTRIBUTING.md) file for information abou
 
 ## Project Structure
 
-- Application - Flask app (main application).
+- **Application** - Backend Flask application.
 
-- Extensions - Extensions, like react widget or discord bot.
+- **Extensions** - Integrations and widgets (e.g., Chatwoot, React widget).
 
-- Frontend - Frontend uses <a href="https://vitejs.dev/">Vite</a> and <a href="https://react.dev/">React</a>.
+- **Frontend** - Web UI built with [Vite](https://vitejs.dev/) and [React](https://react.dev/).
 
-- Scripts - Miscellaneous scripts.
+- **Scripts** - Miscellaneous utility scripts.
 
 ## Code Of Conduct
 
