@@ -498,24 +498,6 @@ class TestMarkdownParserEmptyHeader:
 
 
 # ---------------------------------------------------------------------------
-# application/llm/sagemaker.py  (line 52)
-# ---------------------------------------------------------------------------
-@pytest.mark.unit
-class TestSagemakerLineIteratorStopIteration:
-    def test_stop_iteration_with_newline_data(self):
-        """Cover line 52: chunk with newline yields a line."""
-        from application.llm.sagemaker import LineIterator
-
-        # Chunk with newline so it yields
-        chunks = [
-            {"PayloadPart": {"Bytes": b'{"outputs": [" partial"]}\n'}},
-        ]
-        it = LineIterator(iter(chunks))
-        lines = list(it)
-        assert len(lines) == 1
-
-
-# ---------------------------------------------------------------------------
 # application/core/url_validation.py  (lines 89-90)
 # ---------------------------------------------------------------------------
 @pytest.mark.unit

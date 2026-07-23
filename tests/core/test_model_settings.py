@@ -34,8 +34,6 @@ class TestModelProvider:
         assert ModelProvider.HUGGINGFACE == "huggingface"
         assert ModelProvider.NOVITA == "novita"
         assert ModelProvider.OPENROUTER == "openrouter"
-        assert ModelProvider.SAGEMAKER == "sagemaker"
-        assert ModelProvider.PREMAI == "premai"
         assert ModelProvider.LLAMA_CPP == "llama.cpp"
 
 

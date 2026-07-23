@@ -207,8 +207,18 @@ def stream_cache(func):
 
         stream_cache_data = []
         cacheable = True
+        # Skip caching streams that produced no visible content — a
+        # reasoning-only stop (thoughts only, no str deltas) would
+        # otherwise be replayed for the whole TTL on every identical
+        # request, poisoning the cache and denying the reasoning-only
+        # recovery path any chance to run against a fresh provider call
+        # (subsequent identical requests replay the cached empty stream,
+        # trip the recovery guard, and produce another silent-loss).
+        had_content = False
         for chunk in func(self, model, messages, stream, tools, *args, **kwargs):
             yield chunk
+            if isinstance(chunk, str) and chunk:
+                had_content = True
             if isinstance(chunk, (str, dict, list, int, float, bool, type(None))):
                 try:
                     json.dumps(chunk)
@@ -218,7 +228,7 @@ def stream_cache(func):
             else:
                 cacheable = False
 
-        if redis_client and cacheable:
+        if redis_client and cacheable and had_content:
             try:
                 payload = {"version": 1, "chunks": stream_cache_data}
                 redis_client.set(cache_key, json.dumps(payload), ex=1800)

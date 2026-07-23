@@ -168,14 +168,12 @@ class Settings(BaseSettings):
     ELASTIC_URL: Optional[str] = None  # url for elasticsearch
     ELASTIC_INDEX: Optional[str] = "docsgpt"  # index name for elasticsearch
 
-    # SageMaker config
-    SAGEMAKER_ENDPOINT: Optional[str] = None  # SageMaker endpoint name
-    SAGEMAKER_REGION: Optional[str] = None  # SageMaker region name
-    SAGEMAKER_ACCESS_KEY: Optional[str] = None  # SageMaker access key
-    SAGEMAKER_SECRET_KEY: Optional[str] = None  # SageMaker secret key
-
-    # prem ai project id
-    PREMAI_PROJECT_ID: Optional[str] = None
+    # Legacy AWS credentials from the retired SageMaker LLM provider.
+    # Still read as a deprecated fallback by S3 storage (see the S3_*
+    # block below); do not use for new deployments.
+    SAGEMAKER_REGION: Optional[str] = None
+    SAGEMAKER_ACCESS_KEY: Optional[str] = None
+    SAGEMAKER_SECRET_KEY: Optional[str] = None
 
     # Qdrant vectorstore config
     QDRANT_COLLECTION_NAME: Optional[str] = "docsgpt"
